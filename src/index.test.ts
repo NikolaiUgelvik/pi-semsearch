@@ -29,6 +29,19 @@ describe("cast plugin", () => {
     await hooks.dispose?.()
   })
 
+  test("semantic_search_code description explains semantic search usage", async () => {
+    const hooks = await castPlugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const description = semanticSearchTool(hooks).description
+    expect(description).toContain("by meaning instead of exact text")
+    expect(description).toContain("behavior, features, APIs, errors, data flow")
+    expect(description).toContain("Use paths to restrict the search area")
+    expect(description).toContain("Use refresh if files may have changed")
+    await hooks.dispose?.()
+  })
+
   test("semantic_search_code returns configuration error when embeddings are missing", async () => {
     const hooks = await castPlugin(input as never, {})
     const result = await semanticSearchTool(hooks).execute({ query: "session" }, {

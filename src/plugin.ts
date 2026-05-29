@@ -69,7 +69,13 @@ export function createCastPluginForTest(
     return {
       tool: {
         semantic_search_code: tool({
-          description: "Semantically search code in the current worktree with cAST retrieval and parent context.",
+          description: `
+Find relevant code in the current repository by meaning, symbol, or implementation intent.
+
+Use this as the default first tool for code discovery in this repository, including when the user asks how something works, where behavior lives, what code is relevant, or asks about a known class, function, method, type, API, error, test, or feature name. Prefer this before grep/glob/read because it returns ranked, syntax-aware matches with surrounding implementation context and file/line references.
+
+This tool searches syntax-aware code chunks such as functions, classes, methods, and nearby context where parser support is available. Use grep only when you need exhaustive literal matching, occurrence counts, mechanical text replacement preparation, or matches in files that are not meaningfully represented as code chunks. Use read after this tool returns candidates when you need larger surrounding context or exact verification. Use paths to restrict the search area. Use refresh if files may have changed since the index was built.
+`,
           args: {
             query: tool.schema.string(),
             topK: tool.schema.number().int().positive().optional(),
