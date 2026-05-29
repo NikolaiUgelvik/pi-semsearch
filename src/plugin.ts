@@ -52,7 +52,7 @@ export function createCastPluginForTest(dependencies: {
     return {
       tool: {
         semantic_search_code: tool({
-          description: "Semantically search code in the current worktree with CAST retrieval and parent context.",
+          description: "Semantically search code in the current worktree with cAST retrieval and parent context.",
           args: {
             query: tool.schema.string(),
             topK: tool.schema.number().int().positive().optional(),
