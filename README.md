@@ -163,3 +163,12 @@ To test a local build in opencode, point config at the built file URL:
 ```
 
 Restart opencode after rebuilding the plugin or changing plugin config. The package root intentionally exports only the default plugin function so opencode does not confuse internal helper functions for plugin exports.
+
+## Acknowledgements
+
+This implementation is based on ideas from:
+
+Zhang et al., “cAST: Enhancing Code Retrieval-Augmented Generation with Structural Chunking via Abstract Syntax Tree,” arXiv:2506.15655, 2025.  
+https://arxiv.org/abs/2506.15655
+
+This repository is an independent implementation and is not affiliated with the original authors.
