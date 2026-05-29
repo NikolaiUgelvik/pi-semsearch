@@ -10,5 +10,6 @@
     "lib": ["es2022", "dom", "dom.iterable"],
     "types": ["bun", "node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }
