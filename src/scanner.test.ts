@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, rm, symlink, utimes } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, symlink, utimes } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { createIndexer } from "./scanner.js"
@@ -88,6 +88,46 @@ describe("createIndexer", () => {
     } finally {
       await rm(dir, { recursive: true, force: true })
       await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test("skips files ignored by gitignore", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, ".gitignore"), "ignored.ts\nnested/\n")
+      await Bun.write(path.join(dir, "kept.ts"), "export const kept = true\n")
+      await Bun.write(path.join(dir, "ignored.ts"), "export const ignored = true\n")
+      await mkdir(path.join(dir, "nested"))
+      await Bun.write(path.join(dir, "nested", "ignored.ts"), "export const nestedIgnored = true\n")
+      await mkdir(path.join(dir, "subdir"))
+      await Bun.write(path.join(dir, "subdir", ".gitignore"), "local-ignored.ts\n")
+      await Bun.write(path.join(dir, "subdir", "kept.ts"), "export const nestedKept = true\n")
+      await Bun.write(path.join(dir, "subdir", "local-ignored.ts"), "export const localIgnored = true\n")
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+
+      expect(Object.keys(index.files).sort()).toEqual(["kept.ts", "subdir/kept.ts"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
     }
   })
 

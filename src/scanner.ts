@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
-import { readdir } from "node:fs/promises"
+import { readdir, readFile } from "node:fs/promises"
 import path from "node:path"
+import ignore, { type Ignore } from "ignore"
 import { minimatch } from "minimatch"
 import { castChunks, type SyntaxNode } from "./cast.js"
 import { fallbackChunks } from "./fallback.js"
@@ -9,6 +10,7 @@ import { assignSymbolsToChunks, attachTopology, extractSymbols } from "./topolog
 import type { CastIndex } from "./types.js"
 
 type Store = { read(): Promise<CastIndex>; write(index: CastIndex): Promise<void> }
+type GitignoreMatcher = { base: string; matcher: Ignore }
 
 export function createIndexer(input: {
   worktree: string
@@ -194,18 +196,49 @@ async function scanFiles(root: string, includeGlobs: string[], excludeGlobs: str
   )
 }
 
-async function walk(root: string, prefix = ""): Promise<string[]> {
+async function loadGitignore(root: string, prefix: string): Promise<GitignoreMatcher | undefined> {
+  const matcher = ignore()
+  try {
+    matcher.add(await readFile(path.join(root, prefix, ".gitignore"), "utf8"))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error
+    }
+    return
+  }
+  return { base: prefix, matcher }
+}
+
+async function walk(root: string, prefix = "", inheritedGitignores: GitignoreMatcher[] = []): Promise<string[]> {
   const entries = await readdir(path.join(root, prefix), { withFileTypes: true })
+  const localGitignore = await loadGitignore(root, prefix)
+  const gitignores = localGitignore ? [...inheritedGitignores, localGitignore] : inheritedGitignores
   const ignored = new Set([".git", "node_modules", "dist", "build", ".cache"])
   const nested = await Promise.all(
     entries
-      .filter((entry) => !(ignored.has(entry.name) || entry.isSymbolicLink()))
+      .filter((entry) => {
+        const relative = path.join(prefix, entry.name)
+        return !(ignored.has(entry.name) || entry.isSymbolicLink() || isGitignored(relative, gitignores))
+      })
       .map((entry) => {
         const relative = path.join(prefix, entry.name)
-        return entry.isDirectory() ? walk(root, relative) : Promise.resolve([relative])
+        return entry.isDirectory() ? walk(root, relative, gitignores) : Promise.resolve([relative])
       }),
   )
   return nested.flat()
+}
+
+function isGitignored(relativePath: string, gitignores: GitignoreMatcher[]) {
+  return gitignores.some(({ base, matcher }) => {
+    const relativeToBase = base ? path.relative(base, relativePath) : relativePath
+    return relativeToBase && !relativeToBase.startsWith("..") && !path.isAbsolute(relativeToBase)
+      ? matcher.ignores(toGitignorePath(relativeToBase))
+      : false
+  })
+}
+
+function toGitignorePath(relativePath: string) {
+  return relativePath.split(path.sep).join("/")
 }
 
 async function fingerprint(filePath: string) {
