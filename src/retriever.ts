@@ -169,3 +169,5 @@ function breadcrumbsFor(chunk: ChunkRecord, symbols: CastIndex["symbols"]) {
 function textForByteSlice(source: string, byteStart: number, byteEnd: number) {
   return decoder.decode(encoder.encode(source).slice(byteStart, byteEnd))
 }
+
+// far e retriver ikkje reciever.
