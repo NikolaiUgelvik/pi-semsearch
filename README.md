@@ -4,7 +4,7 @@ Unofficial cAST semantic code search plugin for opencode. Code Retrieval-Augment
 
 This is an unofficial community plugin. It is not affiliated with, endorsed by, sponsored by, or maintained by opencode, opencode.ai, or the `@opencode-ai` npm organization. It depends on `@opencode-ai/plugin` only for the public plugin API.
 
-The plugin registers `semantic_search_code`, a repository search tool that chunks code with Tree-sitter AST structure where supported, falls back to deterministic text chunks where unsupported, embeds chunks through an OpenAI-compatible endpoint, and expands matches with enclosing class/function context when it fits the response budget.
+The plugin registers `semantic_search_code`, a repository search tool that chunks code with Tree-sitter AST structure where supported, and `semantic_get_chunk`, which fetches exact chunks by IDs returned in search topology.
 
 ## Installation
 
@@ -89,7 +89,52 @@ OpenRouter can be used as the HyDE chat provider while embeddings come from a ve
 - `refresh`: optional forced index refresh before searching.
 - `paths`: optional path filters. Entries can be exact file paths or directory prefixes.
 
-The tool returns a JSON payload with ranked results, diagnostics, and retrieval status metadata. When embedding config is missing or invalid, opencode still starts and the tool returns a clear configuration error.
+Each search result includes labeled topology entries that keep chunk IDs actionable while making parent, child, sibling, and symbol relationships readable:
+
+```json
+{
+  "topology": {
+    "chunk": {
+      "id": "chunk_7f3a9c2e4b1d",
+      "label": "function semanticSearchCode",
+      "range": "src/plugin.ts:120-188"
+    },
+    "parent": {
+      "id": "chunk_15d8e0a6c934",
+      "label": "file src/plugin.ts",
+      "range": "src/plugin.ts:20-220"
+    },
+    "children": [
+      {
+        "id": "chunk_b8a41f0c72de",
+        "label": "block chunk",
+        "range": "src/plugin.ts:142-166"
+      }
+    ],
+    "previousSibling": {
+      "id": "chunk_029d64f1a83c",
+      "label": "function resolveWorktreePath",
+      "range": "src/plugin.ts:90-118"
+    },
+    "nextSibling": {
+      "id": "chunk_e61c5b9a0d2f",
+      "label": "function semanticGetChunk",
+      "range": "src/plugin.ts:190-218"
+    },
+    "symbols": ["function semanticSearchCode"]
+  }
+}
+```
+
+`semantic_get_chunk` inputs:
+
+- `id`: chunk ID returned from `semantic_search_code` topology.
+- `includeParents`: optional parent context toggle. Defaults to `true`.
+- `includeSiblings`: optional sibling context toggle. Defaults to `true`.
+- `includeChildren`: optional child context toggle. Defaults to `true`.
+- `maxContextChars`: optional limit for parent and related chunk text. When omitted, lookup returns full stored related chunk text and full fitting parent context.
+
+`semantic_search_code` returns a JSON payload with ranked results, diagnostics, and retrieval status metadata. `semantic_get_chunk` returns the requested chunk, labeled topology, related chunks, diagnostics, and status metadata. When embedding config is missing or invalid, opencode still starts and the tools return a clear configuration error.
 
 ## Cache
 

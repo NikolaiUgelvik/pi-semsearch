@@ -1,6 +1,6 @@
 import type { SyntaxNode } from "./cast.js"
 import { rangeForSlice } from "./range.js"
-import type { ChunkRecord, SymbolRecord } from "./types.js"
+import type { ChunkRecord, SearchResultTopology, SymbolRecord, TopologyNode } from "./types.js"
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
@@ -126,6 +126,68 @@ export function expandWithParentContext(input: {
       ),
     parentRange: parent.range,
   }
+}
+
+export function summarizeTopology(
+  chunk: ChunkRecord,
+  chunks: Record<string, ChunkRecord>,
+  symbols: Record<string, SymbolRecord>,
+): SearchResultTopology {
+  return {
+    chunk: summarizeChunk(chunk, symbols),
+    ...optionalChunk(chunks, chunk.parentChunkId, symbols, "parent"),
+    children: chunk.childChunkIds.flatMap((id) => {
+      const child = chunks[id]
+      return child ? [summarizeChunk(child, symbols)] : []
+    }),
+    ...optionalChunk(chunks, chunk.previousSiblingChunkId, symbols, "previousSibling"),
+    ...optionalChunk(chunks, chunk.nextSiblingChunkId, symbols, "nextSibling"),
+    symbols: symbolBreadcrumbs(chunk, symbols),
+  }
+}
+
+export function summarizeChunk(chunk: ChunkRecord, symbols: Record<string, SymbolRecord>): TopologyNode {
+  return {
+    id: chunk.id,
+    label: labelForChunk(chunk, symbols),
+    range: rangeLabel(chunk),
+  }
+}
+
+function optionalChunk<Key extends "parent" | "previousSibling" | "nextSibling">(
+  chunks: Record<string, ChunkRecord>,
+  id: string | undefined,
+  symbols: Record<string, SymbolRecord>,
+  key: Key,
+): Partial<Record<Key, TopologyNode>> {
+  const chunk = id ? chunks[id] : undefined
+  return chunk ? ({ [key]: summarizeChunk(chunk, symbols) } as Partial<Record<Key, TopologyNode>>) : {}
+}
+
+function labelForChunk(chunk: ChunkRecord, symbols: Record<string, SymbolRecord>) {
+  if (chunk.kind === "file") {
+    return `file ${chunk.filePath}`
+  }
+  const symbol = nearestSymbol(chunk, symbols)
+  return symbol ? `${symbol.kind} ${symbol.name}` : `${chunk.kind} chunk`
+}
+
+function nearestSymbol(chunk: ChunkRecord, symbols: Record<string, SymbolRecord>) {
+  return [...chunk.symbolIds].reverse().flatMap((id) => (symbols[id] ? [symbols[id]] : []))[0]
+}
+
+function rangeLabel(chunk: ChunkRecord) {
+  if (chunk.range.lineStart === chunk.range.lineEnd) {
+    return `${chunk.filePath}:${chunk.range.lineStart}`
+  }
+  return `${chunk.filePath}:${chunk.range.lineStart}-${chunk.range.lineEnd}`
+}
+
+function symbolBreadcrumbs(chunk: ChunkRecord, symbols: Record<string, SymbolRecord>) {
+  return chunk.symbolIds.flatMap((id) => {
+    const symbol = symbols[id]
+    return symbol ? [`${symbol.kind} ${symbol.name}`] : []
+  })
 }
 
 function extractNodeSymbols(

@@ -20,12 +20,12 @@ describe("cast plugin", () => {
     expect(entrypoint.default).toBeFunction()
   })
 
-  test("registers semantic_search_code", async () => {
+  test("registers semantic_search_code and semantic_get_chunk", async () => {
     const hooks = await castPlugin(input as never, {
       embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
     })
 
-    expect(Object.keys(hooks.tool ?? {})).toEqual(["semantic_search_code"])
+    expect(Object.keys(hooks.tool ?? {})).toEqual(["semantic_search_code", "semantic_get_chunk"])
     await hooks.dispose?.()
   })
 
@@ -56,6 +56,71 @@ describe("cast plugin", () => {
     expect(result.title).toBe("Semantic code search is not configured")
     expect(result.output).toContain("embedding.model is required")
     expect(result.metadata).toEqual({ configured: false })
+  })
+
+  test("semantic_get_chunk returns configuration error when embeddings are missing", async () => {
+    const hooks = await castPlugin(input as never, {})
+    const result = await semanticGetChunkTool(hooks).execute({ id: "c1" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(result.title).toBe("Semantic chunk lookup is not configured")
+    expect(result.output).toContain("embedding.model is required")
+    expect(result.metadata).toEqual({ configured: false })
+  })
+
+  test("configured semantic_get_chunk reads the cached index and returns chunk output", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-plugin-"))
+    try {
+      const source = "export function session() { return 'ok' }\n"
+      await Bun.write(path.join(dir, "source.ts"), source)
+      const index = emptyReadyIndex()
+      index.files["source.ts"] = {
+        path: "source.ts",
+        language: "typescript",
+        fingerprint: "fingerprint",
+        chunkIds: ["c1"],
+        diagnostics: [],
+      }
+      index.chunks.c1 = {
+        id: "c1",
+        filePath: "source.ts",
+        language: "typescript",
+        kind: "function",
+        range: { byteStart: 0, byteEnd: source.length, lineStart: 1, lineEnd: 1 },
+        text: source,
+        nonWhitespaceChars: 30,
+        nodeTypes: ["function_declaration"],
+        symbolIds: [],
+        childChunkIds: [],
+        embedding: [1],
+      }
+      const plugin = createCastPluginForTest({
+        createIndexer: () => ({ refresh: async () => index }),
+        createStore: () => ({ read: async () => index, write: async () => undefined }),
+      })
+      const hooks = await plugin({ ...input, directory: dir, worktree: dir } as never, {
+        embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      })
+
+      const result = await semanticGetChunkTool(hooks).execute({ id: "c1" }, { worktree: dir, directory: dir } as never)
+
+      expect(typeof result).toBe("object")
+      if (typeof result === "string") {
+        throw new Error("expected object tool result")
+      }
+      expect(result.title).toBe("Semantic chunk lookup: c1")
+      expect(result.metadata).toEqual({ found: true })
+      expect(JSON.parse(result.output).chunk.topology.chunk.id).toBe("c1")
+      await hooks.dispose?.()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test("configured semantic_search_code executes retrieval pipeline and returns result metadata", async () => {
@@ -496,4 +561,12 @@ function semanticSearchTool(hooks: Awaited<ReturnType<typeof castPlugin>>) {
     throw new Error("semantic_search_code tool was not registered")
   }
   return semanticSearchCode
+}
+
+function semanticGetChunkTool(hooks: Awaited<ReturnType<typeof castPlugin>>) {
+  const semanticGetChunk = hooks.tool?.semantic_get_chunk
+  if (!semanticGetChunk) {
+    throw new Error("semantic_get_chunk tool was not registered")
+  }
+  return semanticGetChunk
 }

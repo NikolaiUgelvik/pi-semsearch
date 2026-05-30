@@ -72,6 +72,58 @@ export type SearchInput = {
   paths?: string[]
 }
 
+export type TopologyNode = {
+  id: string
+  label: string
+  range: string
+}
+
+export type SearchResultTopology = {
+  chunk: TopologyNode
+  parent?: TopologyNode
+  children: TopologyNode[]
+  previousSibling?: TopologyNode
+  nextSibling?: TopologyNode
+  symbols: string[]
+}
+
+export type ChunkLookupInput = {
+  id: string
+  includeParents?: boolean
+  includeSiblings?: boolean
+  includeChildren?: boolean
+  maxContextChars?: number
+}
+
+export type ChunkLookupOutput = {
+  status: IndexMetadata
+  chunk?: {
+    filePath: string
+    language: string
+    range: SourceRange
+    kind: ChunkKind
+    breadcrumbs: string[]
+    text: string
+    parentText?: string
+    parentRange?: SourceRange
+    topology: SearchResultTopology
+    related: {
+      parent?: ChunkLookupRelatedChunk
+      previousSibling?: ChunkLookupRelatedChunk
+      nextSibling?: ChunkLookupRelatedChunk
+      children: ChunkLookupRelatedChunk[]
+    }
+  }
+  diagnostics: string[]
+}
+
+export type ChunkLookupRelatedChunk = {
+  id: string
+  label: string
+  range: string
+  text?: string
+}
+
 export type SearchResult = {
   filePath: string
   language: string
@@ -83,14 +135,7 @@ export type SearchResult = {
   text: string
   parentText?: string
   parentRange?: SourceRange
-  topology: {
-    chunkId: string
-    parentChunkId?: string
-    childChunkIds: string[]
-    previousSiblingChunkId?: string
-    nextSiblingChunkId?: string
-    symbolIds: string[]
-  }
+  topology: SearchResultTopology
 }
 
 export type SearchOutput = {

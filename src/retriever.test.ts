@@ -40,6 +40,133 @@ describe("retrieve", () => {
     expect(output.results[0].filePath).toBe("a.ts")
   })
 
+  test("returns labeled topology in search results", async () => {
+    const index = createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+    })
+    const functionText = "function parseOptions() {\n  return {}\n}"
+    const source = `${functionText}\n\nconst value = 1\n`
+    index.metadata.status = "ready"
+    index.symbols.s1 = {
+      id: "s1",
+      name: "parseOptions",
+      kind: "function",
+      filePath: "src/options.ts",
+      range: { byteStart: 0, byteEnd: functionText.length, lineStart: 1, lineEnd: 3 },
+      childSymbolIds: [],
+    }
+    index.symbols.sChild = {
+      id: "sChild",
+      name: "readOptions",
+      kind: "function",
+      filePath: "src/options.ts",
+      range: { byteStart: 26, byteEnd: 35, lineStart: 2, lineEnd: 2 },
+      childSymbolIds: [],
+    }
+    index.symbols.sPrevious = {
+      id: "sPrevious",
+      name: "loadDefaults",
+      kind: "function",
+      filePath: "src/options.ts",
+      range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+      childSymbolIds: [],
+    }
+    index.symbols.sNext = {
+      id: "sNext",
+      name: "formatOptions",
+      kind: "function",
+      filePath: "src/options.ts",
+      range: { byteStart: 41, byteEnd: 55, lineStart: 5, lineEnd: 5 },
+      childSymbolIds: [],
+    }
+    index.chunks.parent = {
+      id: "parent",
+      filePath: "src/options.ts",
+      language: "typescript",
+      kind: "file",
+      range: { byteStart: 0, byteEnd: source.trimEnd().length, lineStart: 1, lineEnd: 6 },
+      text: source.trimEnd(),
+      nonWhitespaceChars: 44,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: ["c1"],
+    }
+    index.chunks.c1 = {
+      id: "c1",
+      filePath: "src/options.ts",
+      language: "typescript",
+      kind: "function",
+      range: { byteStart: 0, byteEnd: functionText.length, lineStart: 1, lineEnd: 3 },
+      text: functionText,
+      nonWhitespaceChars: 33,
+      nodeTypes: [],
+      symbolIds: ["s1"],
+      parentChunkId: "parent",
+      childChunkIds: ["child"],
+      previousSiblingChunkId: "previous",
+      nextSiblingChunkId: "next",
+      embedding: [1, 0],
+    }
+    index.chunks.child = {
+      id: "child",
+      filePath: "src/options.ts",
+      language: "typescript",
+      kind: "block",
+      range: { byteStart: 26, byteEnd: 35, lineStart: 2, lineEnd: 2 },
+      text: "return {}",
+      nonWhitespaceChars: 8,
+      nodeTypes: [],
+      symbolIds: ["sChild"],
+      parentChunkId: "c1",
+      childChunkIds: [],
+    }
+    index.chunks.previous = {
+      id: "previous",
+      filePath: "src/options.ts",
+      language: "typescript",
+      kind: "function",
+      range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+      text: "defaults()",
+      nonWhitespaceChars: 10,
+      nodeTypes: [],
+      symbolIds: ["sPrevious"],
+      childChunkIds: [],
+    }
+    index.chunks.next = {
+      id: "next",
+      filePath: "src/options.ts",
+      language: "typescript",
+      kind: "function",
+      range: { byteStart: 41, byteEnd: 55, lineStart: 5, lineEnd: 5 },
+      text: "formatOptions()",
+      nonWhitespaceChars: 13,
+      nodeTypes: [],
+      symbolIds: ["sNext"],
+      childChunkIds: [],
+    }
+
+    const output = await retrieve({
+      index,
+      input: { query: "parseOptions", topK: 1, includeParents: true, maxContextChars: 100 },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => source,
+    })
+
+    expect(output.results[0].topology).toEqual({
+      chunk: { id: "c1", label: "function parseOptions", range: "src/options.ts:1-3" },
+      parent: { id: "parent", label: "file src/options.ts", range: "src/options.ts:1-6" },
+      children: [{ id: "child", label: "function readOptions", range: "src/options.ts:2" }],
+      previousSibling: { id: "previous", label: "function loadDefaults", range: "src/options.ts:1" },
+      nextSibling: { id: "next", label: "function formatOptions", range: "src/options.ts:5" },
+      symbols: ["function parseOptions"],
+    })
+  })
+
   test("filters retrieval candidates by exact paths and directory prefixes", async () => {
     const index = createEmptyIndex({
       projectId: "p",
@@ -181,7 +308,7 @@ describe("retrieve", () => {
     })
 
     expect(output.status.hydeUsed).toBe(false)
-    expect(output.results[0].topology.chunkId).toBe("c1")
+    expect(output.results[0].topology.chunk.id).toBe("c1")
     expect(output.results[0].score).toBe(0)
     expect(output.results[0].finalScore).toBe(0)
     expect(output.diagnostics).toContain("existing")
@@ -281,7 +408,7 @@ describe("retrieve", () => {
       readSource: async () => "function d() {}",
     })
 
-    expect(output.results[0].topology.chunkId).toBe("c4")
+    expect(output.results[0].topology.chunk.id).toBe("c4")
     expect(output.results[0].finalScore).toBeGreaterThan(0.99)
     expect(output.results[0].score).toBe(output.results[0].finalScore)
   })

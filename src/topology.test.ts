@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { assignSymbolsToChunks, attachTopology, expandWithParentContext, extractSymbols } from "./topology.js"
+import {
+  assignSymbolsToChunks,
+  attachTopology,
+  expandWithParentContext,
+  extractSymbols,
+  summarizeTopology,
+} from "./topology.js"
 import type { ChunkRecord, SymbolRecord } from "./types.js"
 
 const base = {
@@ -221,6 +227,96 @@ describe("topology", () => {
     expect(chunks[0].childChunkIds).toEqual([])
     expect(chunks[1].parentChunkId).toBeUndefined()
     expect(chunks[1].childChunkIds).toEqual([])
+  })
+
+  test("summarizes topology with labels and one-based ranges", () => {
+    const classSymbol: SymbolRecord = {
+      id: "sym:class:A",
+      name: "A",
+      kind: "class",
+      filePath: "src/a.ts",
+      range: { byteStart: 0, byteEnd: 80, lineStart: 1, lineEnd: 5 },
+      childSymbolIds: ["sym:method:run"],
+    }
+    const methodSymbol: SymbolRecord = {
+      id: "sym:method:run",
+      name: "run",
+      kind: "method",
+      filePath: "src/a.ts",
+      range: { byteStart: 20, byteEnd: 40, lineStart: 3, lineEnd: 3 },
+      parentSymbolId: classSymbol.id,
+      childSymbolIds: [],
+    }
+    const functionSymbol: SymbolRecord = {
+      id: "sym:function:before",
+      name: "before",
+      kind: "function",
+      filePath: "src/a.ts",
+      range: { byteStart: 10, byteEnd: 18, lineStart: 2, lineEnd: 2 },
+      childSymbolIds: [],
+    }
+    const chunk = {
+      ...base,
+      id: "chunk:method",
+      kind: "method",
+      range: { byteStart: 20, byteEnd: 40, lineStart: 3, lineEnd: 3 },
+      text: "run() {}",
+      symbolIds: [classSymbol.id, methodSymbol.id],
+      parentChunkId: "chunk:class",
+      childChunkIds: ["chunk:block"],
+      previousSiblingChunkId: "chunk:function",
+      nextSiblingChunkId: "chunk:file",
+    } as ChunkRecord
+    const chunks: Record<string, ChunkRecord> = {
+      [chunk.id]: chunk,
+      "chunk:class": {
+        ...base,
+        id: "chunk:class",
+        kind: "class",
+        range: { byteStart: 0, byteEnd: 80, lineStart: 1, lineEnd: 5 },
+        text: "class A {}",
+        symbolIds: [classSymbol.id],
+      } as ChunkRecord,
+      "chunk:block": {
+        ...base,
+        id: "chunk:block",
+        kind: "block",
+        range: { byteStart: 30, byteEnd: 36, lineStart: 4, lineEnd: 4 },
+        text: "body",
+        symbolIds: [],
+      } as ChunkRecord,
+      "chunk:function": {
+        ...base,
+        id: "chunk:function",
+        kind: "function",
+        range: { byteStart: 10, byteEnd: 18, lineStart: 2, lineEnd: 2 },
+        text: "before()",
+        symbolIds: [functionSymbol.id],
+      } as ChunkRecord,
+      "chunk:file": {
+        ...base,
+        id: "chunk:file",
+        kind: "file",
+        range: { byteStart: 0, byteEnd: 120, lineStart: 1, lineEnd: 8 },
+        text: "file",
+        symbolIds: [],
+      } as ChunkRecord,
+    }
+
+    expect(
+      summarizeTopology(chunk, chunks, {
+        [classSymbol.id]: classSymbol,
+        [methodSymbol.id]: methodSymbol,
+        [functionSymbol.id]: functionSymbol,
+      }),
+    ).toEqual({
+      chunk: { id: "chunk:method", label: "method run", range: "src/a.ts:3" },
+      parent: { id: "chunk:class", label: "class A", range: "src/a.ts:1-5" },
+      children: [{ id: "chunk:block", label: "block chunk", range: "src/a.ts:4" }],
+      previousSibling: { id: "chunk:function", label: "function before", range: "src/a.ts:2" },
+      nextSibling: { id: "chunk:file", label: "file src/a.ts", range: "src/a.ts:1-8" },
+      symbols: ["class A", "method run"],
+    })
   })
 
   test("extracts enclosing class and assigns it to contained chunks", () => {

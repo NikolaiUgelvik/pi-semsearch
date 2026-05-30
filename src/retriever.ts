@@ -1,5 +1,5 @@
 import { searchVectors } from "./store.js"
-import { expandWithParentContext } from "./topology.js"
+import { expandWithParentContext, summarizeTopology } from "./topology.js"
 import type { CastIndex, ChunkRecord, SearchInput, SearchOutput } from "./types.js"
 
 const encoder = new TextEncoder()
@@ -95,14 +95,7 @@ export async function retrieve(input: {
             text: chunk.text,
             parentText: context.parentText,
             parentRange: context.parentRange,
-            topology: {
-              chunkId: chunk.id,
-              parentChunkId: chunk.parentChunkId,
-              childChunkIds: chunk.childChunkIds,
-              previousSiblingChunkId: chunk.previousSiblingChunkId,
-              nextSiblingChunkId: chunk.nextSiblingChunkId,
-              symbolIds: chunk.symbolIds,
-            },
+            topology: summarizeTopology(chunk, chunksById, input.index.symbols),
           },
         ]
       }),
