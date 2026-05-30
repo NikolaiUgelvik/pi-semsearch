@@ -49,7 +49,12 @@ export function attachTopology(chunks: ChunkRecord[], symbols: Record<string, Sy
         (candidate) =>
           candidate.filePath === chunk.filePath &&
           candidate.id !== chunk.id &&
-          containsRange(candidate.range.byteStart, candidate.range.byteEnd, chunk.range.byteStart, chunk.range.byteEnd),
+          strictlyContainsRange(
+            candidate.range.byteStart,
+            candidate.range.byteEnd,
+            chunk.range.byteStart,
+            chunk.range.byteEnd,
+          ),
       )
       .sort((left, right) => rangeSize(left) - rangeSize(right))[0]?.id,
     childChunkIds: chunks
@@ -57,7 +62,12 @@ export function attachTopology(chunks: ChunkRecord[], symbols: Record<string, Sy
         (candidate) =>
           candidate.filePath === chunk.filePath &&
           candidate.id !== chunk.id &&
-          containsRange(chunk.range.byteStart, chunk.range.byteEnd, candidate.range.byteStart, candidate.range.byteEnd),
+          strictlyContainsRange(
+            chunk.range.byteStart,
+            chunk.range.byteEnd,
+            candidate.range.byteStart,
+            candidate.range.byteEnd,
+          ),
       )
       .filter(
         (candidate) =>
@@ -66,8 +76,13 @@ export function attachTopology(chunks: ChunkRecord[], symbols: Record<string, Sy
               other.filePath === chunk.filePath &&
               other.id !== chunk.id &&
               other.id !== candidate.id &&
-              containsRange(chunk.range.byteStart, chunk.range.byteEnd, other.range.byteStart, other.range.byteEnd) &&
-              containsRange(
+              strictlyContainsRange(
+                chunk.range.byteStart,
+                chunk.range.byteEnd,
+                other.range.byteStart,
+                other.range.byteEnd,
+              ) &&
+              strictlyContainsRange(
                 other.range.byteStart,
                 other.range.byteEnd,
                 candidate.range.byteStart,
@@ -322,6 +337,12 @@ function siblingContextId(chunk: ChunkRecord, symbols: Record<string, SymbolReco
 
 function containsRange(parentStart: number, parentEnd: number, childStart: number, childEnd: number) {
   return parentStart <= childStart && childEnd <= parentEnd
+}
+
+function strictlyContainsRange(parentStart: number, parentEnd: number, childStart: number, childEnd: number) {
+  return (
+    containsRange(parentStart, parentEnd, childStart, childEnd) && (parentStart < childStart || childEnd < parentEnd)
+  )
 }
 
 function rangeSize(chunk: ChunkRecord) {

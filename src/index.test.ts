@@ -489,6 +489,37 @@ describe("cast plugin", () => {
     })
   })
 
+  test("chunking options are plugin indexing options and not semantic_search_code arguments", async () => {
+    let indexerOptions: unknown
+    const plugin = createCastPluginForTest({
+      createIndexer: (input) => {
+        indexerOptions = input.options
+        return { refresh: async () => emptyReadyIndex() }
+      },
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: [],
+      }),
+    })
+
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      chunking: { overlap: 2, expansion: true, minSemanticNonWhitespaceChars: 16 },
+    })
+
+    expect(indexerOptions).toEqual({
+      maxChunkNonWhitespaceChars: 2000,
+      includeGlobs: ["**/*"],
+      excludeGlobs: [],
+      topK: 5,
+      maxContextChars: 12_000,
+      chunking: { overlap: 2, expansion: true, minSemanticNonWhitespaceChars: 16 },
+    })
+    expect(Object.keys(semanticSearchTool(hooks).args)).not.toContain("chunking")
+  })
+
   test("chat.message records the latest model for opencode HyDE fallback", async () => {
     const index = emptyReadyIndex()
     const fakeClient = createFakeClient()

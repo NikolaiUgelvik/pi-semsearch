@@ -79,7 +79,14 @@ export function createCastPluginForTest(
         .then(() =>
           (dependencies.createIndexer ?? createIndexer)({
             worktree: input.worktree,
-            options,
+            options: {
+              maxChunkNonWhitespaceChars: options.maxChunkNonWhitespaceChars,
+              includeGlobs: options.includeGlobs,
+              excludeGlobs: options.excludeGlobs,
+              topK: options.topK,
+              maxContextChars: options.maxContextChars,
+              chunking: options.chunking,
+            },
             store,
             parse: parseSource,
             embed: (text) => client.embed({ ...embedding, input: text }),

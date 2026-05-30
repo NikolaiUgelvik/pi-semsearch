@@ -37,6 +37,12 @@ export type HydeOptions = {
   enabled: boolean
 }
 
+export type ChunkingOptions = {
+  overlap: number
+  expansion: boolean
+  minSemanticNonWhitespaceChars: number
+}
+
 export type LexicalIndex = {
   documentCount: number
   averageDocumentLength: number
@@ -103,6 +109,7 @@ export type IndexMetadata = {
   embeddingModel?: string
   embeddingDimensions?: number
   maxChunkNonWhitespaceChars: number
+  chunking: ChunkingOptions
   updatedAt: number
   status: "empty" | "indexing" | "ready" | "stale" | "error"
   diagnostics: string[]

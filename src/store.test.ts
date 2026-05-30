@@ -88,6 +88,43 @@ describe("index store", () => {
     }
   })
 
+  test("reads old cache data without chunking metadata", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const store = createIndexStore({ cacheDir: dir, cacheKey: "project" })
+      const index = createEmptyIndex({
+        projectId: "p",
+        worktree: "/repo",
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      index.metadata.status = "ready"
+      const oldMetadata = {
+        schemaVersion: index.metadata.schemaVersion,
+        projectId: index.metadata.projectId,
+        worktree: index.metadata.worktree,
+        cacheKey: index.metadata.cacheKey,
+        maxChunkNonWhitespaceChars: index.metadata.maxChunkNonWhitespaceChars,
+        updatedAt: index.metadata.updatedAt,
+        status: index.metadata.status,
+        diagnostics: index.metadata.diagnostics,
+      }
+      await mkdir(path.join(dir, "project"), { recursive: true })
+      await Bun.write(path.join(dir, "project", "index.json"), JSON.stringify({ ...index, metadata: oldMetadata }))
+
+      const cached = await store.read()
+
+      expect(cached.metadata.status).toBe("ready")
+      expect(cached.metadata.chunking).toEqual({
+        overlap: 0,
+        expansion: false,
+        minSemanticNonWhitespaceChars: 8,
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("returns empty index without diagnostics for missing files", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
     try {

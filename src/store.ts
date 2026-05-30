@@ -1,14 +1,21 @@
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import type { CastIndex } from "./types.js"
+import type { CastIndex, ChunkingOptions } from "./types.js"
 
 export const INDEX_SCHEMA_VERSION = 1
+
+const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = {
+  overlap: 0,
+  expansion: false,
+  minSemanticNonWhitespaceChars: 8,
+}
 
 export function createEmptyIndex(input: {
   projectId: string
   worktree: string
   cacheKey: string
   maxChunkNonWhitespaceChars: number
+  chunking?: ChunkingOptions
   diagnostics?: string[]
 }): CastIndex {
   return {
@@ -18,6 +25,7 @@ export function createEmptyIndex(input: {
       worktree: input.worktree,
       cacheKey: input.cacheKey,
       maxChunkNonWhitespaceChars: input.maxChunkNonWhitespaceChars,
+      chunking: input.chunking ?? DEFAULT_CHUNKING_OPTIONS,
       updatedAt: Date.now(),
       status: "empty",
       diagnostics: input.diagnostics ?? [],
@@ -41,7 +49,7 @@ export function createIndexStore(input: { cacheDir: string; cacheKey: string }) 
         })
       }
       try {
-        const index = await Bun.file(file).json()
+        const index = normalizeIndex(await Bun.file(file).json())
         if (isCastIndex(index)) {
           return index
         }
@@ -83,6 +91,20 @@ export function searchVectors(query: number[], vectors: Array<{ id: string; vect
     .slice(0, Math.max(0, topK))
 }
 
+function normalizeIndex(value: unknown) {
+  if (!(isObject(value) && isObject(value.metadata)) || value.metadata.chunking !== undefined) {
+    return value
+  }
+
+  return {
+    ...value,
+    metadata: {
+      ...value.metadata,
+      chunking: DEFAULT_CHUNKING_OPTIONS,
+    },
+  }
+}
+
 function isCastIndex(value: unknown): value is CastIndex {
   return (
     isObject(value) &&
@@ -104,12 +126,25 @@ function isIndexMetadata(value: unknown) {
     typeof value.worktree === "string" &&
     typeof value.cacheKey === "string" &&
     typeof value.maxChunkNonWhitespaceChars === "number" &&
+    isChunkingOptions(value.chunking) &&
     typeof value.updatedAt === "number" &&
     typeof value.status === "string" &&
     ["empty", "indexing", "ready", "stale", "error"].includes(value.status) &&
     isStringArray(value.diagnostics) &&
     isOptionalString(value.embeddingModel) &&
     (value.embeddingDimensions === undefined || typeof value.embeddingDimensions === "number")
+  )
+}
+
+function isChunkingOptions(value: unknown): value is ChunkingOptions {
+  return (
+    isObject(value) &&
+    isNonnegativeNumber(value.overlap) &&
+    Number.isInteger(value.overlap) &&
+    typeof value.expansion === "boolean" &&
+    typeof value.minSemanticNonWhitespaceChars === "number" &&
+    Number.isInteger(value.minSemanticNonWhitespaceChars) &&
+    value.minSemanticNonWhitespaceChars > 0
   )
 }
 

@@ -7,7 +7,7 @@ import { castChunks, type SyntaxNode } from "./cast.js"
 import { fallbackChunks } from "./fallback.js"
 import { buildLexicalIndex } from "./lexical.js"
 import { assignSymbolsToChunks, attachTopology, extractSymbols } from "./topology.js"
-import type { CastIndex } from "./types.js"
+import type { CastIndex, ChunkingOptions } from "./types.js"
 
 type Store = { read(): Promise<CastIndex>; write(index: CastIndex): Promise<void> }
 type GitignoreMatcher = { base: string; matcher: Ignore }
@@ -20,6 +20,7 @@ export function createIndexer(input: {
     excludeGlobs: string[]
     topK: number
     maxContextChars: number
+    chunking: ChunkingOptions
   }
   store: Store
   parse(filePath: string, source: string): Promise<{ language: string; root?: SyntaxNode }>
@@ -30,7 +31,8 @@ export function createIndexer(input: {
       const index = await input.store.read()
       index.metadata.status = "indexing"
       const canReuseExistingRecords =
-        index.metadata.maxChunkNonWhitespaceChars === input.options.maxChunkNonWhitespaceChars
+        index.metadata.maxChunkNonWhitespaceChars === input.options.maxChunkNonWhitespaceChars &&
+        sameChunkingOptions(index.metadata.chunking, input.options.chunking)
       const files = await scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs)
       const nextFiles: CastIndex["files"] = {}
       const nextChunks: CastIndex["chunks"] = {}
@@ -66,6 +68,7 @@ export function createIndexer(input: {
               source: text,
               root: parsed.root,
               maxNonWhitespaceChars: input.options.maxChunkNonWhitespaceChars,
+              chunking: input.options.chunking,
             })
           : fallbackChunks({
               filePath: relativePath,
@@ -82,7 +85,7 @@ export function createIndexer(input: {
 
         for (const chunk of chunks) {
           const embedded = await input
-            .embed(embeddingText(relativePath, parsed.language, chunk, symbolsById))
+            .embed(embeddingText(relativePath, parsed.language, chunk, symbolsById, input.options.chunking.expansion))
             .then((embedding) => ({ embedding }))
             .catch((error) => ({ embeddingError: error instanceof Error ? error.message : String(error) }))
           if ("embeddingError" in embedded) {
@@ -110,6 +113,7 @@ export function createIndexer(input: {
       index.lexical = lexicalIndex.lexical
       index.metadata.worktree = input.worktree
       index.metadata.maxChunkNonWhitespaceChars = input.options.maxChunkNonWhitespaceChars
+      index.metadata.chunking = input.options.chunking
       index.metadata.status = "ready"
       index.metadata.updatedAt = Date.now()
       await input.store.write(index)
@@ -158,6 +162,14 @@ function canReuseFile(
     )
 }
 
+function sameChunkingOptions(left: ChunkingOptions | undefined, right: ChunkingOptions) {
+  return (
+    left?.overlap === right.overlap &&
+    left.expansion === right.expansion &&
+    left.minSemanticNonWhitespaceChars === right.minSemanticNonWhitespaceChars
+  )
+}
+
 function hasDanglingChunkReference(index: CastIndex, chunk: CastIndex["chunks"][string], chunkIds: Set<string>) {
   return Boolean(
     (chunk.parentChunkId && !(chunkIds.has(chunk.parentChunkId) && index.chunks[chunk.parentChunkId])) ||
@@ -174,17 +186,24 @@ function embeddingText(
   language: string,
   chunk: CastIndex["chunks"][string],
   symbols: CastIndex["symbols"],
+  expansion: boolean,
 ) {
-  return [
-    `path: ${filePath}`,
-    `language: ${language}`,
+  const fields = [`path: ${filePath}`, `language: ${language}`]
+  if (expansion) {
+    const lineEnd = chunk.text.endsWith("\n")
+      ? Math.max(chunk.range.lineStart, chunk.range.lineEnd - 1)
+      : chunk.range.lineEnd
+    fields.push(`chunk:\nkind: ${chunk.kind}\nrange: ${chunk.range.lineStart}-${lineEnd}`)
+  }
+  fields.push(
     `symbols:\n${chunk.symbolIds
       .map((id) => symbols[id])
       .filter((symbol) => symbol)
       .map((symbol) => `${symbol.kind} ${symbol.name}`)
       .join("\n")}`,
-    `text:\n${chunk.text}`,
-  ].join("\n")
+  )
+  fields.push(`text:\n${chunk.text}`)
+  return fields.join("\n")
 }
 
 async function scanFiles(root: string, includeGlobs: string[], excludeGlobs: string[]) {

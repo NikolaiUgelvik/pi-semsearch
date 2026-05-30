@@ -229,6 +229,64 @@ describe("topology", () => {
     expect(chunks[1].childChunkIds).toEqual([])
   })
 
+  test("does not link chunks with the same range as parent or child", () => {
+    const chunks = attachTopology(
+      [
+        {
+          ...base,
+          id: "chunk:a",
+          kind: "block",
+          range: { byteStart: 0, byteEnd: 40, lineStart: 1, lineEnd: 4 },
+          text: "same range a",
+          symbolIds: [],
+        },
+        {
+          ...base,
+          id: "chunk:b",
+          kind: "block",
+          range: { byteStart: 0, byteEnd: 40, lineStart: 1, lineEnd: 4 },
+          text: "same range b",
+          symbolIds: [],
+        },
+      ] as ChunkRecord[],
+      {},
+    )
+
+    expect(chunks[0].parentChunkId).toBeUndefined()
+    expect(chunks[0].childChunkIds).toEqual([])
+    expect(chunks[1].parentChunkId).toBeUndefined()
+    expect(chunks[1].childChunkIds).toEqual([])
+  })
+
+  test("links chunks with strictly containing ranges as parent and child", () => {
+    const chunks = attachTopology(
+      [
+        {
+          ...base,
+          id: "chunk:parent",
+          kind: "block",
+          range: { byteStart: 0, byteEnd: 40, lineStart: 1, lineEnd: 4 },
+          text: "parent",
+          symbolIds: [],
+        },
+        {
+          ...base,
+          id: "chunk:child",
+          kind: "block",
+          range: { byteStart: 10, byteEnd: 30, lineStart: 2, lineEnd: 3 },
+          text: "child",
+          symbolIds: [],
+        },
+      ] as ChunkRecord[],
+      {},
+    )
+
+    expect(chunks[0].parentChunkId).toBeUndefined()
+    expect(chunks[0].childChunkIds).toEqual(["chunk:child"])
+    expect(chunks[1].parentChunkId).toBe("chunk:parent")
+    expect(chunks[1].childChunkIds).toEqual([])
+  })
+
   test("summarizes topology with labels and one-based ranges", () => {
     const classSymbol: SymbolRecord = {
       id: "sym:class:A",

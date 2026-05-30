@@ -1,7 +1,7 @@
 import path from "node:path"
 import process from "node:process"
 import { z } from "zod"
-import type { HydeOptions } from "./types.js"
+import type { ChunkingOptions, HydeOptions } from "./types.js"
 
 const ApiConfig = z.object({
   baseURL: z.string().url().optional(),
@@ -28,6 +28,12 @@ const RetrievalOptions = z.object({
   hybrid: HybridOptions.optional(),
 })
 
+const ChunkingOptionsSchema = z.object({
+  overlap: z.number().int().nonnegative().optional(),
+  expansion: z.boolean().optional(),
+  minSemanticNonWhitespaceChars: z.number().int().positive().optional(),
+})
+
 const OptionsSchema = z.object({
   embedding: ApiConfig.optional(),
   hyde: ApiConfig.extend({
@@ -36,6 +42,7 @@ const OptionsSchema = z.object({
   }).optional(),
   rerank: RerankConfig.optional(),
   retrieval: RetrievalOptions.optional(),
+  chunking: ChunkingOptionsSchema.optional(),
   maxChunkNonWhitespaceChars: z.number().int().positive().optional(),
   maxContextChars: z.number().int().positive().optional(),
   topK: z.number().int().positive().optional(),
@@ -49,6 +56,7 @@ const ApiFields = ApiConfig.shape
 const HydeFields = OptionFields.hyde.unwrap().shape
 const RerankFields = OptionFields.rerank.unwrap().shape
 const HybridFields = RetrievalOptions.shape.hybrid.unwrap().shape
+const ChunkingFields = OptionFields.chunking.unwrap().shape
 const DEFAULT_HYDE_THRESHOLD = 0.35
 const DEFAULT_RERANK_CANDIDATE_MULTIPLIER = 4
 const DEFAULT_HYBRID_OPTIONS = {
@@ -59,6 +67,11 @@ const DEFAULT_HYBRID_OPTIONS = {
   bm25CandidateMultiplier: 8,
   vectorWeight: 1,
   bm25Weight: 1,
+}
+const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = {
+  overlap: 0,
+  expansion: false,
+  minSemanticNonWhitespaceChars: 8,
 }
 const DEFAULT_MAX_CHUNK_NON_WHITESPACE_CHARS = 2000
 const DEFAULT_MAX_CONTEXT_CHARS = 12_000
@@ -76,6 +89,7 @@ export function parseOptions(input: unknown, env: Record<string, string | undefi
     hyde: OptionFields.hyde.safeParse(inputRecord.success ? inputRecord.data.hyde : undefined),
     rerank: OptionFields.rerank.safeParse(inputRecord.success ? inputRecord.data.rerank : undefined),
     retrieval: OptionFields.retrieval.safeParse(inputRecord.success ? inputRecord.data.retrieval : undefined),
+    chunking: OptionFields.chunking.safeParse(inputRecord.success ? inputRecord.data.chunking : undefined),
     maxChunkNonWhitespaceChars: OptionFields.maxChunkNonWhitespaceChars.safeParse(
       inputRecord.success ? inputRecord.data.maxChunkNonWhitespaceChars : undefined,
     ),
@@ -100,6 +114,9 @@ export function parseOptions(input: unknown, env: Record<string, string | undefi
     retrieval: parsed.retrieval.success
       ? parsed.retrieval.data
       : parseRetrievalOptions(inputRecord.success ? inputRecord.data.retrieval : undefined),
+    chunking: parsed.chunking.success
+      ? parsed.chunking.data
+      : parseChunkingOptions(inputRecord.success ? inputRecord.data.chunking : undefined),
     maxChunkNonWhitespaceChars: parsed.maxChunkNonWhitespaceChars.success
       ? parsed.maxChunkNonWhitespaceChars.data
       : undefined,
@@ -172,6 +189,12 @@ export function parseOptions(input: unknown, env: Record<string, string | undefi
         vectorWeight: raw.retrieval?.hybrid?.vectorWeight ?? DEFAULT_HYBRID_OPTIONS.vectorWeight,
         bm25Weight: raw.retrieval?.hybrid?.bm25Weight ?? DEFAULT_HYBRID_OPTIONS.bm25Weight,
       },
+    },
+    chunking: {
+      overlap: raw.chunking?.overlap ?? DEFAULT_CHUNKING_OPTIONS.overlap,
+      expansion: raw.chunking?.expansion ?? DEFAULT_CHUNKING_OPTIONS.expansion,
+      minSemanticNonWhitespaceChars:
+        raw.chunking?.minSemanticNonWhitespaceChars ?? DEFAULT_CHUNKING_OPTIONS.minSemanticNonWhitespaceChars,
     },
     maxChunkNonWhitespaceChars: raw.maxChunkNonWhitespaceChars ?? DEFAULT_MAX_CHUNK_NON_WHITESPACE_CHARS,
     maxContextChars: raw.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS,
@@ -268,6 +291,29 @@ function parseRetrievalOptions(input: unknown) {
 
   return {
     hybrid: parseHybridOptions(inputRecord.data.hybrid),
+  }
+}
+
+function parseChunkingOptions(input: unknown) {
+  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  if (!inputRecord.success) {
+    return
+  }
+
+  const parsed = {
+    overlap: ChunkingFields.overlap.safeParse(inputRecord.data.overlap),
+    expansion: ChunkingFields.expansion.safeParse(inputRecord.data.expansion),
+    minSemanticNonWhitespaceChars: ChunkingFields.minSemanticNonWhitespaceChars.safeParse(
+      inputRecord.data.minSemanticNonWhitespaceChars,
+    ),
+  }
+
+  return {
+    overlap: parsed.overlap.success ? parsed.overlap.data : undefined,
+    expansion: parsed.expansion.success ? parsed.expansion.data : undefined,
+    minSemanticNonWhitespaceChars: parsed.minSemanticNonWhitespaceChars.success
+      ? parsed.minSemanticNonWhitespaceChars.data
+      : undefined,
   }
 }
 

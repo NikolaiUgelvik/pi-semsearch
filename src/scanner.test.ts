@@ -2,8 +2,20 @@ import { describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, symlink, utimes } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { createIndexer } from "./scanner.js"
+import { createIndexer as createScannerIndexer } from "./scanner.js"
 import { createEmptyIndex, createIndexStore } from "./store.js"
+import type { ChunkingOptions } from "./types.js"
+
+const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 }
+type CreateIndexerInput = Parameters<typeof createScannerIndexer>[0]
+type TestCreateIndexerInput = Omit<CreateIndexerInput, "options"> & {
+  options: Omit<CreateIndexerInput["options"], "chunking"> & { chunking?: ChunkingOptions }
+}
+const createIndexer = (input: TestCreateIndexerInput) =>
+  createScannerIndexer({
+    ...input,
+    options: { ...input.options, chunking: input.options.chunking ?? DEFAULT_CHUNKING_OPTIONS },
+  })
 
 describe("createIndexer", () => {
   test("indexes changed files and removes deleted files", async () => {
@@ -214,6 +226,65 @@ describe("createIndexer", () => {
       expect(index.files).toEqual(previousFiles)
       expect(index.chunks).toEqual(previousChunks)
       expect(index.symbols).toEqual(previousSymbols)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("reindexes unchanged files when chunking options change", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      let parseCalls = 0
+      let embedCalls = 0
+      let index = createEmptyIndex({
+        projectId: "p",
+        worktree: dir,
+        cacheKey: "key",
+        maxChunkNonWhitespaceChars: 2000,
+        chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      })
+      const makeIndexer = (chunking: { overlap: number; expansion: boolean; minSemanticNonWhitespaceChars: number }) =>
+        createIndexer({
+          worktree: dir,
+          options: {
+            maxChunkNonWhitespaceChars: 2000,
+            includeGlobs: ["**/*.ts"],
+            excludeGlobs: [],
+            topK: 5,
+            maxContextChars: 12_000,
+            chunking,
+          },
+          store: {
+            read: async () => index,
+            write: async (next) => {
+              index = next
+            },
+          },
+          parse: async (_filePath, source) => {
+            parseCalls++
+            return {
+              language: "typescript",
+              root: {
+                type: "program",
+                startIndex: 0,
+                endIndex: source.length,
+                children: [{ type: "function_declaration", startIndex: 0, endIndex: source.length, children: [] }],
+              },
+            }
+          },
+          embed: async () => {
+            embedCalls++
+            return [1, 0]
+          },
+        })
+
+      await makeIndexer({ overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 }).refresh()
+      await makeIndexer({ overlap: 1, expansion: false, minSemanticNonWhitespaceChars: 8 }).refresh()
+
+      expect(parseCalls).toBe(2)
+      expect(embedCalls).toBe(2)
+      expect(index.metadata.chunking).toEqual({ overlap: 1, expansion: false, minSemanticNonWhitespaceChars: 8 })
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -651,6 +722,62 @@ describe("createIndexer", () => {
       expect(embeddedTexts[0]).toContain("language: typescript")
       expect(embeddedTexts[0]).toContain("symbols:\nfunction a")
       expect(embeddedTexts[0]).toContain("text:\nexport function a() { return 1 }")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("adds expansion metadata to embedding input without changing stored chunk text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const source = "export function findWidget() { return 1 }\n"
+      await Bun.write(path.join(dir, "nested.ts"), source)
+      let index = createEmptyIndex({
+        projectId: "p",
+        worktree: dir,
+        cacheKey: "key",
+        maxChunkNonWhitespaceChars: 2000,
+        chunking: { overlap: 0, expansion: true, minSemanticNonWhitespaceChars: 8 },
+      })
+      const embeddedTexts: string[] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          chunking: { overlap: 0, expansion: true, minSemanticNonWhitespaceChars: 8 },
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async (_filePath, text) => ({
+          language: "typescript",
+          root: {
+            type: "program",
+            startIndex: 0,
+            endIndex: text.length,
+            children: [{ type: "function_declaration", startIndex: 0, endIndex: text.length, children: [] }],
+          },
+        }),
+        embed: async (text) => {
+          embeddedTexts.push(text)
+          return [1, 0]
+        },
+      })
+
+      await indexer.refresh()
+
+      const chunk = Object.values(index.chunks)[0]
+      expect(chunk.text).toBe(source)
+      expect(embeddedTexts[0]).toContain("chunk:\nkind: file")
+      expect(embeddedTexts[0]).toContain("range: 1-1")
+      expect(embeddedTexts[0]).toContain("text:\nexport function findWidget() { return 1 }")
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

@@ -182,6 +182,103 @@ describe("parseOptions", () => {
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("retrieval.hybrid.rrfK:"))).toBe(true)
   })
 
+  test("applies chunking defaults", () => {
+    const options = parseOptions(
+      {
+        embedding: {
+          baseURL: "https://example.test/v1",
+          apiKey: "literal",
+          model: "text-embedding-3-small",
+        },
+      },
+      {},
+    )
+
+    expect(options.chunking).toEqual({
+      overlap: 0,
+      expansion: false,
+      minSemanticNonWhitespaceChars: 8,
+    })
+  })
+
+  test("parses configured chunking options", () => {
+    const options = parseOptions(
+      {
+        embedding: {
+          baseURL: "https://example.test/v1",
+          apiKey: "literal",
+          model: "text-embedding-3-small",
+        },
+        chunking: {
+          overlap: 1,
+          expansion: true,
+          minSemanticNonWhitespaceChars: 12,
+        },
+      },
+      {},
+    )
+
+    expect(options.chunking).toEqual({
+      overlap: 1,
+      expansion: true,
+      minSemanticNonWhitespaceChars: 12,
+    })
+  })
+
+  test("reports invalid chunking options and falls back to defaults", () => {
+    const options = parseOptions(
+      {
+        embedding: {
+          baseURL: "https://example.test/v1",
+          apiKey: "literal",
+          model: "text-embedding-3-small",
+        },
+        chunking: {
+          overlap: -1,
+          expansion: "yes",
+          minSemanticNonWhitespaceChars: 0,
+        },
+      },
+      {},
+    )
+
+    expect(options.chunking).toEqual({
+      overlap: 0,
+      expansion: false,
+      minSemanticNonWhitespaceChars: 8,
+    })
+    expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("chunking.overlap:"))).toBe(true)
+    expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("chunking.expansion:"))).toBe(true)
+    expect(
+      options.diagnostics.some((diagnostic) => diagnostic.startsWith("chunking.minSemanticNonWhitespaceChars:")),
+    ).toBe(true)
+  })
+
+  test("preserves valid chunking fields when a sibling field is invalid", () => {
+    const options = parseOptions(
+      {
+        embedding: {
+          baseURL: "https://example.test/v1",
+          apiKey: "literal",
+          model: "text-embedding-3-small",
+        },
+        chunking: {
+          overlap: -1,
+          expansion: true,
+          minSemanticNonWhitespaceChars: 12,
+        },
+      },
+      {},
+    )
+
+    expect(options.chunking).toEqual({
+      overlap: 0,
+      expansion: true,
+      minSemanticNonWhitespaceChars: 12,
+    })
+    expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("chunking.overlap:"))).toBe(true)
+  })
+
   test("returns missing embedding config instead of throwing", () => {
     const options = parseOptions({}, {})
 
