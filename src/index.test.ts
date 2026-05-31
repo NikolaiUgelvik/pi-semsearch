@@ -252,7 +252,7 @@ describe("cast plugin", () => {
       const hooks = await plugin({ ...input, directory: dir, worktree: dir } as never, {
         embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
       })
-      hooks.config?.({ tool_output: { max_bytes: 7000 } } as never)
+      hooks.config?.({ tool_output: { max_bytes: 5000 } } as never)
 
       const result = await semanticGetChunkTool(hooks).execute({ id: "root", includeChildren: true }, {
         worktree: dir,
@@ -309,6 +309,34 @@ describe("cast plugin", () => {
     expect(result.title).toBe("Semantic chunk lookup is not configured")
     expect(result.output).toContain("embedding.model is required")
     expect(result.metadata).toEqual({ configured: false })
+  })
+
+  test("semantic_search_code runs with valid embedding config despite non-fatal option diagnostics", async () => {
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: [],
+      }),
+    })
+
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      topK: 0,
+    })
+    const result = await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(result.title).toBe("Semantic code search: session")
+    expect(result.metadata).toMatchObject({ resultCount: 0 })
   })
 
   test("store creation failure registers tools and reports unavailable diagnostics", async () => {
@@ -637,6 +665,49 @@ describe("cast plugin", () => {
         directory: "/repo",
       } as never),
     ).rejects.toThrow("permission denied")
+    expect(refreshes).toBe(2)
+  })
+
+  test("failed forced refresh does not poison later normal searches", async () => {
+    let refreshes = 0
+    const plugin = createCastPluginForTest({
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          if (refreshes === 2) {
+            throw new Error("permission denied")
+          }
+          return emptyReadyIndex()
+        },
+      }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: [],
+      }),
+    })
+
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed", dimensions: 2 },
+    })
+    await expect(
+      semanticSearchTool(hooks).execute({ query: "session", refresh: true }, {
+        worktree: "/repo",
+        directory: "/repo",
+      } as never),
+    ).rejects.toThrow("permission denied")
+
+    const result = await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(result.title).toBe("Semantic code search: session")
     expect(refreshes).toBe(2)
   })
 

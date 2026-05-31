@@ -142,7 +142,7 @@ export function createCastPluginForTest(
         return Promise.resolve()
       }
       const indexStore = store
-      refresh = refreshTail
+      const nextRefresh = refreshTail
         .then(() => {
           if (storeError) {
             return
@@ -176,11 +176,24 @@ export function createCastPluginForTest(
           }
           return
         })
-      refreshTail = refresh.then(
+      refresh = nextRefresh
+      nextRefresh.then(
+        () => {
+          if (refresh === nextRefresh) {
+            refresh = undefined
+          }
+        },
+        () => {
+          if (refresh === nextRefresh) {
+            refresh = undefined
+          }
+        },
+      )
+      refreshTail = nextRefresh.then(
         () => undefined,
         () => undefined,
       )
-      return refresh
+      return nextRefresh
     }
 
     const recordStoreUnavailable = (error: unknown) => {
@@ -296,7 +309,7 @@ export function createCastPluginForTest(
     queueInitialRefresh(options, queueRefresh)
 
     const semanticSearchUnavailable = () => {
-      if (!options.embedding || options.diagnostics.length > 0) {
+      if (!options.embedding) {
         return {
           title: "Semantic code search is not configured",
           output: options.diagnostics.join("\n"),
@@ -416,7 +429,7 @@ Use this after semantic_search_code when you need the exact cached chunk, expand
             maxContextChars: tool.schema.number().int().positive().optional(),
           },
           async execute(args) {
-            if (!options.embedding || options.diagnostics.length > 0) {
+            if (!options.embedding) {
               return {
                 title: "Semantic chunk lookup is not configured",
                 output: options.diagnostics.join("\n"),
@@ -559,7 +572,7 @@ function queueInitialRefresh(
   options: ReturnType<typeof parseOptions>,
   queueRefresh: (input: { background?: boolean }) => Promise<unknown>,
 ) {
-  if (options.embedding && options.diagnostics.length === 0) {
+  if (options.embedding) {
     queueRefresh({ background: true })
   }
 }

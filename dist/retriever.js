@@ -284,11 +284,16 @@ async function rerankResults(input) {
         return chunk ? [{ result, chunk }] : [];
     });
     const reranked = await input.rerank(input.query, candidates.map(({ chunk }) => rerankDocument(chunk)));
-    return reranked.flatMap((rerankedResult, index) => {
+    const seenCandidateIndexes = new Set();
+    const rerankedResults = reranked.flatMap((rerankedResult, index) => {
+        if (seenCandidateIndexes.has(rerankedResult.index)) {
+            return [];
+        }
         const candidate = candidates[rerankedResult.index];
         if (!candidate) {
             return [];
         }
+        seenCandidateIndexes.add(rerankedResult.index);
         const existing = input.retrieval.get(candidate.result.id);
         input.retrieval.set(candidate.result.id, {
             ...(existing ?? { mode: "vector" }),
@@ -297,6 +302,8 @@ async function rerankResults(input) {
         });
         return [{ id: candidate.result.id, score: rerankedResult.score }];
     });
+    const missingResults = candidates.flatMap(({ result }, index) => (seenCandidateIndexes.has(index) ? [] : [result]));
+    return [...rerankedResults, ...missingResults];
 }
 function rerankDocument(chunk) {
     return `${chunk.filePath}:${formatLineRange(chunk.range.lineStart, chunk.range.lineEnd)}\nkind: ${chunk.kind}\n${chunk.text}`;

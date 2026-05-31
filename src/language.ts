@@ -103,7 +103,11 @@ export async function parseSource(filePath: string, source: string) {
   if (!tree) {
     return { language: entry.id, root: undefined }
   }
-  return { language: entry.id, root: adaptNode(tree.rootNode) }
+  try {
+    return { language: entry.id, root: adaptNode(tree.rootNode) }
+  } finally {
+    tree.delete()
+  }
 }
 
 function parserFor(entry: ParserEntry) {

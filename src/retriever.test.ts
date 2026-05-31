@@ -1277,6 +1277,62 @@ describe("retrieve", () => {
     expect(output.diagnostics.at(-1)).toBe("Rerank failed: provider unavailable")
   })
 
+  test("preserves omitted candidates after partial rerank responses", async () => {
+    const index = createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+    })
+    index.metadata.status = "ready"
+    index.chunks.c1 = {
+      id: "c1",
+      filePath: "a.ts",
+      language: "typescript",
+      kind: "function",
+      range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+      text: "function first() {}",
+      nonWhitespaceChars: 18,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: [],
+      embedding: [1, 0],
+    }
+    index.chunks.c2 = {
+      id: "c2",
+      filePath: "b.ts",
+      language: "typescript",
+      kind: "function",
+      range: { byteStart: 0, byteEnd: 20, lineStart: 1, lineEnd: 1 },
+      text: "function second() {}",
+      nonWhitespaceChars: 19,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: [],
+      embedding: [0.9, Math.sqrt(0.19)],
+    }
+
+    const output = await retrieveFromIndex({
+      index,
+      input: { query: "best match", topK: 2, includeParents: true, maxContextChars: 100 },
+      options: {
+        topK: 2,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        rerank: rerankOptions({ candidateMultiplier: 1 }),
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      rerank: async () => [{ index: 1, score: 0.99 }],
+      readSource: async (filePath) => index.chunks[filePath === "a.ts" ? "c1" : "c2"].text,
+    })
+
+    expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["c2", "c1"])
+    expect(output.results.map((result) => result.finalScore)).toEqual([0.99, 1])
+    expect(output.results[0].retrieval?.rerankRank).toBe(1)
+    expect(output.results[1].retrieval?.rerankRank).toBeUndefined()
+  })
+
   test("uses active score when HyDE promotes a result outside initial candidates", async () => {
     const index = createEmptyIndex({
       projectId: "p",

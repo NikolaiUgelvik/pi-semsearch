@@ -377,6 +377,39 @@ describe("topology", () => {
     })
   })
 
+  test("caps summarized topology children", () => {
+    const childCount = 30
+    const chunk = {
+      ...base,
+      id: "chunk:parent",
+      kind: "function",
+      range: { byteStart: 0, byteEnd: 1000, lineStart: 1, lineEnd: 50 },
+      text: "parent",
+      childChunkIds: Array.from({ length: childCount }, (_, index) => `chunk:child:${index}`),
+    } as ChunkRecord
+    const chunks = {
+      [chunk.id]: chunk,
+      ...Object.fromEntries(
+        Array.from({ length: childCount }, (_, index) => [
+          `chunk:child:${index}`,
+          {
+            ...base,
+            id: `chunk:child:${index}`,
+            kind: "block",
+            range: { byteStart: index, byteEnd: index + 1, lineStart: index + 1, lineEnd: index + 1 },
+            text: `child ${index}`,
+          } as ChunkRecord,
+        ]),
+      ),
+    }
+
+    const topology = summarizeTopology(chunk, chunks, {})
+
+    expect(topology.children).toHaveLength(20)
+    expect(topology.children.at(0)?.id).toBe("chunk:child:0")
+    expect(topology.children.at(-1)?.id).toBe("chunk:child:19")
+  })
+
   test("uses local chunk snippets before broad enclosing symbols", () => {
     const broadSymbol: SymbolRecord = {
       id: "sym:function:store",

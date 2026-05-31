@@ -215,6 +215,68 @@ describe("chunk lookup", () => {
     expect(output.chunk?.related.childrenPage).toEqual({ offset: 1, limit: 1, total: 3, hasMore: true })
   })
 
+  test("caps default related child pages and parent context", async () => {
+    const index = createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+    })
+    index.metadata.status = "ready"
+    const childCount = 30
+    const parentText = "p".repeat(13_000)
+    const source = `${parentText}\n${Array.from({ length: childCount }, (_, index) => `child-${index}`).join("\n")}\n`
+    index.symbols.parent = {
+      id: "parent",
+      name: "parent",
+      kind: "function",
+      filePath: "src/parent.ts",
+      range: { byteStart: 0, byteEnd: parentText.length, lineStart: 1, lineEnd: 1 },
+      childSymbolIds: [],
+    }
+    index.chunks.parent = {
+      id: "parent",
+      filePath: "src/parent.ts",
+      language: "typescript",
+      kind: "function",
+      range: { byteStart: 0, byteEnd: parentText.length, lineStart: 1, lineEnd: 1 },
+      text: parentText,
+      nonWhitespaceChars: parentText.length,
+      nodeTypes: [],
+      symbolIds: ["parent"],
+      childChunkIds: Array.from({ length: childCount }, (_, index) => `child-${index}`),
+    }
+    let byteStart = parentText.length + 1
+    for (let childIndex = 0; childIndex < childCount; childIndex++) {
+      const text = `child-${childIndex}`
+      index.chunks[`child-${childIndex}`] = {
+        id: `child-${childIndex}`,
+        filePath: "src/parent.ts",
+        language: "typescript",
+        kind: "block",
+        range: { byteStart, byteEnd: byteStart + text.length, lineStart: childIndex + 2, lineEnd: childIndex + 2 },
+        text,
+        nonWhitespaceChars: text.length,
+        nodeTypes: [],
+        symbolIds: [],
+        parentChunkId: "parent",
+        childChunkIds: [],
+      }
+      byteStart += text.length + 1
+    }
+
+    const output = await getChunkById({
+      index,
+      input: { id: "parent" },
+      readSource: async () => source,
+    })
+
+    expect(output.chunk?.text).toHaveLength(12_000)
+    expect(output.chunk?.parentText).toHaveLength(12_000)
+    expect(output.chunk?.related.children).toHaveLength(20)
+    expect(output.chunk?.related.childrenPage).toEqual({ offset: 0, limit: 20, total: childCount, hasMore: true })
+  })
+
   test("returns empty child page metadata when children are disabled", async () => {
     const index = createEmptyIndex({
       projectId: "p",

@@ -4,6 +4,7 @@ import type { ChunkRecord, SearchResultTopology, SymbolRecord, TopologyNode } fr
 const LEADING_SEPARATOR_PATTERN = /^[,;]\s*/u
 const SNIPPET_LABEL_MAX_LENGTH = 80
 const SNIPPET_LABEL_PREFIX_LENGTH = 77
+const TOPOLOGY_CHILDREN_LIMIT = 20
 
 function expandWithParentContext(input: {
   chunk: ChunkRecord
@@ -45,7 +46,7 @@ function summarizeTopology(
   return {
     chunk: summarizeChunk(chunk, symbols),
     ...optionalChunk(chunks, chunk.parentChunkId, symbols, "parent"),
-    children: chunk.childChunkIds.flatMap((id) => {
+    children: chunk.childChunkIds.slice(0, TOPOLOGY_CHILDREN_LIMIT).flatMap((id) => {
       const child = chunks[id]
       return child ? [summarizeChunk(child, symbols)] : []
     }),

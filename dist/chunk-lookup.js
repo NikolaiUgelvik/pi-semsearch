@@ -17,13 +17,13 @@ async function getChunkById(input) {
         };
     }
     const source = await getSource(chunk.filePath);
-    const chunkText = validatedChunkText(chunk, source, diagnostics, "chunk text omitted");
+    const maxContextChars = input.input.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
     const context = parentContext({
         chunk,
         diagnostics,
         includeParents: input.input.includeParents,
         index: input.index,
-        maxContextChars: input.input.maxContextChars,
+        maxContextChars,
         source,
     });
     const related = await relatedChunks({
@@ -36,7 +36,7 @@ async function getChunkById(input) {
         includeChildren: input.input.includeChildren,
         includeParents: input.input.includeParents,
         includeSiblings: input.input.includeSiblings,
-        maxContextChars: input.input.maxContextChars,
+        maxContextChars,
         symbols: input.index.symbols,
     });
     return {
@@ -47,7 +47,7 @@ async function getChunkById(input) {
             range: chunk.range,
             kind: chunk.kind,
             breadcrumbs: context.breadcrumbs,
-            text: chunkText,
+            text: primaryChunkText(input.input, validatedChunkText(chunk, source, diagnostics, "chunk text omitted")),
             parentText: context.parentText,
             parentRange: context.parentRange,
             topology: summarizeTopology(chunk, input.index.chunks, input.index.symbols),
@@ -57,6 +57,10 @@ async function getChunkById(input) {
     };
 }
 const DEFAULT_CHILDREN_LIMIT = 20;
+const DEFAULT_MAX_CONTEXT_CHARS = 12_000;
+function primaryChunkText(input, text) {
+    return input.maxContextChars === undefined ? text.slice(0, DEFAULT_MAX_CONTEXT_CHARS) : text;
+}
 function parentContext(input) {
     if (input.includeParents === false) {
         return { breadcrumbs: chunkBreadcrumbs(input.chunk, input.index.symbols) };
@@ -66,7 +70,7 @@ function parentContext(input) {
             chunk: input.chunk,
             symbols: input.index.symbols,
             source: input.source.text,
-            maxContextChars: input.maxContextChars ?? Number.MAX_SAFE_INTEGER,
+            maxContextChars: input.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS,
         });
     }
     if (input.source.ok) {
@@ -148,7 +152,7 @@ async function relatedChunk(input) {
     const text = validatedChunkText(input.chunk, source, input.diagnostics, "related chunk text omitted");
     return {
         ...summarizeChunk(input.chunk, input.symbols),
-        text: input.maxContextChars === undefined ? text : text.slice(0, input.maxContextChars),
+        text: text.slice(0, input.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS),
     };
 }
 function validatedChunkText(chunk, source, diagnostics, omittedReason) {
