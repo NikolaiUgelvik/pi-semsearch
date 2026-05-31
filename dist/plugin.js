@@ -7,7 +7,7 @@ import { HYDE_SYSTEM_PROMPT } from "./hyde.js";
 import { parseSource } from "./language.js";
 import { createOpenAIClient } from "./openai.js";
 import { parseOptions } from "./options.js";
-import { retrieve } from "./retriever.js";
+import { retrieveFromStore } from "./retriever.js";
 import { createIndexer } from "./scanner.js";
 import { createIndexStore } from "./store.js";
 const COMPACTION_DIAGNOSTIC = "output compacted to fit opencode tool_output limits; use semantic_get_chunk for more context";
@@ -161,14 +161,46 @@ export function createCastPluginForTest(dependencies = {}) {
             }
             return wrapped;
         };
-        const vectorCandidateStore = () => {
-            if (!hasVectorCandidateStore(store)) {
-                return;
+        const retrievalIndexStore = () => {
+            if (!store) {
+                throw new IndexUnavailableError(storeError ?? "index unavailable");
             }
-            return {
-                searchVectorCandidates: async (queryEmbedding, topK, paths) => {
+            const indexStore = store;
+            const wrapped = {
+                readMetadata: async () => {
+                    if (!hasReadMetadataStore(indexStore)) {
+                        throw new IndexUnavailableError(storeError ?? "index unavailable");
+                    }
                     try {
-                        return await store.searchVectorCandidates(queryEmbedding, topK, paths);
+                        return await indexStore.readMetadata();
+                    }
+                    catch (error) {
+                        if (!recordStoreUnavailable(error)) {
+                            throw error;
+                        }
+                        throw new IndexUnavailableError(storeError ?? formatThrownError(error));
+                    }
+                },
+                searchVectorCandidates: async (queryEmbedding, topK, paths) => {
+                    if (!hasVectorCandidateStore(indexStore)) {
+                        throw new IndexUnavailableError(storeError ?? "index unavailable");
+                    }
+                    try {
+                        return await indexStore.searchVectorCandidates(queryEmbedding, topK, paths);
+                    }
+                    catch (error) {
+                        if (!recordStoreUnavailable(error)) {
+                            throw error;
+                        }
+                        throw new IndexUnavailableError(storeError ?? formatThrownError(error));
+                    }
+                },
+                hydrateChunks: async (chunkIds) => {
+                    if (!hasHydrateChunksStore(indexStore)) {
+                        throw new IndexUnavailableError(storeError ?? "index unavailable");
+                    }
+                    try {
+                        return await indexStore.hydrateChunks(chunkIds);
                     }
                     catch (error) {
                         if (!recordStoreUnavailable(error)) {
@@ -178,6 +210,20 @@ export function createCastPluginForTest(dependencies = {}) {
                     }
                 },
             };
+            if (hasLexicalCandidateStore(indexStore)) {
+                wrapped.searchLexicalCandidates = async (query, topK, paths) => {
+                    try {
+                        return await indexStore.searchLexicalCandidates(query, topK, paths);
+                    }
+                    catch (error) {
+                        if (!recordStoreUnavailable(error)) {
+                            throw error;
+                        }
+                        throw new IndexUnavailableError(storeError ?? formatThrownError(error));
+                    }
+                };
+            }
+            return wrapped;
         };
         queueInitialRefresh(options, queueRefresh);
         const semanticSearchUnavailable = () => {
@@ -197,15 +243,14 @@ export function createCastPluginForTest(dependencies = {}) {
             }
             await ensureSearchIndexReady(args.refresh === true, queueRefresh, () => refresh, () => storeError);
             try {
-                return await (dependencies.retrieve ?? retrieve)({
-                    index: await readIndex(),
+                return await (dependencies.retrieve ?? retrieveFromStore)({
                     input: args,
                     options: { ...options, hybrid: options.retrieval.hybrid, rerank: options.rerank },
                     embed: (text) => client.embed({ ...embedding, input: text }),
                     generateHyde: (query) => generateHydeText({ query, context, hyde: options.hyde, client, generateOpenCodeHyde }),
                     rerank: (query, documents) => rerankDocuments(query, documents, options.rerank, client),
                     readSource: async (filePath) => Bun.file(await resolveWorktreePath(input.worktree, filePath)).text(),
-                    indexStore: vectorCandidateStore(),
+                    indexStore: retrievalIndexStore(),
                 });
             }
             catch (error) {
@@ -347,6 +392,18 @@ function hasVectorCandidateStore(value) {
         value !== null &&
         "searchVectorCandidates" in value &&
         typeof value.searchVectorCandidates === "function");
+}
+function hasLexicalCandidateStore(value) {
+    return (typeof value === "object" &&
+        value !== null &&
+        "searchLexicalCandidates" in value &&
+        typeof value.searchLexicalCandidates === "function");
+}
+function hasReadMetadataStore(value) {
+    return (typeof value === "object" && value !== null && "readMetadata" in value && typeof value.readMetadata === "function");
+}
+function hasHydrateChunksStore(value) {
+    return (typeof value === "object" && value !== null && "hydrateChunks" in value && typeof value.hydrateChunks === "function");
 }
 function addRunStoreMethods(wrapped, indexStore, wrapStoreOperation) {
     const maybeRunStore = indexStore;

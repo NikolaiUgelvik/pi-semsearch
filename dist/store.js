@@ -6,11 +6,16 @@ import path from "node:path";
 import { load as loadSqliteVec } from "sqlite-vec";
 import { matchesPaths } from "./path-filter.js";
 const INDEX_SCHEMA_VERSION = 1;
-const SQLITE_SCHEMA_VERSION = 3;
+const SQLITE_SCHEMA_VERSION = 4;
 const RUN_ID_RANDOM_RADIX = 36;
+const SQLITE_VECTOR_PATH_FILTER_INITIAL_K = 100;
+const SQLITE_VECTOR_PATH_FILTER_MAX_K = 10_000;
+const SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER = 10;
+const SQLITE_LEXICAL_PATH_FILTER_MAX_K = 1000;
 const INDEX_STATUSES = ["empty", "indexing", "ready", "stale", "error"];
 const CHUNK_KINDS = ["file", "class", "function", "method", "block", "fallback"];
 const SYMBOL_KINDS = ["module", "class", "function", "method", "interface"];
+const PATH_FILTER_GLOB_SYNTAX_PATTERN = /[*?[{]|[!+@]\(/;
 const DEFAULT_CHUNKING_OPTIONS = {
     overlap: 0,
     expansion: false,
@@ -47,6 +52,7 @@ export function createEmptyIndex(input) {
 export function createIndexStore(input) {
     return createSqliteIndexStore(input.cacheDir, input.cacheKey, input.embeddingDimensions);
 }
+// biome-ignore lint/complexity/noExcessiveLinesPerFunction: The store factory intentionally exposes the SQLite store API in one object.
 function createSqliteIndexStore(cacheDir, cacheKey, embeddingDimensions) {
     const file = path.join(cacheDir, cacheKey, "index.sqlite");
     return {
@@ -68,10 +74,43 @@ function createSqliteIndexStore(cacheDir, cacheKey, embeddingDimensions) {
                 db.close();
             }
         },
+        async readMetadata() {
+            const db = await openSqliteIndex(file, embeddingDimensions);
+            try {
+                return readSqliteMetadata(db, cacheKey, embeddingDimensions);
+            }
+            finally {
+                db.close();
+            }
+        },
+        async hydrateChunks(chunkIds) {
+            const db = await openSqliteIndex(file, embeddingDimensions);
+            try {
+                return hydrateSqliteChunks(db, cacheKey, embeddingDimensions, chunkIds);
+            }
+            finally {
+                db.close();
+            }
+        },
         async searchVectorCandidates(queryEmbedding, topK, paths) {
+            if (queryEmbedding.length === 0 || topK <= 0) {
+                return [];
+            }
             const db = await openSqliteIndex(file, embeddingDimensions ?? queryEmbedding.length);
             try {
                 return searchSqliteVectorCandidates(db, queryEmbedding, topK, paths);
+            }
+            finally {
+                db.close();
+            }
+        },
+        async searchLexicalCandidates(query, topK, paths) {
+            if (query.trim().length === 0 || topK <= 0) {
+                return [];
+            }
+            const db = await openSqliteIndex(file, embeddingDimensions);
+            try {
+                return searchSqliteLexicalCandidates(db, query, topK, paths);
             }
             finally {
                 db.close();
@@ -129,28 +168,28 @@ async function openSqliteIndex(file, embeddingDimensions) {
     }
 }
 function readSqliteIndex(db, cacheKey, embeddingDimensions) {
-    const activeRun = db.query("select value from meta where key = 'active_run_id'").get();
-    if (!activeRun) {
+    const activeRunId = readActiveRunId(db);
+    if (!activeRunId) {
         return createEmptySqliteIndex(cacheKey, embeddingDimensions);
     }
     try {
-        const metadata = readRunMetadata(db, activeRun.value);
+        const metadata = readRunMetadata(db, activeRunId);
         if (!metadata) {
             return createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"]);
         }
-        const files = readFiles(db, activeRun.value);
+        const files = readFiles(db, activeRunId);
         const diagnostics = [...metadata.diagnostics];
         const index = {
             metadata: { ...metadata, diagnostics },
             files,
-            chunks: readChunks(db, activeRun.value, readVectors(db, activeRun.value), {
+            chunks: readChunks(db, activeRunId, readVectors(db, activeRunId), {
                 worktree: metadata.worktree,
                 files,
                 diagnostics,
             }),
-            symbols: readSymbols(db, activeRun.value),
+            symbols: readSymbols(db, activeRunId),
         };
-        const lexical = readLexical(db, activeRun.value);
+        const lexical = readLexical(db, activeRunId);
         if (lexical) {
             index.lexical = lexical;
         }
@@ -164,6 +203,110 @@ function readSqliteIndex(db, cacheKey, embeddingDimensions) {
         }
         return createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"]);
     }
+}
+function readSqliteMetadata(db, cacheKey, embeddingDimensions) {
+    const activeRunId = readActiveRunId(db);
+    if (!activeRunId) {
+        return createEmptySqliteIndex(cacheKey, embeddingDimensions).metadata;
+    }
+    try {
+        return (readRunMetadata(db, activeRunId) ??
+            createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"]).metadata);
+    }
+    catch (error) {
+        if (!(error instanceof CorruptIndexError)) {
+            throw error;
+        }
+        return createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"]).metadata;
+    }
+}
+function hydrateSqliteChunks(db, cacheKey, embeddingDimensions, chunkIds) {
+    const activeRunId = readActiveRunId(db);
+    if (!activeRunId) {
+        return emptyHydratedChunkSet(cacheKey, embeddingDimensions);
+    }
+    const metadata = readSqliteMetadata(db, cacheKey, embeddingDimensions);
+    if (!metadata) {
+        return emptyHydratedChunkSet(cacheKey, embeddingDimensions, ["rebuilding corrupt index"]);
+    }
+    if (chunkIds.length === 0) {
+        return { metadata, files: {}, chunks: {}, symbols: {}, diagnostics: [] };
+    }
+    const ids = chunkIdsWithTopology(db, activeRunId, chunkIds);
+    const storedChunks = readStoredChunksByIds(db, activeRunId, ids);
+    const orderedStoredChunks = ids.flatMap((chunkId) => {
+        const chunk = storedChunks.get(chunkId);
+        return chunk ? [chunk] : [];
+    });
+    const filePaths = [...new Set(orderedStoredChunks.map((chunk) => chunk.filePath))];
+    const files = readFilesByPaths(db, activeRunId, filePaths);
+    const diagnostics = [...metadata.diagnostics];
+    const sourceContext = { worktree: metadata.worktree, files, diagnostics };
+    const sourceCache = new Map();
+    const vectors = readVectorsForChunkIds(db, activeRunId, ids);
+    const chunks = {};
+    for (const storedChunk of orderedStoredChunks) {
+        const chunk = { ...storedChunk, text: readChunkText(sourceContext, sourceCache, storedChunk) };
+        const embedding = vectors.get(chunk.id);
+        if (embedding) {
+            chunk.embedding = embedding;
+        }
+        chunks[chunk.id] = chunk;
+    }
+    const lexical = readLexical(db, activeRunId);
+    const hydrated = {
+        metadata: { ...metadata, diagnostics },
+        files,
+        chunks,
+        symbols: readSymbolsByIds(db, activeRunId, [...new Set(Object.values(chunks).flatMap((chunk) => chunk.symbolIds))]),
+        diagnostics,
+    };
+    if (lexical) {
+        hydrated.lexical = lexical;
+    }
+    return hydrated;
+}
+function emptyHydratedChunkSet(cacheKey, embeddingDimensions, diagnostics) {
+    return {
+        metadata: createEmptySqliteIndex(cacheKey, embeddingDimensions, diagnostics).metadata,
+        files: {},
+        chunks: {},
+        symbols: {},
+        diagnostics: diagnostics ?? [],
+    };
+}
+function chunkIdsWithTopology(db, runId, chunkIds) {
+    const ids = [];
+    const seen = new Set();
+    const selected = readStoredChunksByIds(db, runId, [...new Set(chunkIds)]);
+    for (const chunkId of chunkIds) {
+        if (seen.has(chunkId) || !selected.has(chunkId)) {
+            continue;
+        }
+        ids.push(chunkId);
+        seen.add(chunkId);
+    }
+    for (const chunkId of ids.slice()) {
+        const chunk = selected.get(chunkId);
+        if (!chunk) {
+            continue;
+        }
+        for (const relatedId of [
+            chunk.parentChunkId,
+            ...chunk.childChunkIds,
+            chunk.previousSiblingChunkId,
+            chunk.nextSiblingChunkId,
+        ]) {
+            if (relatedId && !seen.has(relatedId)) {
+                ids.push(relatedId);
+                seen.add(relatedId);
+            }
+        }
+    }
+    return ids;
+}
+function readActiveRunId(db) {
+    return db.query("select value from meta where key = 'active_run_id'").get()?.value;
 }
 function readRunMetadata(db, runId) {
     const run = db.query("select metadata_json as metadataJson from runs where id = ?").get(runId);
@@ -183,17 +326,35 @@ function createEmptySqliteIndex(cacheKey, embeddingDimensions, diagnostics) {
     return index;
 }
 function readFiles(db, runId) {
-    const records = {};
-    const files = db
+    return fileRecordsFromRows(db
         .query(`select file_runs.path,
-              coalesce(file_runs.language, files.language) as language,
-              coalesce(file_runs.fingerprint, files.fingerprint) as fingerprint,
-              coalesce(file_runs.diagnostics_json, files.diagnostics_json) as diagnosticsJson,
-              file_runs.chunk_ids_json as chunkIdsJson
-       from file_runs
-       left join files on files.path = file_runs.path
-       where file_runs.run_id = ?`)
-        .all(runId);
+                coalesce(file_runs.language, files.language) as language,
+                coalesce(file_runs.fingerprint, files.fingerprint) as fingerprint,
+                coalesce(file_runs.diagnostics_json, files.diagnostics_json) as diagnosticsJson,
+                file_runs.chunk_ids_json as chunkIdsJson
+         from file_runs
+         left join files on files.path = file_runs.path
+         where file_runs.run_id = ?`)
+        .all(runId));
+}
+function readFilesByPaths(db, runId, filePaths) {
+    if (filePaths.length === 0) {
+        return {};
+    }
+    const placeholders = placeholdersFor(filePaths);
+    return fileRecordsFromRows(db
+        .query(`select file_runs.path,
+                coalesce(file_runs.language, files.language) as language,
+                coalesce(file_runs.fingerprint, files.fingerprint) as fingerprint,
+                coalesce(file_runs.diagnostics_json, files.diagnostics_json) as diagnosticsJson,
+                file_runs.chunk_ids_json as chunkIdsJson
+         from file_runs
+         left join files on files.path = file_runs.path
+         where file_runs.run_id = ? and file_runs.path in (${placeholders})`)
+        .all(runId, ...filePaths));
+}
+function fileRecordsFromRows(files) {
+    const records = {};
     for (const file of files) {
         records[file.path] = {
             path: file.path,
@@ -202,6 +363,20 @@ function readFiles(db, runId) {
             chunkIds: parsePersistedJson(file.chunkIdsJson),
             diagnostics: parsePersistedJson(file.diagnosticsJson),
         };
+    }
+    return records;
+}
+function readStoredChunksByIds(db, runId, chunkIds) {
+    const records = new Map();
+    if (chunkIds.length === 0) {
+        return records;
+    }
+    const placeholders = placeholdersFor(chunkIds);
+    const chunks = db
+        .query(`select id, record_json as recordJson from chunks where run_id = ? and id in (${placeholders})`)
+        .all(runId, ...chunkIds);
+    for (const chunk of chunks) {
+        records.set(chunk.id, parsePersistedJson(chunk.recordJson));
     }
     return records;
 }
@@ -327,6 +502,20 @@ function fingerprint(bytes) {
 function readSymbols(db, runId) {
     const records = {};
     const symbols = db.query("select id, record_json as recordJson from symbols where run_id = ?").all(runId);
+    for (const symbol of symbols) {
+        records[symbol.id] = parsePersistedJson(symbol.recordJson);
+    }
+    return records;
+}
+function readSymbolsByIds(db, runId, symbolIds) {
+    const records = {};
+    if (symbolIds.length === 0) {
+        return records;
+    }
+    const placeholders = placeholdersFor(symbolIds);
+    const symbols = db
+        .query(`select id, record_json as recordJson from symbols where run_id = ? and id in (${placeholders})`)
+        .all(runId, ...symbolIds);
     for (const symbol of symbols) {
         records[symbol.id] = parsePersistedJson(symbol.recordJson);
     }
@@ -471,26 +660,166 @@ function activateSqliteRun(db, runId, index) {
     activate(index);
 }
 function searchSqliteVectorCandidates(db, queryEmbedding, topK, paths) {
-    const activeRun = db.query("select value from meta where key = 'active_run_id'").get();
-    if (!activeRun || topK <= 0) {
+    const activeRunId = readActiveRunId(db);
+    const target = Math.max(0, Math.floor(topK));
+    if (!activeRunId ||
+        target <= 0 ||
+        queryEmbedding.length === 0 ||
+        !isValidQueryEmbedding(queryEmbedding) ||
+        !tableExists(db, "chunk_vectors")) {
         return [];
     }
-    return scoreSqliteVectorRows(queryEmbedding, readSqliteVectorRows(db, activeRun.value), paths).slice(0, topK);
+    const dimensions = readRunMetadata(db, activeRunId)?.embeddingDimensions;
+    if (dimensions !== undefined && queryEmbedding.length !== dimensions) {
+        return [];
+    }
+    const vectorCount = readActiveVectorCount(db, activeRunId);
+    if (vectorCount === 0) {
+        return [];
+    }
+    const hasPathFilters = paths !== undefined && paths.length > 0;
+    const limits = sqliteVectorLimits(vectorCount, target, hasPathFilters);
+    let currentK = limits.initial;
+    const candidates = [];
+    const seen = new Set();
+    while (true) {
+        try {
+            appendMatchingSqliteVectorCandidates(candidates, seen, querySqliteVectorCandidates(db, activeRunId, queryEmbedding, currentK), paths);
+        }
+        catch (error) {
+            if (isSqliteVecQueryEmbeddingError(error)) {
+                return [];
+            }
+            throw error;
+        }
+        if (candidates.length >= target || currentK >= limits.max) {
+            break;
+        }
+        currentK = Math.min(limits.max, currentK * 2);
+    }
+    return candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, target);
 }
-function readSqliteVectorRows(db, runId) {
-    return db
-        .query(`select chunk_rowids.chunk_id as id, vec_to_json(chunk_vectors.embedding) as embedding, chunks.file_path as filePath
-       from chunk_rowids
-       inner join chunk_vectors on chunk_vectors.rowid = chunk_rowids.rowid
-       inner join chunks on chunks.run_id = chunk_rowids.run_id and chunks.id = chunk_rowids.chunk_id
-       where chunk_rowids.run_id = ?`)
-        .all(runId);
-}
-function scoreSqliteVectorRows(queryEmbedding, rows, paths) {
+function searchSqliteLexicalCandidates(db, query, topK, paths) {
+    const activeRunId = readActiveRunId(db);
+    const target = Math.max(0, Math.floor(topK));
+    if (!activeRunId || target <= 0 || query.trim().length === 0 || !tableExists(db, "chunk_fts")) {
+        return [];
+    }
+    const pathFilter = sqlPrefixPathFilter(paths);
+    const queryLimit = lexicalCandidateLimit(target, paths);
+    let rows;
+    try {
+        rows = db
+            .query(`select chunk_fts.id as id, chunks.file_path as filePath, chunk_fts.rank as rank
+         from chunk_fts
+         inner join chunks on chunks.run_id = chunk_fts.run_id and chunks.id = chunk_fts.id
+         where chunk_fts match ? and chunk_fts.run_id = ?${pathFilter.sql}
+         order by rank
+         limit ?`)
+            .all(query, activeRunId, ...pathFilter.args, queryLimit);
+    }
+    catch (error) {
+        if (isFtsQuerySyntaxError(error)) {
+            return [];
+        }
+        throw error;
+    }
     return rows
         .filter((row) => matchesPaths(row.filePath, paths))
-        .map((row) => ({ id: row.id, score: cosineSimilarity(queryEmbedding, JSON.parse(row.embedding)) }))
-        .sort((left, right) => bScoreThenId(left, right));
+        .map((row) => ({ id: row.id, score: row.rank * -1, bm25Score: row.rank * -1 }))
+        .slice(0, target);
+}
+function isFtsQuerySyntaxError(error) {
+    if (!(error instanceof Error)) {
+        return false;
+    }
+    return (error.message.includes("fts5: syntax error") ||
+        error.message.includes("malformed MATCH expression") ||
+        error.message.includes("unterminated string") ||
+        error.message.startsWith("unknown special query: ") ||
+        error.message.startsWith("no such column: "));
+}
+function lexicalCandidateLimit(topK, paths) {
+    if (!paths || paths.length === 0) {
+        return topK;
+    }
+    return Math.max(topK, Math.min(SQLITE_LEXICAL_PATH_FILTER_MAX_K, topK * SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER));
+}
+function sqlPrefixPathFilter(paths) {
+    if (!paths || paths.length === 0 || paths.some(hasPathFilterGlobSyntax)) {
+        return { sql: "", args: [] };
+    }
+    const clauses = [];
+    const args = [];
+    for (const filter of paths) {
+        const prefix = filter.endsWith("/") ? filter : `${filter}/`;
+        clauses.push("(chunks.file_path = ? or chunks.file_path like ? escape '\\')");
+        args.push(filter, `${escapeSqlLike(prefix)}%`);
+    }
+    return { sql: ` and (${clauses.join(" or ")})`, args };
+}
+function hasPathFilterGlobSyntax(filter) {
+    return PATH_FILTER_GLOB_SYNTAX_PATTERN.test(filter);
+}
+function escapeSqlLike(value) {
+    return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
+}
+function isValidQueryEmbedding(queryEmbedding) {
+    for (let index = 0; index < queryEmbedding.length; index += 1) {
+        if (!Object.hasOwn(queryEmbedding, index)) {
+            return false;
+        }
+        if (typeof queryEmbedding[index] !== "number" || !Number.isFinite(queryEmbedding[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+function isSqliteVecQueryEmbeddingError(error) {
+    return error instanceof Error && error.message.includes("Dimension mismatch for query vector");
+}
+function appendMatchingSqliteVectorCandidates(candidates, seen, rows, paths) {
+    for (const row of rows) {
+        if (seen.has(row.id)) {
+            continue;
+        }
+        seen.add(row.id);
+        if (matchesPaths(row.filePath, paths)) {
+            candidates.push({
+                id: row.id,
+                score: cosineSimilarity(row.queryEmbedding, parsePersistedJson(row.embedding)),
+            });
+        }
+    }
+}
+function sqliteVectorLimits(vectorCount, topK, hasPathFilters) {
+    const max = hasPathFilters
+        ? Math.min(vectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_MAX_K))
+        : Math.min(vectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_INITIAL_K));
+    const initial = hasPathFilters ? Math.min(vectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_INITIAL_K)) : max;
+    return { initial, max };
+}
+function readActiveVectorCount(db, runId) {
+    const row = db
+        .query(`select count(*) as count
+       from chunk_rowids
+       inner join chunk_vectors on chunk_vectors.rowid = chunk_rowids.rowid
+       where chunk_rowids.run_id = ?`)
+        .get(runId);
+    return row.count;
+}
+function querySqliteVectorCandidates(db, runId, queryEmbedding, topK) {
+    const rows = db
+        .query(`select chunk_rowids.chunk_id as id,
+              chunks.file_path as filePath,
+              vec_to_json(chunk_vectors.embedding) as embedding
+       from chunk_vectors
+       inner join chunk_rowids on chunk_rowids.rowid = chunk_vectors.rowid
+       inner join chunks on chunks.run_id = chunk_rowids.run_id and chunks.id = chunk_rowids.chunk_id
+       where chunk_rowids.run_id = ? and chunk_vectors.embedding match ? and k = ?
+      order by chunk_vectors.distance, chunk_rowids.chunk_id`)
+        .all(runId, JSON.stringify(queryEmbedding), topK);
+    return rows.map((row) => ({ ...row, queryEmbedding }));
 }
 function bScoreThenId(left, right) {
     return right.score - left.score || left.id.localeCompare(right.id);
@@ -498,6 +827,9 @@ function bScoreThenId(left, right) {
 function clearSqliteIndex(db) {
     if (tableExists(db, "chunk_vectors")) {
         db.run("delete from chunk_vectors");
+    }
+    if (tableExists(db, "chunk_fts")) {
+        db.run("delete from chunk_fts");
     }
     db.run("delete from chunk_rowids");
     db.run("delete from lexical");
@@ -561,6 +893,7 @@ function insertChunksWithVectorRowids(db, runId, chunks, initialVectorRowid) {
             db.run("insert into chunk_rowids (run_id, chunk_id, rowid) values (?, ?, ?)", [runId, chunk.id, vectorRowid]);
             vectorRowid += 1;
         }
+        db.run("insert into chunk_fts (run_id, id, content) values (?, ?, ?)", [runId, chunk.id, chunk.text]);
     }
 }
 function nextVectorRowid(db) {
@@ -577,6 +910,7 @@ function deleteRunFile(db, runId, filePath) {
         }
     }
     db.run("delete from chunk_rowids where run_id = ? and chunk_id in (select id from chunks where run_id = ? and file_path = ?)", [runId, runId, filePath]);
+    db.run("delete from chunk_fts where run_id = ? and id in (select id from chunks where run_id = ? and file_path = ?)", [runId, runId, filePath]);
     db.run("delete from chunks where run_id = ? and file_path = ?", [runId, filePath]);
     db.run("delete from symbols where run_id = ? and file_path = ?", [runId, filePath]);
     db.run("delete from file_runs where run_id = ? and path = ?", [runId, filePath]);
@@ -589,6 +923,7 @@ function deleteRunRecords(db, runId) {
         }
     }
     db.run("delete from chunk_rowids where run_id = ?", [runId]);
+    db.run("delete from chunk_fts where run_id = ?", [runId]);
     db.run("delete from lexical where run_id = ?", [runId]);
     db.run("delete from symbols where run_id = ?", [runId]);
     db.run("delete from chunks where run_id = ?", [runId]);
@@ -630,6 +965,7 @@ function initializeSchema(db, embeddingDimensions) {
     if (embeddingDimensions !== undefined) {
         db.run(`create virtual table if not exists chunk_vectors using vec0(embedding float[${embeddingDimensions}])`);
     }
+    db.run("create virtual table if not exists chunk_fts using fts5(run_id unindexed, id unindexed, content)");
 }
 function tableExists(db, table) {
     return Boolean(db.query("select name from sqlite_master where type = 'table' and name = ?").get(table));

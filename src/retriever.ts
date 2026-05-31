@@ -7,6 +7,9 @@ import type {
   ChunkRecord,
   HybridRetrievalMode,
   HybridRetrievalOptions,
+  HydratedChunkSet,
+  LexicalChunkCandidate,
+  RankedChunkCandidate,
   RerankOptions,
   SearchInput,
   SearchOutput,
@@ -15,9 +18,17 @@ import type {
 
 const CANDIDATE_MULTIPLIER = 3
 const DEFAULT_MIN_FINAL_SCORE = 0.01
+const STORE_BACKED_VECTOR_PREFILTER_CANDIDATE_COUNT = 10_000
 
 export interface VectorCandidateSource {
   searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<RankedResult[]>
+}
+
+export interface RetrievalIndexStore {
+  readMetadata(): Promise<CastIndex["metadata"]>
+  searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<RankedChunkCandidate[]>
+  searchLexicalCandidates?(query: string, topK: number, paths?: string[]): Promise<LexicalChunkCandidate[]>
+  hydrateChunks(chunkIds: string[]): Promise<HydratedChunkSet>
 }
 
 export interface RetrieveInput {
@@ -35,6 +46,92 @@ export interface RetrieveInput {
   rerank?(query: string, documents: string[]): Promise<Array<{ index: number; score: number }>>
   readSource(filePath: string): Promise<string>
   indexStore?: VectorCandidateSource
+}
+
+export interface RetrieveFromStoreInput extends Omit<RetrieveInput, "index" | "indexStore"> {
+  indexStore: RetrievalIndexStore
+}
+
+export async function retrieveFromStore(input: RetrieveFromStoreInput): Promise<SearchOutput> {
+  const settings = retrievalSettings({ ...input, index: emptyRetrievalIndex(await input.indexStore.readMetadata()) })
+  const rankingTopK = rankingLimit(settings.topK, input.options.rerank)
+  const candidateCount = storeVectorCandidateCount(rankingTopK, input.options.hybrid)
+  const queryVector = await input.embed(input.input.query)
+  const vectorCandidates = await input.indexStore.searchVectorCandidates(queryVector, candidateCount, input.input.paths)
+  const lexicalCandidates =
+    input.options.hybrid?.enabled && input.indexStore.searchLexicalCandidates
+      ? await input.indexStore.searchLexicalCandidates(
+          input.input.query,
+          rankingTopK * input.options.hybrid.bm25CandidateMultiplier,
+          input.input.paths,
+        )
+      : []
+  const candidateBatches = [{ vector: queryVector, candidates: vectorCandidates, requestedTopK: candidateCount }]
+  let generateHyde = input.generateHyde
+  let embed = input.embed
+
+  if (input.options.hyde.enabled && (vectorCandidates[0]?.score ?? -1) < input.options.hyde.threshold) {
+    try {
+      const hydeText = await input.generateHyde(input.input.query)
+      const hydeVector = await input.embed(hydeText)
+      candidateBatches.push({
+        vector: hydeVector,
+        candidates: await input.indexStore.searchVectorCandidates(hydeVector, candidateCount, input.input.paths),
+        requestedTopK: candidateCount,
+      })
+      generateHyde = () => Promise.resolve(hydeText)
+      embed = (text) => (text === hydeText ? Promise.resolve(hydeVector) : input.embed(text))
+    } catch {
+      // Let retrieve perform HyDE and preserve its fallback diagnostics/status behavior.
+    }
+  }
+
+  const candidateIds = mergeCandidateIds(...candidateBatches.map((batch) => batch.candidates), lexicalCandidates)
+  const hydrated = await input.indexStore.hydrateChunks(candidateIds)
+  return retrieve({
+    ...input,
+    generateHyde,
+    embed,
+    index: {
+      metadata: { ...hydrated.metadata, diagnostics: [...hydrated.metadata.diagnostics, ...hydrated.diagnostics] },
+      files: hydrated.files,
+      chunks: hydrated.chunks,
+      symbols: hydrated.symbols,
+      lexical: hydrated.lexical,
+    },
+    indexStore: {
+      searchVectorCandidates: (vector, topK, paths) => {
+        const cached = candidateBatches.find((batch) => vectorsEqual(batch.vector, vector))
+        return cached && cached.requestedTopK >= topK
+          ? Promise.resolve(cached.candidates)
+          : input.indexStore.searchVectorCandidates(vector, topK, paths)
+      },
+    },
+  })
+}
+
+function mergeCandidateIds(...candidateGroups: Array<Array<{ id: string }>>) {
+  return [...new Set(candidateGroups.flatMap((group) => group.map((candidate) => candidate.id)))]
+}
+
+function storeVectorCandidateCount(rankingTopK: number, hybrid: HybridRetrievalOptions | undefined) {
+  if (hybrid?.enabled && hybrid.mode === "vector-prefilter") {
+    return Math.max(
+      rankingTopK * hybrid.vectorCandidateMultiplier,
+      rankingTopK,
+      STORE_BACKED_VECTOR_PREFILTER_CANDIDATE_COUNT,
+    )
+  }
+  const multiplier = hybrid?.enabled ? hybrid.vectorCandidateMultiplier : CANDIDATE_MULTIPLIER
+  return Math.max(rankingTopK * multiplier, rankingTopK)
+}
+
+function vectorsEqual(left: number[], right: number[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function emptyRetrievalIndex(metadata: CastIndex["metadata"]): CastIndex {
+  return { metadata, files: {}, chunks: {}, symbols: {} }
 }
 
 interface RankedSearch {

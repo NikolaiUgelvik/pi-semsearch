@@ -352,6 +352,11 @@ describe("cast plugin", () => {
       read: async () => {
         throw new Error("sqlite-vec failed to load lazily")
       },
+      readMetadata: async () => {
+        throw new Error("sqlite-vec failed to load lazily")
+      },
+      searchVectorCandidates: async () => [],
+      hydrateChunks: async () => emptyHydratedIndex(),
       write: async () => undefined,
     }
     const plugin = createCastPluginForTest({
@@ -385,6 +390,11 @@ describe("cast plugin", () => {
       read: async () => {
         throw new Error("failed to open database")
       },
+      readMetadata: async () => {
+        throw new Error("failed to open database")
+      },
+      searchVectorCandidates: async () => [],
+      hydrateChunks: async () => emptyHydratedIndex(),
       write: async () => undefined,
     }
     const plugin = createCastPluginForTest({
@@ -419,6 +429,11 @@ describe("cast plugin", () => {
         read: async () => {
           throw new Error("permission denied")
         },
+        readMetadata: async () => {
+          throw new Error("permission denied")
+        },
+        searchVectorCandidates: async () => [],
+        hydrateChunks: async () => emptyHydratedIndex(),
         write: async () => undefined,
       }),
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
@@ -442,6 +457,11 @@ describe("cast plugin", () => {
         read: async () => {
           throw new Error("restore failed")
         },
+        readMetadata: async () => {
+          throw new Error("restore failed")
+        },
+        searchVectorCandidates: async () => [],
+        hydrateChunks: async () => emptyHydratedIndex(),
         write: async () => undefined,
       }),
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
@@ -468,10 +488,12 @@ describe("cast plugin", () => {
       },
       createStore: () => ({
         read: async () => index,
+        readMetadata: async () => index.metadata,
         write: async () => undefined,
         searchVectorCandidates: async () => {
           throw new Error("sqlite-vec failed to load for candidates")
         },
+        hydrateChunks: async () => emptyHydratedIndex(index),
       }),
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
     })
@@ -517,6 +539,7 @@ describe("cast plugin", () => {
       },
       createStore: () => ({
         read: async () => index,
+        readMetadata: async () => index.metadata,
         write: async () => undefined,
         searchVectorCandidates: async () => {
           candidateSearches += 1
@@ -525,6 +548,7 @@ describe("cast plugin", () => {
           }
           throw new Error("sqlite-vec failed to load during HyDE candidates")
         },
+        hydrateChunks: async () => emptyHydratedIndex(index),
       }),
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
     })
@@ -546,7 +570,7 @@ describe("cast plugin", () => {
     expect(result.output).toContain("sqlite-vec failed to load during HyDE candidates")
     expect(result.output).not.toContain("HyDE failed")
     expect(result.metadata).toEqual({ configured: false })
-    expect(candidateSearches).toBe(2)
+    expect(candidateSearches).toBe(3)
   })
 
   test("lazy sqlite-vec background failure from store write is recorded and prevents repeated refresh attempts", async () => {
@@ -892,6 +916,183 @@ describe("cast plugin", () => {
     expect(retrieveCandidates).toEqual([{ id: "c1", score: 1 }])
   })
 
+  test("semantic_search_code uses store-backed retrieval without reading the full index", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-plugin-"))
+    const calls: string[] = []
+    try {
+      await Bun.write(path.join(dir, "alpha.ts"), "function alpha() {}\n")
+      const metadata = { ...emptyReadyIndex().metadata, worktree: dir }
+      const plugin = createCastPluginForTest({
+        fetch: async (_url, init) => {
+          const body = JSON.parse(String(init.body))
+          return Response.json({ data: [{ embedding: String(body.input).includes("alpha") ? [1, 0] : [0, 1] }] })
+        },
+        createStore: () => ({
+          read: async () => {
+            calls.push("read")
+            throw new Error("full index read should not be called")
+          },
+          write: async () => undefined,
+          readMetadata: async () => {
+            calls.push("readMetadata")
+            return metadata
+          },
+          searchVectorCandidates: async () => {
+            calls.push("searchVectorCandidates")
+            return [{ id: "alpha", score: 0.9 }]
+          },
+          hydrateChunks: async (chunkIds) => {
+            calls.push(`hydrateChunks:${chunkIds.join(",")}`)
+            return {
+              metadata,
+              files: {
+                "alpha.ts": {
+                  path: "alpha.ts",
+                  language: "typescript",
+                  fingerprint: "fp",
+                  chunkIds: ["alpha"],
+                  diagnostics: [],
+                },
+              },
+              chunks: {
+                alpha: {
+                  id: "alpha",
+                  filePath: "alpha.ts",
+                  language: "typescript",
+                  kind: "function",
+                  range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+                  text: "function alpha() {}",
+                  nonWhitespaceChars: 17,
+                  nodeTypes: [],
+                  symbolIds: [],
+                  childChunkIds: [],
+                },
+              },
+              symbols: {},
+              diagnostics: [],
+            }
+          },
+        }),
+        createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      })
+      const hooks = await plugin({ ...input, directory: dir, worktree: dir } as never, {
+        embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed", dimensions: 2 },
+        hyde: { enabled: false },
+      })
+
+      const result = await semanticSearchTool(hooks).execute({ query: "alpha", topK: 1 }, {
+        worktree: dir,
+        directory: dir,
+      } as never)
+
+      expect(typeof result).toBe("object")
+      if (typeof result === "string") {
+        throw new Error("expected object tool result")
+      }
+      expect(JSON.parse(result.output).results[0].filePath).toBe("alpha.ts")
+      expect(calls).toEqual(["readMetadata", "searchVectorCandidates", "hydrateChunks:alpha"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("semantic_search_code hydrates lexical-only store candidates through the plugin path", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-plugin-"))
+    const calls: string[] = []
+    try {
+      await Bun.write(path.join(dir, "lexical.ts"), "function lexicalNeedle() {}\n")
+      const metadata = { ...emptyReadyIndex().metadata, worktree: dir }
+      const plugin = createCastPluginForTest({
+        fetch: async () => Response.json({ data: [{ embedding: [1, 0] }] }),
+        createStore: () => ({
+          read: async () => {
+            calls.push("read")
+            throw new Error("full index read should not be called")
+          },
+          write: async () => undefined,
+          readMetadata: async () => {
+            calls.push("readMetadata")
+            return metadata
+          },
+          searchVectorCandidates: async () => {
+            calls.push("searchVectorCandidates")
+            return []
+          },
+          searchLexicalCandidates: async (query: string, topK: number, paths?: string[]) => {
+            calls.push(`searchLexicalCandidates:${query}:${topK}:${paths?.join(",") ?? ""}`)
+            return [{ id: "lexical", score: 0.8, bm25Score: 0.8 }]
+          },
+          hydrateChunks: async (chunkIds) => {
+            calls.push(`hydrateChunks:${chunkIds.join(",")}`)
+            const includeLexical = chunkIds.includes("lexical")
+            return {
+              metadata,
+              files: includeLexical
+                ? {
+                    "lexical.ts": {
+                      path: "lexical.ts",
+                      language: "typescript",
+                      fingerprint: "fp",
+                      chunkIds: ["lexical"],
+                      diagnostics: [],
+                    },
+                  }
+                : {},
+              chunks: includeLexical
+                ? {
+                    lexical: {
+                      id: "lexical",
+                      filePath: "lexical.ts",
+                      language: "typescript",
+                      kind: "function",
+                      range: { byteStart: 0, byteEnd: 27, lineStart: 1, lineEnd: 1 },
+                      text: "function lexicalNeedle() {}",
+                      nonWhitespaceChars: 24,
+                      nodeTypes: [],
+                      symbolIds: [],
+                      childChunkIds: [],
+                      lexical: { length: 1, termFrequencies: { lexicalneedle: 1 } },
+                    },
+                  }
+                : {},
+              symbols: {},
+              lexical: { documentCount: 1, averageDocumentLength: 1, documentFrequencies: { lexicalneedle: 1 } },
+              diagnostics: [],
+            }
+          },
+        }),
+        createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      })
+      const hooks = await plugin({ ...input, directory: dir, worktree: dir } as never, {
+        embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed", dimensions: 2 },
+        hyde: { enabled: false },
+        retrieval: { hybrid: { enabled: true } },
+      })
+
+      const result = await semanticSearchTool(hooks).execute({ query: "lexicalneedle", topK: 1 }, {
+        worktree: dir,
+        directory: dir,
+      } as never)
+
+      expect(typeof result).toBe("object")
+      if (typeof result === "string") {
+        throw new Error("expected object tool result")
+      }
+      const output = JSON.parse(result.output)
+      expect(output.results[0].filePath).toBe("lexical.ts")
+      expect(output.results[0].retrieval.mode).toBe("hybrid")
+      expect(output.results[0].retrieval.bm25Rank).toBe(1)
+      expect(calls).toEqual([
+        "readMetadata",
+        "searchVectorCandidates",
+        "searchLexicalCandidates:lexicalneedle:8:",
+        "hydrateChunks:lexical",
+      ])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("refresh true forces an additional refresh before searching", async () => {
     const refreshes: string[] = []
     const plugin = createCastPluginForTest({
@@ -1062,11 +1263,11 @@ describe("cast plugin", () => {
     })
   })
 
-  test("retrieve wiring passes store index, args, OpenAI calls, and worktree source reader", async () => {
+  test("retrieve wiring passes store-backed index, args, OpenAI calls, and worktree source reader", async () => {
     const index = emptyReadyIndex()
     const seen: {
       input?: unknown
-      index?: unknown
+      metadata?: unknown
       embed?: number[]
       hyde?: string
       rerank?: unknown
@@ -1084,9 +1285,15 @@ describe("cast plugin", () => {
         return Response.json({ data: [{ embedding: String(body.input).startsWith("hyde:") ? [2] : [1] }] })
       },
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
-      createStore: () => ({ read: async () => index, write: async () => undefined }),
+      createStore: () => ({
+        read: async () => index,
+        readMetadata: async () => index.metadata,
+        searchVectorCandidates: async () => [],
+        hydrateChunks: async () => emptyHydratedIndex(index),
+        write: async () => undefined,
+      }),
       retrieve: async (input) => {
-        seen.index = input.index
+        seen.metadata = await input.indexStore.readMetadata()
         seen.input = input.input
         seen.embed = await input.embed("query text")
         seen.hyde = await input.generateHyde("query text")
@@ -1116,7 +1323,7 @@ describe("cast plugin", () => {
         { worktree: dir, directory: dir } as never,
       )
 
-      expect(seen.index).toBe(index)
+      expect(seen.metadata).toBe(index.metadata)
       expect(seen.input).toEqual({
         query: "query text",
         topK: 3,
@@ -1463,6 +1670,17 @@ function emptyReadyIndex() {
   })
   index.metadata.status = "ready"
   return index
+}
+
+function emptyHydratedIndex(index = emptyReadyIndex()) {
+  return {
+    metadata: index.metadata,
+    files: index.files,
+    chunks: index.chunks,
+    symbols: index.symbols,
+    lexical: index.lexical,
+    diagnostics: [],
+  }
 }
 
 function recordEventAndReturnIndex(events: string[], event: string) {

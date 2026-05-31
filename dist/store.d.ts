@@ -1,4 +1,4 @@
-import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, SymbolRecord } from "./types.js";
+import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, HydratedChunkSet, LexicalChunkCandidate, SymbolRecord } from "./types.js";
 interface FileResult {
     file: FileRecord;
     chunks: Record<string, ChunkRecord>;
@@ -19,10 +19,13 @@ export declare function createIndexStore(input: {
 }): {
     read(): Promise<CastIndex>;
     write(index: CastIndex): Promise<void>;
+    readMetadata(): Promise<import("./types.js").IndexMetadata>;
+    hydrateChunks(chunkIds: string[]): Promise<HydratedChunkSet>;
     searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<{
         id: string;
         score: number;
     }[]>;
+    searchLexicalCandidates(query: string, topK: number, paths?: string[]): Promise<LexicalChunkCandidate[]>;
     beginIndexRun(input: {
         configHash: string;
         metadata: CastIndex["metadata"];

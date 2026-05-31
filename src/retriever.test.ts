@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { buildLexicalIndex } from "./lexical.js"
-import { retrieve } from "./retriever.js"
+import { retrieve, retrieveFromStore } from "./retriever.js"
 import { createEmptyIndex } from "./store.js"
 import type { CastIndex, HybridRetrievalOptions, RerankOptions } from "./types.js"
 
@@ -73,6 +73,379 @@ describe("retrieve", () => {
 
     expect(output.results[0].filePath).toBe("a.ts")
     expect(output.results[0].score).toBe(0.75)
+  })
+
+  test("store-backed retrieval does not require a hydrated full index", async () => {
+    const output = await retrieveFromStore({
+      input: { query: "alpha", topK: 1, includeParents: true, maxContextChars: 100 },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "function alpha() {}",
+      indexStore: {
+        readMetadata: async () => ({
+          schemaVersion: 1,
+          projectId: "p",
+          worktree: "/repo",
+          cacheKey: "key",
+          maxChunkNonWhitespaceChars: 2000,
+          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+          updatedAt: 1,
+          status: "ready",
+          diagnostics: [],
+        }),
+        searchVectorCandidates: async () => [{ id: "c1", score: 0.9 }],
+        hydrateChunks: async () => ({
+          metadata: {
+            schemaVersion: 1,
+            projectId: "p",
+            worktree: "/repo",
+            cacheKey: "key",
+            maxChunkNonWhitespaceChars: 2000,
+            chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+            updatedAt: 1,
+            status: "ready",
+            diagnostics: [],
+          },
+          files: {
+            "a.ts": { path: "a.ts", language: "typescript", fingerprint: "fp", chunkIds: ["c1"], diagnostics: [] },
+          },
+          chunks: {
+            c1: {
+              id: "c1",
+              filePath: "a.ts",
+              language: "typescript",
+              kind: "function",
+              range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+              text: "function alpha() {}",
+              nonWhitespaceChars: 17,
+              nodeTypes: [],
+              symbolIds: [],
+              childChunkIds: [],
+            },
+          },
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(output.results.map((result) => result.filePath)).toEqual(["a.ts"])
+  })
+
+  test("store-backed retrieval uses HyDE vector candidates", async () => {
+    const hydratedChunkIds: string[][] = []
+    const output = await retrieveFromStore({
+      input: { query: "alpha", topK: 1, includeParents: true, maxContextChars: 100 },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.5 } },
+      embed: async (text) => (text === "alpha" ? [1, 0] : [0, 1]),
+      generateHyde: async () => "hyde alpha",
+      readSource: async (filePath) => (filePath === "hyde.ts" ? "function hydeAlpha() {}" : "function alpha() {}"),
+      indexStore: {
+        readMetadata: async () => ({
+          schemaVersion: 1,
+          projectId: "p",
+          worktree: "/repo",
+          cacheKey: "key",
+          maxChunkNonWhitespaceChars: 2000,
+          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+          updatedAt: 1,
+          status: "ready",
+          diagnostics: [],
+        }),
+        searchVectorCandidates: async (vector) =>
+          vector[0] === 1 ? [{ id: "initial", score: 0.1 }] : [{ id: "hyde", score: 0.95 }],
+        hydrateChunks: async (chunkIds) => {
+          hydratedChunkIds.push(chunkIds)
+          return {
+            metadata: {
+              schemaVersion: 1,
+              projectId: "p",
+              worktree: "/repo",
+              cacheKey: "key",
+              maxChunkNonWhitespaceChars: 2000,
+              chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+              updatedAt: 1,
+              status: "ready",
+              diagnostics: [],
+            },
+            files: {
+              "initial.ts": {
+                path: "initial.ts",
+                language: "typescript",
+                fingerprint: "initial-fp",
+                chunkIds: ["initial"],
+                diagnostics: [],
+              },
+              "hyde.ts": {
+                path: "hyde.ts",
+                language: "typescript",
+                fingerprint: "hyde-fp",
+                chunkIds: ["hyde"],
+                diagnostics: [],
+              },
+            },
+            chunks: {
+              initial: {
+                id: "initial",
+                filePath: "initial.ts",
+                language: "typescript",
+                kind: "function",
+                range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+                text: "function alpha() {}",
+                nonWhitespaceChars: 17,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+              hyde: {
+                id: "hyde",
+                filePath: "hyde.ts",
+                language: "typescript",
+                kind: "function",
+                range: { byteStart: 0, byteEnd: 24, lineStart: 1, lineEnd: 1 },
+                text: "function hydeAlpha() {}",
+                nonWhitespaceChars: 21,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            },
+            symbols: {},
+            diagnostics: [],
+          }
+        },
+      },
+    })
+
+    expect(output.status.hydeUsed).toBe(true)
+    expect(output.results.map((result) => result.filePath)).toEqual(["hyde.ts"])
+    expect(hydratedChunkIds).toEqual([["initial", "hyde"]])
+  })
+
+  test("store-backed hybrid retrieval hydrates merged vector and lexical candidates", async () => {
+    const hydratedIds: string[][] = []
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "exactNeedle", topK: 2, maxContextChars: 100 },
+      options: { topK: 2, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 }, hybrid: hybridOptions() },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async () => [{ id: "vector", score: 0.9 }],
+        searchLexicalCandidates: async () => [{ id: "lexical", score: 10, bm25Score: 10 }],
+        hydrateChunks: async (ids) => {
+          hydratedIds.push(ids)
+          const hydrated = {
+            metadata,
+            files: {
+              "vector.ts": {
+                path: "vector.ts",
+                language: "typescript",
+                fingerprint: "fp",
+                chunkIds: ["vector"],
+                diagnostics: [],
+              },
+              "lexical.ts": {
+                path: "lexical.ts",
+                language: "typescript",
+                fingerprint: "fp",
+                chunkIds: ["lexical"],
+                diagnostics: [],
+              },
+            },
+            chunks: {
+              vector: {
+                id: "vector",
+                filePath: "vector.ts",
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: "function vector() {}",
+                nonWhitespaceChars: 16,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+              lexical: {
+                id: "lexical",
+                filePath: "lexical.ts",
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: "function exactNeedle() {}",
+                nonWhitespaceChars: 22,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            },
+            symbols: {},
+            diagnostics: [],
+          }
+          const lexical = buildLexicalIndex(hydrated.chunks, hydrated.symbols)
+          return { ...hydrated, chunks: lexical.chunks, lexical: lexical.lexical }
+        },
+      },
+    })
+
+    expect(hydratedIds[0].sort()).toEqual(["lexical", "vector"])
+    expect(output.results.map((result) => result.filePath).sort()).toEqual(["lexical.ts", "vector.ts"])
+  })
+
+  test("store-backed hybrid retrieval prefetches the hybrid vector candidate count", async () => {
+    const vectorTopKs: number[] = []
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    await retrieveFromStore({
+      input: { query: "exactNeedle", topK: 2, maxContextChars: 100 },
+      options: {
+        topK: 2,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        hybrid: hybridOptions({ vectorCandidateMultiplier: 8 }),
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async (_vector, topK) => {
+          vectorTopKs.push(topK)
+          return Array.from({ length: topK }, (_, index) => ({ id: `vector-${index}`, score: 1 - index / topK }))
+        },
+        searchLexicalCandidates: async () => [{ id: "lexical", score: 10, bm25Score: 10 }],
+        hydrateChunks: async (ids) => {
+          const chunks = Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: id === "lexical" ? "function exactNeedle() {}" : `function ${id.replace("-", "")}() {}`,
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            ]),
+          )
+          const lexical = buildLexicalIndex(chunks, {})
+          return {
+            metadata,
+            files: Object.fromEntries(
+              ids.map((id) => [
+                `${id}.ts`,
+                { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+              ]),
+            ),
+            chunks: lexical.chunks,
+            symbols: {},
+            lexical: lexical.lexical,
+            diagnostics: [],
+          }
+        },
+      },
+    })
+
+    expect(vectorTopKs[0]).toBe(16)
+  })
+
+  test("store-backed vector-prefilter hybrid prefetches enough candidates to preserve vector ties", async () => {
+    const vectorTopKs: number[] = []
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "exactVectorTieNeedle", topK: 1, maxContextChars: 100 },
+      options: {
+        topK: 1,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        hybrid: hybridOptions({ mode: "vector-prefilter", vectorCandidateMultiplier: 1, bm25CandidateMultiplier: 1 }),
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async (_vector, topK) => {
+          vectorTopKs.push(topK)
+          const candidates = [{ id: "a-unrelated", score: 1 }]
+          return topK > 1 ? [...candidates, { id: "z-exact", score: 1 }] : candidates
+        },
+        searchLexicalCandidates: async () => [],
+        hydrateChunks: async (ids) => {
+          const chunks = Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: id === "z-exact" ? "function exactVectorTieNeedle() {}" : "function unrelated() {}",
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+                embedding: [1, 0],
+              },
+            ]),
+          )
+          const lexical = buildLexicalIndex(chunks, {})
+          return {
+            metadata,
+            files: Object.fromEntries(
+              ids.map((id) => [
+                `${id}.ts`,
+                { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+              ]),
+            ),
+            chunks: lexical.chunks,
+            symbols: {},
+            lexical: lexical.lexical,
+            diagnostics: [],
+          }
+        },
+      },
+    })
+
+    expect(vectorTopKs[0]).toBe(10_000)
+    expect(output.results[0].topology.chunk.id).toBe("z-exact")
   })
 
   test("returns normal embedding results without HyDE above threshold", async () => {

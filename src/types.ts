@@ -64,6 +64,24 @@ export type SearchResultRetrievalDetails = {
   rerankScore?: number
 }
 
+export type RankedChunkCandidate = {
+  id: string
+  score: number
+}
+
+export type LexicalChunkCandidate = RankedChunkCandidate & {
+  bm25Score: number
+}
+
+export type HydratedChunkSet = {
+  metadata: IndexMetadata
+  files: Record<string, FileRecord>
+  chunks: Record<string, ChunkRecord>
+  symbols: Record<string, SymbolRecord>
+  lexical?: LexicalIndex
+  diagnostics: string[]
+}
+
 export type ChunkRecord = {
   id: string
   filePath: string

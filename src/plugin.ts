@@ -7,10 +7,10 @@ import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
 import { parseSource } from "./language.js"
 import { createOpenAIClient, type FetchLike } from "./openai.js"
 import { parseOptions } from "./options.js"
-import { retrieve } from "./retriever.js"
+import { type RetrievalIndexStore, retrieveFromStore } from "./retriever.js"
 import { createIndexer } from "./scanner.js"
 import { createIndexStore } from "./store.js"
-import type { ChunkLookupOutput, SearchOutput } from "./types.js"
+import type { ChunkLookupOutput, LexicalChunkCandidate, SearchOutput } from "./types.js"
 
 interface VectorCandidateStore {
   searchVectorCandidates(
@@ -18,6 +18,10 @@ interface VectorCandidateStore {
     topK: number,
     paths?: string[],
   ): Promise<Array<{ id: string; score: number }>>
+}
+
+interface LexicalCandidateStore {
+  searchLexicalCandidates(query: string, topK: number, paths?: string[]): Promise<LexicalChunkCandidate[]>
 }
 
 type IndexingStore = Parameters<typeof createIndexer>[0]["store"]
@@ -91,7 +95,7 @@ export function createCastPluginForTest(
     fetch?: FetchLike
     createStore?: typeof createIndexStore
     createIndexer?: typeof createIndexer
-    retrieve?: typeof retrieve
+    retrieve?: typeof retrieveFromStore
   } = {},
 ): Plugin {
   return async (input, rawOptions) => {
@@ -225,14 +229,44 @@ export function createCastPluginForTest(
       return wrapped
     }
 
-    const vectorCandidateStore = (): VectorCandidateStore | undefined => {
-      if (!hasVectorCandidateStore(store)) {
-        return
+    const retrievalIndexStore = (): RetrievalIndexStore => {
+      if (!store) {
+        throw new IndexUnavailableError(storeError ?? "index unavailable")
       }
-      return {
-        searchVectorCandidates: async (queryEmbedding, topK, paths) => {
+      const indexStore = store
+      const wrapped: RetrievalIndexStore = {
+        readMetadata: async () => {
+          if (!hasReadMetadataStore(indexStore)) {
+            throw new IndexUnavailableError(storeError ?? "index unavailable")
+          }
           try {
-            return await store.searchVectorCandidates(queryEmbedding, topK, paths)
+            return await indexStore.readMetadata()
+          } catch (error) {
+            if (!recordStoreUnavailable(error)) {
+              throw error
+            }
+            throw new IndexUnavailableError(storeError ?? formatThrownError(error))
+          }
+        },
+        searchVectorCandidates: async (queryEmbedding, topK, paths) => {
+          if (!hasVectorCandidateStore(indexStore)) {
+            throw new IndexUnavailableError(storeError ?? "index unavailable")
+          }
+          try {
+            return await indexStore.searchVectorCandidates(queryEmbedding, topK, paths)
+          } catch (error) {
+            if (!recordStoreUnavailable(error)) {
+              throw error
+            }
+            throw new IndexUnavailableError(storeError ?? formatThrownError(error))
+          }
+        },
+        hydrateChunks: async (chunkIds) => {
+          if (!hasHydrateChunksStore(indexStore)) {
+            throw new IndexUnavailableError(storeError ?? "index unavailable")
+          }
+          try {
+            return await indexStore.hydrateChunks(chunkIds)
           } catch (error) {
             if (!recordStoreUnavailable(error)) {
               throw error
@@ -241,6 +275,19 @@ export function createCastPluginForTest(
           }
         },
       }
+      if (hasLexicalCandidateStore(indexStore)) {
+        wrapped.searchLexicalCandidates = async (query, topK, paths) => {
+          try {
+            return await indexStore.searchLexicalCandidates(query, topK, paths)
+          } catch (error) {
+            if (!recordStoreUnavailable(error)) {
+              throw error
+            }
+            throw new IndexUnavailableError(storeError ?? formatThrownError(error))
+          }
+        }
+      }
+      return wrapped
     }
 
     queueInitialRefresh(options, queueRefresh)
@@ -256,7 +303,10 @@ export function createCastPluginForTest(
       return store ? undefined : unavailableToolResult("Semantic code search index unavailable", storeError)
     }
 
-    const semanticSearchOutput = async (args: Parameters<typeof retrieve>[0]["input"], context: ToolContext) => {
+    const semanticSearchOutput = async (
+      args: Parameters<typeof retrieveFromStore>[0]["input"],
+      context: ToolContext,
+    ) => {
       const embedding = options.embedding
       if (!embedding) {
         throw new Error("embedding dependency unavailable")
@@ -268,8 +318,7 @@ export function createCastPluginForTest(
         () => storeError,
       )
       try {
-        return await (dependencies.retrieve ?? retrieve)({
-          index: await readIndex(),
+        return await (dependencies.retrieve ?? retrieveFromStore)({
           input: args,
           options: { ...options, hybrid: options.retrieval.hybrid, rerank: options.rerank },
           embed: (text) => client.embed({ ...embedding, input: text }),
@@ -277,7 +326,7 @@ export function createCastPluginForTest(
             generateHydeText({ query, context, hyde: options.hyde, client, generateOpenCodeHyde }),
           rerank: (query, documents) => rerankDocuments(query, documents, options.rerank, client),
           readSource: async (filePath) => Bun.file(await resolveWorktreePath(input.worktree, filePath)).text(),
-          indexStore: vectorCandidateStore(),
+          indexStore: retrievalIndexStore(),
         })
       } catch (error) {
         if (!(error instanceof IndexUnavailableError)) {
@@ -422,6 +471,27 @@ function hasVectorCandidateStore(value: unknown): value is VectorCandidateStore 
     value !== null &&
     "searchVectorCandidates" in value &&
     typeof value.searchVectorCandidates === "function"
+  )
+}
+
+function hasLexicalCandidateStore(value: unknown): value is LexicalCandidateStore {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "searchLexicalCandidates" in value &&
+    typeof value.searchLexicalCandidates === "function"
+  )
+}
+
+function hasReadMetadataStore(value: unknown): value is Pick<RetrievalIndexStore, "readMetadata"> {
+  return (
+    typeof value === "object" && value !== null && "readMetadata" in value && typeof value.readMetadata === "function"
+  )
+}
+
+function hasHydrateChunksStore(value: unknown): value is Pick<RetrievalIndexStore, "hydrateChunks"> {
+  return (
+    typeof value === "object" && value !== null && "hydrateChunks" in value && typeof value.hydrateChunks === "function"
   )
 }
 
