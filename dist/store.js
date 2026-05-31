@@ -653,6 +653,7 @@ function writeSqliteFileResults(db, runId, fileResults) {
 function activateSqliteRun(db, runId, index) {
     const activate = db.transaction((castIndex) => {
         validateCompletedRunRows(db, runId, castIndex);
+        updateRunChunkLexicalStats(db, runId, castIndex.chunks);
         for (const file of Object.values(castIndex.files)) {
             upsertGlobalFile(db, file);
         }
@@ -669,6 +670,19 @@ function activateSqliteRun(db, runId, index) {
         pruneSupersededRuns(db, runId);
     });
     activate(index);
+}
+function updateRunChunkLexicalStats(db, runId, chunks) {
+    const update = db.query("update chunks set record_json = ? where run_id = ? and id = ?");
+    for (const chunk of Object.values(chunks)) {
+        if (!chunk.lexical) {
+            continue;
+        }
+        const row = db.query("select record_json as recordJson from chunks where run_id = ? and id = ?").get(runId, chunk.id);
+        if (!row) {
+            continue;
+        }
+        update.run(JSON.stringify({ ...parsePersistedJson(row.recordJson), lexical: chunk.lexical }), runId, chunk.id);
+    }
 }
 function validateCompletedRunRows(db, runId, index) {
     const run = db.query("select status from runs where id = ?").get(runId);

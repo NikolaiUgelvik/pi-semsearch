@@ -485,6 +485,12 @@ describe("index store", () => {
         chunks: { a: index.chunks.a },
         symbols: { [symbol.id]: symbol },
       })
+      index.chunks.a.lexical = { length: 2, termFrequencies: { alpha: 1, function: 1 } }
+      index.lexical = {
+        documentCount: 1,
+        averageDocumentLength: 2,
+        documentFrequencies: { alpha: 1, function: 1 },
+      }
       const dbPath = path.join(dir, "project", "index.sqlite")
       const db = new Database(dbPath)
       let expectedVectorRow: { vectorRowid: number; embeddingJson: string }
@@ -555,6 +561,7 @@ describe("index store", () => {
           embeddingJson: string
         }
         expect(JSON.parse(row.chunkJson).activationMarker).toBe(true)
+        expect(JSON.parse(row.chunkJson).lexical).toEqual(index.chunks.a.lexical)
         expect(JSON.parse(row.diagnosticsJson)).toEqual(["activation-marker"])
         expect(JSON.parse(row.symbolJson).activationMarker).toBe(true)
         expect(row.vectorRowid).toBe(expectedVectorRow.vectorRowid)
@@ -562,6 +569,7 @@ describe("index store", () => {
       } finally {
         reopened.close()
       }
+      expect((await store.read()).chunks.a.lexical).toEqual(index.chunks.a.lexical)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
