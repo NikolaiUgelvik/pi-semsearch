@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { bm25Search, buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText } from "./lexical.js"
+import { buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText } from "./lexical.js"
 import type { ChunkRecord, SymbolRecord } from "./types.js"
 
 const baseChunk: Omit<ChunkRecord, "id" | "filePath" | "text" | "range"> = {
@@ -86,23 +86,6 @@ describe("lexical retrieval", () => {
 
     expect(Object.getOwnPropertyDescriptor(chunks.a.lexical?.termFrequencies, "constructor")?.value).toBe(2)
     expect(Object.getOwnPropertyDescriptor(lexical.documentFrequencies, "constructor")?.value).toBe(1)
-  })
-
-  test("bm25 search prefers exact lexical matches", () => {
-    const { lexical, chunks } = buildLexicalIndex(
-      {
-        exact: chunk("exact", "src/cache.ts", "const OPENCODE_CAST_CACHE_DIR = readCacheDir()", []),
-        partial: chunk("partial", "src/cache.ts", "function readCacheDir() { return cacheDir }", []),
-        other: chunk("other", "src/retriever.ts", "export function retrieve() {}", []),
-      },
-      {},
-    )
-
-    const results = bm25Search("OPENCODE_CAST_CACHE_DIR", Object.values(chunks), lexical, 2)
-
-    expect(results.map((result) => result.id)).toEqual(["exact", "partial"])
-    expect(results[0].score).toBeGreaterThan(results[1].score)
-    expect(results.every((result) => result.score > 0)).toBe(true)
   })
 
   test("reciprocal rank fusion merges rankings without score normalization", () => {

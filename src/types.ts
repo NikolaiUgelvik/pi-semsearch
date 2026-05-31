@@ -7,11 +7,8 @@ export type SourceRange = {
 
 export type ChunkKind = "file" | "class" | "function" | "method" | "block" | "fallback"
 
-export type HybridRetrievalMode = "parallel" | "bm25-prefilter" | "vector-prefilter"
-
 export type HybridRetrievalOptions = {
   enabled: boolean
-  mode: HybridRetrievalMode
   rrfK: number
   vectorCandidateMultiplier: number
   bm25CandidateMultiplier: number
@@ -56,7 +53,6 @@ export type ChunkLexicalStats = {
 
 export type SearchResultRetrievalDetails = {
   mode: "vector" | "hybrid"
-  hybridMode?: HybridRetrievalMode
   vectorRank?: number
   bm25Rank?: number
   bm25Score?: number

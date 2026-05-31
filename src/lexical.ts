@@ -1,8 +1,5 @@
 import type { ChunkRecord, LexicalIndex, SymbolRecord } from "./types.js"
 
-const BM25_K1 = 1.2
-const BM25_B = 0.75
-const BM25_IDF_SMOOTHING = 0.5
 const TOKEN_PATTERN = /[A-Za-z0-9_]+(?:[./-][A-Za-z0-9_]+)*/g
 const CAMEL_CASE_BOUNDARY_PATTERN = /([a-z0-9])([A-Z])/g
 const IDENTIFIER_SEPARATOR_PATTERN = /[_.\-/\s]+/
@@ -95,57 +92,6 @@ function buildLexicalIndex(
   }
 }
 
-function bm25Search(
-  query: string,
-  chunks: ChunkRecord[],
-  lexical: LexicalIndex | undefined,
-  topK: number,
-): RankedResult[] {
-  if (
-    !lexical ||
-    lexical.documentCount === 0 ||
-    lexical.averageDocumentLength === 0 ||
-    chunks.length === 0 ||
-    topK <= 0
-  ) {
-    return []
-  }
-
-  const queryTerms = new Set(tokenizeCodeText(query))
-  const results = chunks.flatMap((chunk) => rankedBm25Chunk(chunk, queryTerms, lexical))
-
-  return results.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, topK)
-}
-
-function rankedBm25Chunk(chunk: ChunkRecord, queryTerms: Set<string>, lexical: LexicalIndex) {
-  const score = bm25ChunkScore(chunk, queryTerms, lexical)
-  return score > 0 ? [{ id: chunk.id, score }] : []
-}
-
-function bm25ChunkScore(chunk: ChunkRecord, queryTerms: Set<string>, lexical: LexicalIndex) {
-  if (!chunk.lexical || chunk.lexical.length === 0) {
-    return 0
-  }
-  let score = 0
-  for (const term of queryTerms) {
-    score += bm25TermScore(term, chunk.lexical, lexical)
-  }
-  return score
-}
-
-function bm25TermScore(term: string, chunk: NonNullable<ChunkRecord["lexical"]>, lexical: LexicalIndex) {
-  const frequency = chunk.termFrequencies[term] ?? 0
-  if (frequency === 0) {
-    return 0
-  }
-  const documentFrequency = lexical.documentFrequencies[term] ?? 0
-  const inverseDocumentFrequency = Math.log(
-    1 + (lexical.documentCount - documentFrequency + BM25_IDF_SMOOTHING) / (documentFrequency + BM25_IDF_SMOOTHING),
-  )
-  const normalizedLength = 1 - BM25_B + BM25_B * (chunk.length / lexical.averageDocumentLength)
-  return inverseDocumentFrequency * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * normalizedLength))
-}
-
 function reciprocalRankFusion(input: {
   lists: { weight: number; results: RankedResult[] }[]
   rrfK: number
@@ -168,4 +114,4 @@ function reciprocalRankFusion(input: {
 }
 
 export type { RankedResult }
-export { bm25Search, buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText }
+export { buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText }

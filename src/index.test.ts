@@ -570,7 +570,7 @@ describe("cast plugin", () => {
     expect(result.output).toContain("sqlite-vec failed to load during HyDE candidates")
     expect(result.output).not.toContain("HyDE failed")
     expect(result.metadata).toEqual({ configured: false })
-    expect(candidateSearches).toBe(3)
+    expect(candidateSearches).toBe(2)
   })
 
   test("lazy sqlite-vec background failure from store write is recorded and prevents repeated refresh attempts", async () => {
@@ -1368,7 +1368,6 @@ describe("cast plugin", () => {
       retrieval: {
         hybrid: {
           enabled: true,
-          mode: "bm25-prefilter",
           rrfK: 42,
           vectorCandidateMultiplier: 3,
           bm25CandidateMultiplier: 5,
@@ -1385,7 +1384,6 @@ describe("cast plugin", () => {
 
     expect(hybrid).toEqual({
       enabled: true,
-      mode: "bm25-prefilter",
       rrfK: 42,
       vectorCandidateMultiplier: 3,
       bm25CandidateMultiplier: 5,

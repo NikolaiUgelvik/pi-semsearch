@@ -10,18 +10,14 @@ export function createOpenAIClient(options = {}) {
     };
 }
 async function embed(request, input) {
-    const body = await requestJson(request, `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`, {
-        method: "POST",
-        headers: buildHeaders(input.apiKey),
-        body: JSON.stringify({
-            model: input.model,
-            input: input.input,
-            ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
-        }),
-    }, "Embedding");
+    const body = await requestEmbeddings(request, input);
     return embeddingFromBody(body);
 }
 async function embedBatch(request, input) {
+    const body = await requestEmbeddings(request, input);
+    return embeddingsFromBody(body, input.input.length);
+}
+async function requestEmbeddings(request, input) {
     const body = await requestJson(request, `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`, {
         method: "POST",
         headers: buildHeaders(input.apiKey),
@@ -31,7 +27,7 @@ async function embedBatch(request, input) {
             ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
         }),
     }, "Embedding");
-    return embeddingsFromBody(body, input.input.length);
+    return body;
 }
 async function generateHyde(request, input) {
     const body = await requestJson(request, `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/chat/completions`, {

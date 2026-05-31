@@ -59,34 +59,17 @@ export function createIndexer(input) {
                 run = await runPromise;
                 return run;
             };
-            try {
-                await mapWithConcurrency(files, DEFAULT_FILE_CONCURRENCY, async (relativePath) => {
-                    const nextChanged = await processScannedFile({
-                        input,
-                        index,
-                        state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
-                        relativePath,
-                        runStore,
-                        run: () => run,
-                        ensureRun,
-                        embeddingBatcher,
-                        fileResultWriter,
-                    });
-                    changed = changed || nextChanged;
-                });
-            }
-            catch (error) {
-                try {
-                    await fileResultWriter.flush();
-                }
-                catch (flushError) {
-                    if (flushError === error) {
-                        throw error;
-                    }
-                    throw new AggregateError([error, flushError], "refresh failed and flushing file results failed");
-                }
-                throw error;
-            }
+            changed = await processScannedFiles({
+                files,
+                input,
+                index,
+                state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
+                runStore,
+                run: () => run,
+                ensureRun,
+                embeddingBatcher,
+                fileResultWriter,
+            });
             await embeddingBatcher.drain();
             await fileResultWriter.flush();
             metadataDiagnostics.sort();
@@ -110,6 +93,30 @@ export function createIndexer(input) {
             return index;
         },
     };
+}
+async function processScannedFiles(input) {
+    try {
+        await mapWithConcurrency(input.files, DEFAULT_FILE_CONCURRENCY, async (relativePath) => {
+            const nextChanged = await processScannedFile({ ...input, relativePath });
+            input.state.changed = input.state.changed || nextChanged;
+        });
+        return input.state.changed;
+    }
+    catch (error) {
+        await flushFileResultsAfterWorkerFailure(input.fileResultWriter, error);
+        throw error;
+    }
+}
+async function flushFileResultsAfterWorkerFailure(fileResultWriter, error) {
+    try {
+        await fileResultWriter.flush();
+    }
+    catch (flushError) {
+        if (flushError === error) {
+            throw error;
+        }
+        throw new AggregateError([error, flushError], "refresh failed and flushing file results failed");
+    }
 }
 function canSkipRefresh(index, worktree, changed, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange) {
     return (index.metadata.status === "ready" &&

@@ -26,26 +26,21 @@ async function embed(
   request: FetchLike,
   input: { baseURL: string; apiKey?: string; model: string; dimensions?: number; input: string },
 ) {
-  const body = await requestJson(
-    request,
-    `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`,
-    {
-      method: "POST",
-      headers: buildHeaders(input.apiKey),
-      body: JSON.stringify({
-        model: input.model,
-        input: input.input,
-        ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
-      }),
-    },
-    "Embedding",
-  )
+  const body = await requestEmbeddings(request, input)
   return embeddingFromBody(body)
 }
 
 async function embedBatch(
   request: FetchLike,
   input: { baseURL: string; apiKey?: string; model: string; dimensions?: number; input: string[] },
+) {
+  const body = await requestEmbeddings(request, input)
+  return embeddingsFromBody(body, input.input.length)
+}
+
+async function requestEmbeddings(
+  request: FetchLike,
+  input: { baseURL: string; apiKey?: string; model: string; dimensions?: number; input: string | string[] },
 ) {
   const body = await requestJson(
     request,
@@ -61,7 +56,7 @@ async function embedBatch(
     },
     "Embedding",
   )
-  return embeddingsFromBody(body, input.input.length)
+  return body
 }
 
 async function generateHyde(

@@ -285,9 +285,14 @@ function emptyHydratedChunkSet(cacheKey, embeddingDimensions, diagnostics) {
     };
 }
 function chunkIdsWithTopology(db, runId, chunkIds) {
+    const selected = readStoredChunksByIds(db, runId, [...new Set(chunkIds)]);
+    const ids = selectedChunkIds(chunkIds, selected);
+    appendRelatedChunkIds(ids, selected);
+    return ids;
+}
+function selectedChunkIds(chunkIds, selected) {
     const ids = [];
     const seen = new Set();
-    const selected = readStoredChunksByIds(db, runId, [...new Set(chunkIds)]);
     for (const chunkId of chunkIds) {
         if (seen.has(chunkId) || !selected.has(chunkId)) {
             continue;
@@ -295,24 +300,25 @@ function chunkIdsWithTopology(db, runId, chunkIds) {
         ids.push(chunkId);
         seen.add(chunkId);
     }
+    return ids;
+}
+function appendRelatedChunkIds(ids, selected) {
+    const seen = new Set(ids);
     for (const chunkId of ids.slice()) {
         const chunk = selected.get(chunkId);
         if (!chunk) {
             continue;
         }
-        for (const relatedId of [
-            chunk.parentChunkId,
-            ...chunk.childChunkIds,
-            chunk.previousSiblingChunkId,
-            chunk.nextSiblingChunkId,
-        ]) {
+        for (const relatedId of relatedChunkIds(chunk)) {
             if (relatedId && !seen.has(relatedId)) {
                 ids.push(relatedId);
                 seen.add(relatedId);
             }
         }
     }
-    return ids;
+}
+function relatedChunkIds(chunk) {
+    return [chunk.parentChunkId, ...chunk.childChunkIds, chunk.previousSiblingChunkId, chunk.nextSiblingChunkId];
 }
 function readActiveRunId(db) {
     return db.query("select value from meta where key = 'active_run_id'").get()?.value;
@@ -677,7 +683,9 @@ function updateRunChunkLexicalStats(db, runId, chunks) {
         if (!chunk.lexical) {
             continue;
         }
-        const row = db.query("select record_json as recordJson from chunks where run_id = ? and id = ?").get(runId, chunk.id);
+        const row = db
+            .query("select record_json as recordJson from chunks where run_id = ? and id = ?")
+            .get(runId, chunk.id);
         if (!row) {
             continue;
         }
@@ -697,44 +705,57 @@ function sameStringArray(left, right) {
     return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 function searchSqliteVectorCandidates(db, queryEmbedding, topK, paths) {
-    const activeRunId = readActiveRunId(db);
-    const target = Math.max(0, Math.floor(topK));
-    if (!activeRunId ||
-        target <= 0 ||
-        queryEmbedding.length === 0 ||
-        !isValidQueryEmbedding(queryEmbedding) ||
-        !tableExists(db, "chunk_vectors")) {
+    const search = sqliteVectorSearchInput(db, queryEmbedding, topK, paths);
+    if (!search) {
         return [];
     }
-    const dimensions = readRunMetadata(db, activeRunId)?.embeddingDimensions;
-    if (dimensions !== undefined && queryEmbedding.length !== dimensions) {
-        return [];
-    }
-    const vectorCount = readActiveVectorCount(db, activeRunId);
-    if (vectorCount === 0) {
-        return [];
-    }
-    const hasPathFilters = paths !== undefined && paths.length > 0;
-    const limits = sqliteVectorLimits(vectorCount, target, hasPathFilters);
+    const limits = sqliteVectorLimits(search.vectorCount, search.target, search.hasPathFilters);
     let currentK = limits.initial;
     const candidates = [];
     const seen = new Set();
     while (true) {
-        try {
-            appendMatchingSqliteVectorCandidates(candidates, seen, querySqliteVectorCandidates(db, activeRunId, queryEmbedding, currentK), paths);
-        }
-        catch (error) {
-            if (isSqliteVecQueryEmbeddingError(error)) {
-                return [];
-            }
-            throw error;
-        }
-        if (candidates.length >= target || currentK >= limits.max) {
+        appendMatchingSqliteVectorCandidates(candidates, seen, safeQuerySqliteVectorCandidates(db, search.activeRunId, queryEmbedding, currentK), paths);
+        if (candidates.length >= search.target || currentK >= limits.max) {
             break;
         }
         currentK = Math.min(limits.max, currentK * 2);
     }
-    return candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, target);
+    return candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, search.target);
+}
+function sqliteVectorSearchInput(db, queryEmbedding, topK, paths) {
+    const activeRunId = readActiveRunId(db);
+    const target = Math.max(0, Math.floor(topK));
+    if (!activeRunId) {
+        return null;
+    }
+    if (!canSearchSqliteVectors(db, queryEmbedding, target)) {
+        return null;
+    }
+    if (!embeddingDimensionsMatch(db, activeRunId, queryEmbedding)) {
+        return null;
+    }
+    const vectorCount = readActiveVectorCount(db, activeRunId);
+    return vectorCount > 0
+        ? { activeRunId, target, vectorCount, hasPathFilters: paths !== undefined && paths.length > 0 }
+        : null;
+}
+function canSearchSqliteVectors(db, queryEmbedding, target) {
+    return (target > 0 && queryEmbedding.length > 0 && isValidQueryEmbedding(queryEmbedding) && tableExists(db, "chunk_vectors"));
+}
+function embeddingDimensionsMatch(db, runId, queryEmbedding) {
+    const dimensions = readRunMetadata(db, runId)?.embeddingDimensions;
+    return dimensions === undefined || queryEmbedding.length === dimensions;
+}
+function safeQuerySqliteVectorCandidates(db, runId, queryEmbedding, topK) {
+    try {
+        return querySqliteVectorCandidates(db, runId, queryEmbedding, topK);
+    }
+    catch (error) {
+        if (isSqliteVecQueryEmbeddingError(error)) {
+            return [];
+        }
+        throw error;
+    }
 }
 function searchSqliteLexicalCandidates(db, query, topK, paths) {
     const activeRunId = readActiveRunId(db);

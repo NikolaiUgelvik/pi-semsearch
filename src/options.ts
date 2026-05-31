@@ -17,10 +17,8 @@ const RerankConfig = ApiConfig.omit({ dimensions: true }).extend({
   candidateMultiplier: z.number().int().positive().optional(),
 })
 
-const HybridMode = z.enum(["parallel", "bm25-prefilter", "vector-prefilter"])
 const HybridOptions = z.object({
   enabled: z.boolean().optional(),
-  mode: HybridMode.optional(),
   rrfK: z.number().int().positive().optional(),
   vectorCandidateMultiplier: z.number().int().positive().optional(),
   bm25CandidateMultiplier: z.number().int().positive().optional(),
@@ -67,7 +65,6 @@ const DEFAULT_HYDE_THRESHOLD = 0.35
 const DEFAULT_RERANK_CANDIDATE_MULTIPLIER = 4
 const DEFAULT_HYBRID_OPTIONS = {
   enabled: true,
-  mode: "parallel" as const,
   rrfK: 60,
   vectorCandidateMultiplier: 8,
   bm25CandidateMultiplier: 8,
@@ -405,7 +402,6 @@ function parseHybridOptions(input: unknown) {
 
   return {
     enabled: safeField(HybridFields.enabled, inputRecord.data.enabled),
-    mode: safeField(HybridFields.mode, inputRecord.data.mode),
     rrfK: safeField(HybridFields.rrfK, inputRecord.data.rrfK),
     vectorCandidateMultiplier: safeField(
       HybridFields.vectorCandidateMultiplier,

@@ -1308,7 +1308,9 @@ describe("index store", () => {
           .all("rankterm", 2) as Array<{ id: string; rank: number }>
 
         expect(results?.map((result) => result.id)).toEqual(ftsRows.map((row) => row.id))
+        expect(results?.every((result) => result.score === result.bm25Score)).toBe(true)
         expect(results?.map((result) => result.bm25Score)).toEqual(ftsRows.map((row) => row.rank * -1))
+        expect(results?.every((result) => result.score > 0)).toBe(true)
         expect(results?.[0].bm25Score).toBeGreaterThanOrEqual(results?.[1].bm25Score ?? 0)
       } finally {
         db.close()

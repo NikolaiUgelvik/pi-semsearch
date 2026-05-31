@@ -180,7 +180,6 @@ Configure hybrid retrieval under `retrieval.hybrid`:
   "retrieval": {
     "hybrid": {
       "enabled": true,
-      "mode": "parallel",
       "rrfK": 60,
       "vectorCandidateMultiplier": 8,
       "bm25CandidateMultiplier": 8,
@@ -191,11 +190,11 @@ Configure hybrid retrieval under `retrieval.hybrid`:
 }
 ```
 
-`mode` can be `parallel`, `bm25-prefilter`, or `vector-prefilter`. `parallel` searches both candidate sets before RRF. `bm25-prefilter` keeps BM25 candidates in fusion while limiting vector-side contributions to overlapping candidates, and `vector-prefilter` ranks BM25 within the vector candidate pool. When HyDE is triggered, it remains on the semantic/vector side while BM25 still participates in fusion.
+Hybrid retrieval searches semantic vector candidates and SQLite FTS/BM25 lexical candidates in parallel, then fuses both ranked lists with RRF. When HyDE is triggered, it remains on the semantic/vector side while SQLite lexical candidates still participate in fusion.
 
 When reranking is configured, the plugin first finds candidates through the normal vector, HyDE, and hybrid pipeline, then sends a larger candidate set to the reranker before returning the final `topK` results. Reranker documents include the chunk path, line range, kind, and chunk text, but not expanded parent context.
 
-Lexical stats are persisted in the index cache. Older or missing cache data degrades to vector-only retrieval with a diagnostic until the index is refreshed or rebuilt.
+SQLite FTS lexical data is persisted in the index cache. Older or missing cache data degrades to vector-only retrieval until the index is refreshed or rebuilt.
 
 ## Cache
 

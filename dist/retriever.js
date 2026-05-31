@@ -1,129 +1,133 @@
-import { bm25Search, reciprocalRankFusion } from "./lexical.js";
+import { reciprocalRankFusion } from "./lexical.js";
 import { matchesPaths } from "./path-filter.js";
-import { searchVectors } from "./store.js";
 import { chunkBreadcrumbs, chunkMatchesSource, expandWithParentContext, summarizeTopology } from "./topology.js";
 const CANDIDATE_MULTIPLIER = 3;
 const DEFAULT_MIN_FINAL_SCORE = 0.01;
-const STORE_BACKED_VECTOR_PREFILTER_CANDIDATE_COUNT = 10_000;
 export async function retrieveFromStore(input) {
-    const settings = retrievalSettings({ ...input, index: emptyRetrievalIndex(await input.indexStore.readMetadata()) });
+    await input.indexStore.readMetadata();
+    const settings = retrievalSettings(input);
     const rankingTopK = rankingLimit(settings.topK, input.options.rerank);
     const candidateCount = storeVectorCandidateCount(rankingTopK, input.options.hybrid);
-    const queryVector = await input.embed(input.input.query);
-    const vectorCandidates = await input.indexStore.searchVectorCandidates(queryVector, candidateCount, input.input.paths);
-    const lexicalCandidates = input.options.hybrid?.enabled && input.indexStore.searchLexicalCandidates
-        ? await input.indexStore.searchLexicalCandidates(input.input.query, rankingTopK * input.options.hybrid.bm25CandidateMultiplier, input.input.paths)
-        : [];
-    const candidateBatches = [{ vector: queryVector, candidates: vectorCandidates, requestedTopK: candidateCount }];
-    let generateHyde = input.generateHyde;
-    let embed = input.embed;
-    if (input.options.hyde.enabled && (vectorCandidates[0]?.score ?? -1) < input.options.hyde.threshold) {
-        try {
-            const hydeText = await input.generateHyde(input.input.query);
-            const hydeVector = await input.embed(hydeText);
-            candidateBatches.push({
-                vector: hydeVector,
-                candidates: await input.indexStore.searchVectorCandidates(hydeVector, candidateCount, input.input.paths),
-                requestedTopK: candidateCount,
-            });
-            generateHyde = () => Promise.resolve(hydeText);
-            embed = (text) => (text === hydeText ? Promise.resolve(hydeVector) : input.embed(text));
-        }
-        catch {
-            // Let retrieve perform HyDE and preserve its fallback diagnostics/status behavior.
-        }
-    }
-    const candidateIds = mergeCandidateIds(...candidateBatches.map((batch) => batch.candidates), lexicalCandidates);
+    const candidates = await collectStoreCandidates(input, rankingTopK, candidateCount);
+    const ranked = storeBackedRanking({
+        vectorCandidates: candidates.rankedVectorCandidates,
+        lexicalCandidates: candidates.lexicalCandidates,
+        hybrid: input.options.hybrid,
+        topK: rankingTopK,
+    });
+    const candidateIds = ranked.results.map((result) => result.id);
     const hydrated = await input.indexStore.hydrateChunks(candidateIds);
-    return retrieve({
-        ...input,
-        generateHyde,
-        embed,
-        index: {
-            metadata: { ...hydrated.metadata, diagnostics: [...hydrated.metadata.diagnostics, ...hydrated.diagnostics] },
-            files: hydrated.files,
-            chunks: hydrated.chunks,
-            symbols: hydrated.symbols,
-            lexical: hydrated.lexical,
-        },
-        indexStore: {
-            searchVectorCandidates: (vector, topK, paths) => {
-                const cached = candidateBatches.find((batch) => vectorsEqual(batch.vector, vector));
-                return cached && cached.requestedTopK >= topK
-                    ? Promise.resolve(cached.candidates)
-                    : input.indexStore.searchVectorCandidates(vector, topK, paths);
-            },
-        },
+    const hydratedStatusDiagnostics = uniqueDiagnostics([...hydrated.metadata.diagnostics, ...hydrated.diagnostics]);
+    const index = {
+        metadata: { ...hydrated.metadata, diagnostics: hydratedStatusDiagnostics },
+        files: hydrated.files,
+        chunks: hydrated.chunks,
+        symbols: hydrated.symbols,
+        lexical: hydrated.lexical,
+    };
+    const diagnostics = hydratedDiagnostics(input, hydrated, candidates.diagnostics);
+    const reranked = await maybeRerank({
+        input: { ...input, index },
+        rerank: input.options.rerank,
+        ranked,
+        chunksById: hydrated.chunks,
+        diagnostics,
     });
-}
-function mergeCandidateIds(...candidateGroups) {
-    return [...new Set(candidateGroups.flatMap((group) => group.map((candidate) => candidate.id)))];
-}
-function storeVectorCandidateCount(rankingTopK, hybrid) {
-    if (hybrid?.enabled && hybrid.mode === "vector-prefilter") {
-        return Math.max(rankingTopK * hybrid.vectorCandidateMultiplier, rankingTopK, STORE_BACKED_VECTOR_PREFILTER_CANDIDATE_COUNT);
-    }
-    const multiplier = hybrid?.enabled ? hybrid.vectorCandidateMultiplier : CANDIDATE_MULTIPLIER;
-    return Math.max(rankingTopK * multiplier, rankingTopK);
-}
-function vectorsEqual(left, right) {
-    return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-function emptyRetrievalIndex(metadata) {
-    return { metadata, files: {}, chunks: {}, symbols: {} };
-}
-export async function retrieve(input) {
-    const settings = retrievalSettings(input);
-    const rerank = input.options.rerank;
-    const rankingTopK = rankingLimit(settings.topK, rerank);
-    const diagnostics = diagnosticsForSearch(input);
-    const chunks = matchedChunks(input, diagnostics);
-    const chunksById = Object.fromEntries(chunks.map((chunk) => [chunk.id, chunk]));
-    const queryVector = await input.embed(input.input.query);
-    const hybrid = input.options.hybrid;
-    const canUseHybrid = Boolean(hybrid?.enabled && input.index.lexical && chunks.some((chunk) => chunk.lexical));
-    addHybridDiagnostic(hybrid, canUseHybrid, diagnostics);
-    const vectors = searchableVectors(chunks);
-    const searchVectorCandidates = vectorCandidateSearch({
-        input,
-        chunks,
-        chunksById,
-        vectors,
-        rankingTopK,
-        canUseHybrid,
-    });
-    const initial = await searchVectorCandidates(queryVector);
-    const bestScore = initial[0]?.score;
-    const initialScores = Object.fromEntries(initial.map((result) => [result.id, result.score]));
-    const hyde = await hydeResults(input, initial, bestScore, searchVectorCandidates);
-    let ranked = initialRanking({ input, chunks, vectorCandidates: hyde.scored, rankingTopK, canUseHybrid });
-    const reranked = await maybeRerank({ input, rerank, ranked, chunksById, diagnostics });
-    ranked = reranked.ranked;
-    const candidateResults = ranked.results.slice(0, settings.topK);
+    const candidateResults = reranked.ranked.results.slice(0, settings.topK);
     const filteredRankedResults = candidateResults.filter((result) => result.score >= settings.minFinalScore);
     const filteredCount = candidateResults.length - filteredRankedResults.length;
     const results = await outputResults({
-        input,
+        input: { ...input, index },
         results: filteredRankedResults,
-        chunksById,
+        chunksById: hydrated.chunks,
         diagnostics,
-        initialScores,
+        initialScores: Object.fromEntries(candidates.vectorCandidates.map((result) => [result.id, result.score])),
         maxContextChars: settings.maxContextChars,
-        retrieval: ranked.retrieval,
+        retrieval: reranked.ranked.retrieval,
     });
     return {
         status: {
-            ...input.index.metadata,
-            hydeUsed: hyde.hydeUsed,
-            bestScore,
+            ...hydrated.metadata,
+            diagnostics: hydratedStatusDiagnostics,
+            hydeUsed: candidates.hydeUsed,
+            bestScore: candidates.vectorCandidates[0]?.score,
             rerankUsed: reranked.used,
             minFinalScore: settings.minFinalScore,
             filteredCount,
             candidateCount: candidateResults.length,
         },
         results,
-        diagnostics: [...diagnostics, ...hyde.diagnostics],
+        diagnostics,
     };
+}
+async function collectStoreCandidates(input, rankingTopK, candidateCount) {
+    const queryVector = await input.embed(input.input.query);
+    const vectorCandidates = await input.indexStore.searchVectorCandidates(queryVector, candidateCount, input.input.paths);
+    const lexicalCandidates = await storeLexicalCandidates(input, rankingTopK);
+    const hyde = await storeHydeCandidates(input, vectorCandidates, candidateCount);
+    return {
+        vectorCandidates,
+        lexicalCandidates,
+        rankedVectorCandidates: hyde.rankedVectorCandidates,
+        diagnostics: hyde.diagnostics,
+        hydeUsed: hyde.used,
+    };
+}
+function storeLexicalCandidates(input, rankingTopK) {
+    const hybrid = input.options.hybrid;
+    const searchLexicalCandidates = input.indexStore.searchLexicalCandidates;
+    if (!hybrid?.enabled) {
+        return [];
+    }
+    if (!searchLexicalCandidates) {
+        return [];
+    }
+    return searchLexicalCandidates(input.input.query, rankingTopK * hybrid.bm25CandidateMultiplier, input.input.paths);
+}
+async function storeHydeCandidates(input, vectorCandidates, candidateCount) {
+    if (!shouldUseHyde(input, vectorCandidates)) {
+        return { rankedVectorCandidates: vectorCandidates, diagnostics: [], used: false };
+    }
+    try {
+        const hydeText = await input.generateHyde(input.input.query);
+        const hydeVector = await input.embed(hydeText);
+        const hydeCandidates = await input.indexStore.searchVectorCandidates(hydeVector, candidateCount, input.input.paths);
+        return {
+            rankedVectorCandidates: mergeRankedCandidates(vectorCandidates, hydeCandidates),
+            diagnostics: [],
+            used: true,
+        };
+    }
+    catch (error) {
+        if (isIndexUnavailableError(error)) {
+            throw error;
+        }
+        return {
+            rankedVectorCandidates: vectorCandidates,
+            diagnostics: [`HyDE failed: ${error instanceof Error ? error.message : String(error)}`],
+            used: false,
+        };
+    }
+}
+function shouldUseHyde(input, vectorCandidates) {
+    return input.options.hyde.enabled && (vectorCandidates[0]?.score ?? -1) < input.options.hyde.threshold;
+}
+function hydratedDiagnostics(input, hydrated, candidateDiagnostics) {
+    return uniqueDiagnostics([
+        ...hydrated.metadata.diagnostics,
+        ...candidateDiagnostics,
+        ...Object.values(hydrated.files)
+            .filter((file) => file.diagnostics.length > 0 && matchesPaths(file.path, input.input.paths))
+            .flatMap((file) => file.diagnostics.map((diagnostic) => `${file.path}: ${diagnostic}`)),
+        ...hydrated.diagnostics,
+    ]);
+}
+function uniqueDiagnostics(diagnostics) {
+    return [...new Set(diagnostics)];
+}
+function storeVectorCandidateCount(rankingTopK, hybrid) {
+    const multiplier = hybrid?.enabled ? hybrid.vectorCandidateMultiplier : CANDIDATE_MULTIPLIER;
+    return Math.max(rankingTopK * multiplier, rankingTopK);
 }
 function retrievalSettings(input) {
     return {
@@ -135,31 +139,49 @@ function retrievalSettings(input) {
 function rankingLimit(topK, rerank) {
     return rerank ? Math.max(topK * rerank.candidateMultiplier, topK) : topK;
 }
-function addHybridDiagnostic(hybrid, canUseHybrid, diagnostics) {
-    if (hybrid?.enabled && !canUseHybrid) {
-        diagnostics.push("hybrid retrieval requested but lexical data is unavailable; using vector-only retrieval");
-    }
-}
-function initialRanking(input) {
-    return input.canUseHybrid
-        ? hybridRanking(input.input, input.chunks, input.vectorCandidates, input.rankingTopK)
-        : vectorRanking(input.vectorCandidates, input.rankingTopK);
-}
-function hybridRanking(input, chunks, vectorCandidates, rankingTopK) {
-    return hybridResults({
-        query: input.input.query,
-        chunks,
-        lexical: input.index.lexical,
-        topK: rankingTopK,
-        vectorCandidates,
-        hybrid: input.options.hybrid,
-    });
-}
 function vectorRanking(vectorCandidates, rankingTopK) {
     return {
         results: vectorCandidates.slice(0, rankingTopK),
         retrieval: new Map(vectorCandidates.map((result, index) => [result.id, { mode: "vector", vectorRank: index + 1 }])),
     };
+}
+function storeBackedRanking(input) {
+    if (!input.hybrid?.enabled || input.lexicalCandidates.length === 0) {
+        return vectorRanking(input.vectorCandidates, input.topK);
+    }
+    const results = reciprocalRankFusion({
+        lists: [
+            { weight: input.hybrid.vectorWeight, results: input.vectorCandidates },
+            { weight: input.hybrid.bm25Weight, results: input.lexicalCandidates },
+        ],
+        rrfK: input.hybrid.rrfK,
+        topK: input.topK,
+    });
+    const vectorRanks = rankMap(input.vectorCandidates);
+    const bm25Ranks = rankMap(input.lexicalCandidates);
+    const bm25Scores = new Map(input.lexicalCandidates.map((result) => [result.id, result.bm25Score ?? result.score]));
+    return {
+        results,
+        retrieval: new Map(results.map((result) => [
+            result.id,
+            {
+                mode: "hybrid",
+                vectorRank: vectorRanks.get(result.id),
+                bm25Rank: bm25Ranks.get(result.id),
+                bm25Score: bm25Scores.get(result.id),
+            },
+        ])),
+    };
+}
+function mergeRankedCandidates(...candidateGroups) {
+    const candidatesById = new Map();
+    for (const candidate of candidateGroups.flat()) {
+        const existing = candidatesById.get(candidate.id);
+        if (!existing || candidate.score > existing.score) {
+            candidatesById.set(candidate.id, candidate);
+        }
+    }
+    return [...candidatesById.values()].sort((left, right) => right.score - left.score || left.id.localeCompare(right.id));
 }
 async function maybeRerank(input) {
     if (!input.rerank || input.ranked.results.length === 0) {
@@ -186,77 +208,6 @@ async function rerankedSearch(input) {
             retrieval: input.ranked.retrieval,
             rerank: input.input.rerank,
         }),
-    };
-}
-function diagnosticsForSearch(input) {
-    return [
-        ...input.index.metadata.diagnostics,
-        ...Object.values(input.index.files)
-            .filter((file) => file.diagnostics.length > 0 && matchesPaths(file.path, input.input.paths))
-            .flatMap((file) => file.diagnostics.map((diagnostic) => `${file.path}: ${diagnostic}`)),
-    ];
-}
-function matchedChunks(input, diagnostics) {
-    return Object.entries(input.index.chunks)
-        .flatMap(([key, chunk]) => validChunkEntry(key, chunk, diagnostics))
-        .filter((chunk) => matchesPaths(chunk.filePath, input.input.paths));
-}
-function validChunkEntry(key, chunk, diagnostics) {
-    if (key === chunk.id) {
-        return [chunk];
-    }
-    diagnostics.push(`chunk key mismatch: ${key} contains ${chunk.id}; chunk skipped`);
-    return [];
-}
-function searchableVectors(chunks) {
-    return chunks
-        .filter((chunk) => Boolean(chunk.embedding))
-        .map((chunk) => ({ id: chunk.id, vector: chunk.embedding }))
-        .sort((left, right) => left.id.localeCompare(right.id));
-}
-function vectorCandidateSearch(input) {
-    const searchCandidateCount = candidateSearchCount(input);
-    return async (vector) => {
-        if (input.input.indexStore?.searchVectorCandidates) {
-            const candidates = await input.input.indexStore.searchVectorCandidates(vector, searchCandidateCount, input.input.input.paths);
-            return candidates.filter((candidate) => input.chunksById[candidate.id]);
-        }
-        return searchVectors(vector, input.vectors, searchCandidateCount);
-    };
-}
-function candidateSearchCount(input) {
-    const hybrid = input.input.options.hybrid;
-    const multiplier = input.canUseHybrid ? (hybrid?.vectorCandidateMultiplier ?? 1) : CANDIDATE_MULTIPLIER;
-    const count = input.canUseHybrid && hybrid?.mode === "vector-prefilter"
-        ? Math.max(input.vectors.length, input.chunks.length)
-        : input.rankingTopK * multiplier;
-    return Math.max(count, input.rankingTopK);
-}
-function hydeResults(input, initial, bestScore, searchVectorCandidates) {
-    if (!shouldUseHyde(input, bestScore)) {
-        return { scored: initial, hydeUsed: false, diagnostics: [] };
-    }
-    return input
-        .generateHyde(input.input.query)
-        .then((text) => input.embed(text))
-        .then(async (vector) => ({
-        scored: await searchVectorCandidates(vector),
-        hydeUsed: true,
-        diagnostics: [],
-    }))
-        .catch((error) => failedHydeResult(error, initial));
-}
-function shouldUseHyde(input, bestScore) {
-    return input.options.hyde.enabled && (bestScore ?? -1) < input.options.hyde.threshold;
-}
-function failedHydeResult(error, initial) {
-    if (isIndexUnavailableError(error)) {
-        throw error;
-    }
-    return {
-        scored: initial,
-        hydeUsed: false,
-        diagnostics: [`HyDE failed: ${error instanceof Error ? error.message : String(error)}`],
     };
 }
 async function outputResults(input) {
@@ -324,70 +275,8 @@ function omitDuplicateParentRange(result, seenParentRanges) {
 function isIndexUnavailableError(error) {
     return error instanceof Error && error.name === "IndexUnavailableError";
 }
-function hybridResults(input) {
-    const bm25CandidateCount = Math.max(input.topK * input.hybrid.bm25CandidateMultiplier, input.topK);
-    const vectorCandidateCount = Math.max(input.topK * input.hybrid.vectorCandidateMultiplier, input.topK);
-    const allBm25 = bm25Search(input.query, input.chunks, input.lexical, bm25CandidateCount);
-    const vectorCandidates = input.hybrid.mode === "vector-prefilter"
-        ? includeScoreTies(input.vectorCandidates, vectorCandidateCount)
-        : input.vectorCandidates.slice(0, vectorCandidateCount);
-    const bm25Candidates = candidatesForMode(input.hybrid.mode, {
-        query: input.query,
-        chunks: input.chunks,
-        lexical: input.lexical,
-        allBm25,
-        vectorCandidates,
-    });
-    const filteredVectorCandidates = vectorCandidatesForMode(input.hybrid.mode, {
-        vectorCandidates,
-        bm25Candidates,
-    });
-    const results = reciprocalRankFusion({
-        lists: [
-            { weight: input.hybrid.vectorWeight, results: filteredVectorCandidates },
-            { weight: input.hybrid.bm25Weight, results: bm25Candidates },
-        ],
-        rrfK: input.hybrid.rrfK,
-        topK: input.topK,
-    });
-    const vectorRanks = rankMap(filteredVectorCandidates);
-    const bm25Ranks = rankMap(bm25Candidates);
-    const bm25Scores = new Map(bm25Candidates.map((result) => [result.id, result.score]));
-    const retrieval = new Map(results.map((result) => [
-        result.id,
-        {
-            mode: "hybrid",
-            hybridMode: input.hybrid.mode,
-            vectorRank: vectorRanks.get(result.id),
-            bm25Rank: bm25Ranks.get(result.id),
-            bm25Score: bm25Scores.get(result.id),
-        },
-    ]));
-    return { results, retrieval };
-}
-function candidatesForMode(mode, input) {
-    if (mode !== "vector-prefilter") {
-        return input.allBm25;
-    }
-    const vectorIds = new Set(input.vectorCandidates.map((result) => result.id));
-    return bm25Search(input.query, input.chunks.filter((chunk) => vectorIds.has(chunk.id)), input.lexical, input.allBm25.length);
-}
-function vectorCandidatesForMode(mode, input) {
-    if (mode !== "bm25-prefilter") {
-        return input.vectorCandidates;
-    }
-    const bm25Ids = new Set(input.bm25Candidates.map((result) => result.id));
-    return input.vectorCandidates.filter((result) => bm25Ids.has(result.id));
-}
 function rankMap(results) {
     return new Map(results.map((result, index) => [result.id, index + 1]));
-}
-function includeScoreTies(results, limit) {
-    const cutoffScore = results[limit - 1]?.score;
-    if (cutoffScore === undefined) {
-        return results.slice();
-    }
-    return results.filter((result) => result.score >= cutoffScore);
 }
 async function rerankResults(input) {
     const candidates = input.results.flatMap((result) => {

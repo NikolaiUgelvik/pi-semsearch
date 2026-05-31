@@ -25,7 +25,6 @@ export declare function parseOptions(input: unknown, env?: Record<string, string
     retrieval: {
         hybrid: {
             enabled: boolean;
-            mode: "parallel" | "bm25-prefilter" | "vector-prefilter";
             rrfK: number;
             vectorCandidateMultiplier: number;
             bm25CandidateMultiplier: number;

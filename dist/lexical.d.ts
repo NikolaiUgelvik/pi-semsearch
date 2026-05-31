@@ -8,7 +8,6 @@ declare function buildLexicalIndex(chunks: Record<string, ChunkRecord>, symbols:
     lexical: LexicalIndex;
     chunks: Record<string, ChunkRecord>;
 };
-declare function bm25Search(query: string, chunks: ChunkRecord[], lexical: LexicalIndex | undefined, topK: number): RankedResult[];
 declare function reciprocalRankFusion(input: {
     lists: {
         weight: number;
@@ -18,4 +17,4 @@ declare function reciprocalRankFusion(input: {
     topK: number;
 }): RankedResult[];
 export type { RankedResult };
-export { bm25Search, buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText };
+export { buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText };

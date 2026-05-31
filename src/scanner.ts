@@ -120,32 +120,17 @@ export function createIndexer(input: {
         return run
       }
 
-      try {
-        await mapWithConcurrency(files, DEFAULT_FILE_CONCURRENCY, async (relativePath) => {
-          const nextChanged = await processScannedFile({
-            input,
-            index,
-            state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
-            relativePath,
-            runStore,
-            run: () => run,
-            ensureRun,
-            embeddingBatcher,
-            fileResultWriter,
-          })
-          changed = changed || nextChanged
-        })
-      } catch (error) {
-        try {
-          await fileResultWriter.flush()
-        } catch (flushError) {
-          if (flushError === error) {
-            throw error
-          }
-          throw new AggregateError([error, flushError], "refresh failed and flushing file results failed")
-        }
-        throw error
-      }
+      changed = await processScannedFiles({
+        files,
+        input,
+        index,
+        state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
+        runStore,
+        run: () => run,
+        ensureRun,
+        embeddingBatcher,
+        fileResultWriter,
+      })
 
       await embeddingBatcher.drain()
       await fileResultWriter.flush()
@@ -172,6 +157,40 @@ export function createIndexer(input: {
       await persistRefreshedIndex({ index, store, runStore, run: () => run, ensureRun })
       return index
     },
+  }
+}
+
+async function processScannedFiles(input: {
+  files: string[]
+  input: CreateIndexerInput
+  index: CastIndex
+  state: RefreshState
+  runStore: IndexRunStore | undefined
+  run: () => { runId: string } | undefined
+  ensureRun: () => Promise<{ runId: string } | undefined>
+  embeddingBatcher: EmbeddingBatcher
+  fileResultWriter: FileResultWriter
+}) {
+  try {
+    await mapWithConcurrency(input.files, DEFAULT_FILE_CONCURRENCY, async (relativePath) => {
+      const nextChanged = await processScannedFile({ ...input, relativePath })
+      input.state.changed = input.state.changed || nextChanged
+    })
+    return input.state.changed
+  } catch (error) {
+    await flushFileResultsAfterWorkerFailure(input.fileResultWriter, error)
+    throw error
+  }
+}
+
+async function flushFileResultsAfterWorkerFailure(fileResultWriter: FileResultWriter, error: unknown) {
+  try {
+    await fileResultWriter.flush()
+  } catch (flushError) {
+    if (flushError === error) {
+      throw error
+    }
+    throw new AggregateError([error, flushError], "refresh failed and flushing file results failed")
   }
 }
 

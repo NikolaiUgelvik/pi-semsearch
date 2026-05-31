@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { buildLexicalIndex } from "./lexical.js"
-import { retrieve, retrieveFromStore } from "./retriever.js"
-import { createEmptyIndex } from "./store.js"
-import type { CastIndex, HybridRetrievalOptions, RerankOptions } from "./types.js"
+import { minimatch } from "minimatch"
+import { buildLexicalIndex, tokenizeCodeText } from "./lexical.js"
+import { type RetrievalIndexStore, type RetrieveFromStoreInput, retrieveFromStore } from "./retriever.js"
+import { createEmptyIndex, searchVectors } from "./store.js"
+import type { CastIndex, ChunkRecord, HybridRetrievalOptions, RerankOptions } from "./types.js"
 
 const hybridOptions = (overrides: Partial<HybridRetrievalOptions> = {}): HybridRetrievalOptions => ({
   enabled: true,
-  mode: "parallel",
   rrfK: 60,
   vectorCandidateMultiplier: 2,
   bm25CandidateMultiplier: 2,
@@ -23,10 +23,117 @@ const rerankOptions = (overrides: Partial<RerankOptions> = {}): RerankOptions =>
   ...overrides,
 })
 
+const TEST_GLOB_SYNTAX_PATTERN = /[*?[{]|[!+@]\(/
+
 function addLexicalStats(index: CastIndex) {
   const lexical = buildLexicalIndex(index.chunks, index.symbols)
   index.lexical = lexical.lexical
   index.chunks = lexical.chunks
+}
+
+type RetrieveFromIndexInput = Omit<RetrieveFromStoreInput, "indexStore"> & {
+  index: CastIndex
+  indexStore?: RetrievalIndexStore
+}
+
+async function retrieveFromIndex({ index, indexStore, ...input }: RetrieveFromIndexInput) {
+  return retrieveFromStore({ ...input, indexStore: indexStore ?? indexStoreFromIndex(index) })
+}
+
+function indexStoreFromIndex(index: CastIndex): RetrievalIndexStore {
+  return {
+    readMetadata: async () => index.metadata,
+    searchVectorCandidates: async (queryEmbedding, topK, paths) => {
+      const vectors = Object.values(index.chunks)
+        .filter((chunk) => chunk.embedding && testPathMatches(chunk.filePath, paths))
+        .map((chunk) => ({ id: chunk.id, vector: chunk.embedding ?? [] }))
+      return searchVectors(queryEmbedding, vectors, topK)
+    },
+    searchLexicalCandidates: async (query, topK, paths) => {
+      const chunks = Object.values(index.chunks).filter((chunk) => testPathMatches(chunk.filePath, paths))
+      const lexical = buildLexicalIndex(Object.fromEntries(chunks.map((chunk) => [chunk.id, chunk])), index.symbols)
+      const queryTerms = new Set(tokenizeCodeText(query))
+      return Object.values(lexical.chunks)
+        .flatMap((chunk) => {
+          const score = [...queryTerms].reduce((sum, term) => sum + (chunk.lexical?.termFrequencies[term] ?? 0), 0)
+          return score > 0 ? [{ id: chunk.id, score, bm25Score: score }] : []
+        })
+        .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+        .slice(0, topK)
+    },
+    hydrateChunks: async (chunkIds) => {
+      const ids = chunkIdsWithTopology(index, chunkIds)
+      const chunks = Object.fromEntries(ids.flatMap((id) => (index.chunks[id] ? [[id, index.chunks[id]]] : [])))
+      const filePaths = [...new Set(Object.values(chunks).map((chunk) => chunk.filePath))]
+      const files = Object.fromEntries(
+        filePaths.map((filePath) => [
+          filePath,
+          index.files[filePath] ?? {
+            path: filePath,
+            language: chunksByFilePath(chunks, filePath)[0]?.language ?? "typescript",
+            fingerprint: "test",
+            chunkIds: Object.values(index.chunks)
+              .filter((chunk) => chunk.filePath === filePath)
+              .map((chunk) => chunk.id),
+            diagnostics: [],
+          },
+        ]),
+      )
+      const symbolIds = [...new Set(Object.values(chunks).flatMap((chunk) => chunk.symbolIds))]
+      return {
+        metadata: index.metadata,
+        files,
+        chunks,
+        symbols: Object.fromEntries(symbolIds.flatMap((id) => (index.symbols[id] ? [[id, index.symbols[id]]] : []))),
+        lexical: index.lexical,
+        diagnostics: index.metadata.diagnostics,
+      }
+    },
+  }
+}
+
+function testPathMatches(filePath: string, paths?: string[]) {
+  return !paths || paths.length === 0 || paths.some((path) => testPathFilterMatches(filePath, path))
+}
+
+function testPathFilterMatches(filePath: string, path: string) {
+  if (TEST_GLOB_SYNTAX_PATTERN.test(path)) {
+    return minimatch(filePath, path, { dot: true })
+  }
+  return filePath === path || filePath.startsWith(path.endsWith("/") ? path : `${path}/`)
+}
+
+function chunkIdsWithTopology(index: CastIndex, chunkIds: string[]) {
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const id of chunkIds) {
+    if (!seen.has(id) && index.chunks[id]) {
+      ids.push(id)
+      seen.add(id)
+    }
+  }
+  for (const id of ids.slice()) {
+    const chunk = index.chunks[id]
+    if (!chunk) {
+      continue
+    }
+    for (const relatedId of [
+      chunk.parentChunkId,
+      ...chunk.childChunkIds,
+      chunk.previousSiblingChunkId,
+      chunk.nextSiblingChunkId,
+    ]) {
+      if (relatedId && !seen.has(relatedId)) {
+        ids.push(relatedId)
+        seen.add(relatedId)
+      }
+    }
+  }
+  return ids
+}
+
+function chunksByFilePath(chunks: Record<string, ChunkRecord>, filePath: string) {
+  return Object.values(chunks).filter((chunk) => chunk.filePath === filePath)
 }
 
 describe("retrieve", () => {
@@ -51,7 +158,7 @@ describe("retrieve", () => {
       childChunkIds: [],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -59,16 +166,9 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "function a() {}",
       indexStore: {
+        ...indexStoreFromIndex(index),
         searchVectorCandidates: async () => [{ id: "c1", score: 0.75 }],
       },
-    } as Parameters<typeof retrieve>[0] & {
-      indexStore: {
-        searchVectorCandidates(
-          queryEmbedding: number[],
-          topK: number,
-          paths?: string[],
-        ): Promise<Array<{ id: string; score: number }>>
-      }
     })
 
     expect(output.results[0].filePath).toBe("a.ts")
@@ -220,10 +320,98 @@ describe("retrieve", () => {
 
     expect(output.status.hydeUsed).toBe(true)
     expect(output.results.map((result) => result.filePath)).toEqual(["hyde.ts"])
-    expect(hydratedChunkIds).toEqual([["initial", "hyde"]])
+    expect(hydratedChunkIds).toEqual([["hyde"]])
   })
 
-  test("store-backed hybrid retrieval hydrates merged vector and lexical candidates", async () => {
+  test("store-backed retrieval de-duplicates hydrated diagnostics preserving order", async () => {
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: ["metadata warning", "shared warning"],
+    }
+
+    const output = await retrieveFromStore({
+      input: { query: "alpha", topK: 1, includeParents: true, maxContextChars: 100 },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "function alpha() {}",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async () => [{ id: "c1", score: 0.9 }],
+        hydrateChunks: async () => ({
+          metadata,
+          files: {
+            "a.ts": { path: "a.ts", language: "typescript", fingerprint: "fp", chunkIds: ["c1"], diagnostics: [] },
+          },
+          chunks: {
+            c1: {
+              id: "c1",
+              filePath: "a.ts",
+              language: "typescript",
+              kind: "function",
+              range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+              text: "function alpha() {}",
+              nonWhitespaceChars: 17,
+              nodeTypes: [],
+              symbolIds: [],
+              childChunkIds: [],
+            },
+          },
+          symbols: {},
+          diagnostics: ["shared warning", "hydration warning"],
+        }),
+      },
+    })
+
+    expect(output.status.diagnostics).toEqual(["metadata warning", "shared warning", "hydration warning"])
+    expect(output.diagnostics).toEqual(["metadata warning", "shared warning", "hydration warning"])
+  })
+
+  test("store-backed HyDE rethrows index unavailable errors", async () => {
+    const unavailable = new Error("index unavailable")
+    unavailable.name = "IndexUnavailableError"
+
+    await expect(
+      retrieveFromStore({
+        input: { query: "alpha", topK: 1, includeParents: true, maxContextChars: 100 },
+        options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.5 } },
+        embed: async (text) => (text === "alpha" ? [1, 0] : [0, 1]),
+        generateHyde: async () => "hyde alpha",
+        readSource: async () => "function alpha() {}",
+        indexStore: {
+          readMetadata: async () => ({
+            schemaVersion: 1,
+            projectId: "p",
+            worktree: "/repo",
+            cacheKey: "key",
+            maxChunkNonWhitespaceChars: 2000,
+            chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+            updatedAt: 1,
+            status: "ready",
+            diagnostics: [],
+          }),
+          searchVectorCandidates: async (vector) => {
+            if (vector[0] === 1) {
+              return [{ id: "initial", score: 0.1 }]
+            }
+            throw unavailable
+          },
+          hydrateChunks: async () => {
+            throw new Error("hydrate should not run")
+          },
+        },
+      }),
+    ).rejects.toThrow("index unavailable")
+  })
+
+  test("store-backed hybrid fuses SQLite lexical candidates without hydrated lexical stats", async () => {
     const hydratedIds: string[][] = []
     const metadata = {
       schemaVersion: 1,
@@ -241,14 +429,15 @@ describe("retrieve", () => {
       options: { topK: 2, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 }, hybrid: hybridOptions() },
       embed: async () => [1, 0],
       generateHyde: async () => "hyde text",
-      readSource: async () => "",
+      readSource: async (filePath) =>
+        filePath === "lexical.ts" ? "function exactNeedle() {}" : "function vector() {}",
       indexStore: {
         readMetadata: async () => metadata,
         searchVectorCandidates: async () => [{ id: "vector", score: 0.9 }],
-        searchLexicalCandidates: async () => [{ id: "lexical", score: 10, bm25Score: 10 }],
+        searchLexicalCandidates: async () => [{ id: "lexical", score: 12, bm25Score: 7 }],
         hydrateChunks: async (ids) => {
           hydratedIds.push(ids)
-          const hydrated = {
+          return {
             metadata,
             files: {
               "vector.ts": {
@@ -295,14 +484,20 @@ describe("retrieve", () => {
             symbols: {},
             diagnostics: [],
           }
-          const lexical = buildLexicalIndex(hydrated.chunks, hydrated.symbols)
-          return { ...hydrated, chunks: lexical.chunks, lexical: lexical.lexical }
         },
       },
     })
 
     expect(hydratedIds[0].sort()).toEqual(["lexical", "vector"])
-    expect(output.results.map((result) => result.filePath).sort()).toEqual(["lexical.ts", "vector.ts"])
+    expect(output.diagnostics).not.toContain(
+      "hybrid retrieval requested but lexical data is unavailable; using vector-only retrieval",
+    )
+    expect(output.results.map((result) => result.topology.chunk.id).sort()).toEqual(["lexical", "vector"])
+    expect(output.results.find((result) => result.topology.chunk.id === "lexical")?.retrieval).toMatchObject({
+      mode: "hybrid",
+      bm25Rank: 1,
+      bm25Score: 7,
+    })
   })
 
   test("store-backed hybrid retrieval prefetches the hybrid vector candidate count", async () => {
@@ -375,7 +570,7 @@ describe("retrieve", () => {
     expect(vectorTopKs[0]).toBe(16)
   })
 
-  test("store-backed vector-prefilter hybrid prefetches enough candidates to preserve vector ties", async () => {
+  test("store-backed hybrid hydrates only ranked vector candidates", async () => {
     const vectorTopKs: number[] = []
     const metadata = {
       schemaVersion: 1,
@@ -394,7 +589,7 @@ describe("retrieve", () => {
         topK: 1,
         maxContextChars: 100,
         hyde: { enabled: false, threshold: 0.5 },
-        hybrid: hybridOptions({ mode: "vector-prefilter", vectorCandidateMultiplier: 1, bm25CandidateMultiplier: 1 }),
+        hybrid: hybridOptions({ vectorCandidateMultiplier: 1, bm25CandidateMultiplier: 1 }),
       },
       embed: async () => [1, 0],
       generateHyde: async () => "hyde text",
@@ -444,8 +639,8 @@ describe("retrieve", () => {
       },
     })
 
-    expect(vectorTopKs[0]).toBe(10_000)
-    expect(output.results[0].topology.chunk.id).toBe("z-exact")
+    expect(vectorTopKs[0]).toBe(1)
+    expect(output.results[0].topology.chunk.id).toBe("a-unrelated")
   })
 
   test("returns normal embedding results without HyDE above threshold", async () => {
@@ -470,7 +665,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.5 } },
@@ -593,7 +788,7 @@ describe("retrieve", () => {
       childChunkIds: [],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "parseOptions", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -673,7 +868,7 @@ describe("retrieve", () => {
       embedding: [0.8, 0],
     }
 
-    const exact = await retrieve({
+    const exact = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 3, includeParents: true, maxContextChars: 100, paths: ["test/c.ts"] },
       options: { topK: 3, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -681,7 +876,7 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async (filePath) => index.chunks[filePath].text,
     })
-    const directory = await retrieve({
+    const directory = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 3, includeParents: true, maxContextChars: 100, paths: ["src/"] },
       options: { topK: 3, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -689,7 +884,7 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async (filePath) => index.chunks[filePath].text,
     })
-    const glob = await retrieve({
+    const glob = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 3, includeParents: true, maxContextChars: 100, paths: ["src/**/*.ts"] },
       options: { topK: 3, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -697,7 +892,7 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async (filePath) => index.chunks[filePath].text,
     })
-    const bracketGlob = await retrieve({
+    const bracketGlob = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 3, includeParents: true, maxContextChars: 100, paths: ["src/[ab].ts"] },
       options: { topK: 3, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -734,7 +929,7 @@ describe("retrieve", () => {
       embedding: [0, 1],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.5 } },
@@ -772,7 +967,7 @@ describe("retrieve", () => {
       embedding: [0, 1],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100, minFinalScore: 0 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.5 } },
@@ -788,7 +983,7 @@ describe("retrieve", () => {
     expect(output.results[0].score).toBe(0)
     expect(output.results[0].finalScore).toBe(0)
     expect(output.diagnostics).toContain("existing")
-    expect(output.diagnostics.at(-1)).toContain("HyDE failed: hyde exploded")
+    expect(output.diagnostics).toContain("HyDE failed: hyde exploded")
   })
 
   test("uses HyDE when initial search has no embedded chunks", async () => {
@@ -800,7 +995,7 @@ describe("retrieve", () => {
     })
     index.metadata.status = "ready"
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.5 } },
@@ -836,7 +1031,7 @@ describe("retrieve", () => {
       embedding: [0, 1],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "nonsense", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -873,7 +1068,7 @@ describe("retrieve", () => {
       embedding: [0, 1],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "nonsense", topK: 1, includeParents: true, maxContextChars: 100, minFinalScore: 0 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -911,7 +1106,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100, minFinalScore: 1.1 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -948,7 +1143,7 @@ describe("retrieve", () => {
       embedding: [0, 1],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "nonsense", topK: 1, includeParents: true, maxContextChars: 100, minFinalScore: -1 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -999,7 +1194,7 @@ describe("retrieve", () => {
       embedding: [0.9, Math.sqrt(0.19)],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "best match", topK: 1, includeParents: true, maxContextChars: 100 },
       options: {
@@ -1057,7 +1252,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "best match", topK: 1, includeParents: true, maxContextChars: 100 },
       options: {
@@ -1143,7 +1338,7 @@ describe("retrieve", () => {
       embedding: [0.1, Math.sqrt(0.99)],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.95 } },
@@ -1157,12 +1352,13 @@ describe("retrieve", () => {
     expect(output.results[0].score).toBe(output.results[0].finalScore)
   })
 
-  test("returns file-level diagnostics when no chunks have embeddings", async () => {
+  test("returns metadata diagnostics when no chunks have embeddings", async () => {
     const index = createEmptyIndex({
       projectId: "p",
       worktree: "/repo",
       cacheKey: "key",
       maxChunkNonWhitespaceChars: 2000,
+      diagnostics: ["embedding failed: boom"],
     })
     index.metadata.status = "ready"
     index.files["a.ts"] = {
@@ -1186,7 +1382,7 @@ describe("retrieve", () => {
       embeddingError: "boom",
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1196,7 +1392,7 @@ describe("retrieve", () => {
     })
 
     expect(output.results).toEqual([])
-    expect(output.diagnostics).toContain("a.ts: embedding failed: boom")
+    expect(output.diagnostics).toContain("embedding failed: boom")
   })
 
   function searchParentContextFixture() {
@@ -1252,7 +1448,7 @@ describe("retrieve", () => {
   test("omits parent context from search results by default", async () => {
     const { childText, index, source } = searchParentContextFixture()
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "parse", topK: 1, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1275,7 +1471,7 @@ describe("retrieve", () => {
   test("includes parent context from search results when explicitly requested", async () => {
     const { index, parentRange, parentText, source } = searchParentContextFixture()
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "parse", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1318,7 +1514,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1366,7 +1562,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1406,7 +1602,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1453,7 +1649,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1467,41 +1663,6 @@ describe("retrieve", () => {
     expect(output.results[0].parentText).toBeUndefined()
     expect(output.results[0].parentRange).toBeUndefined()
     expect(output.diagnostics).toContain("source mismatch for a.ts:c1; parent context omitted")
-  })
-
-  test("skips malformed chunk map keys with diagnostics", async () => {
-    const index = createEmptyIndex({
-      projectId: "p",
-      worktree: "/repo",
-      cacheKey: "key",
-      maxChunkNonWhitespaceChars: 2000,
-    })
-    index.metadata.status = "ready"
-    index.chunks.wrong = {
-      id: "c1",
-      filePath: "a.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
-      text: "function a() {}",
-      nonWhitespaceChars: 13,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [1, 0],
-    }
-
-    const output = await retrieve({
-      index,
-      input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
-      options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
-      embed: async () => [1, 0],
-      generateHyde: async () => "hyde text",
-      readSource: async () => "function a() {}",
-    })
-
-    expect(output.results).toEqual([])
-    expect(output.diagnostics).toContain("chunk key mismatch: wrong contains c1; chunk skipped")
   })
 
   test("suppresses duplicate parent context for repeated parent ranges", async () => {
@@ -1547,7 +1708,7 @@ describe("retrieve", () => {
       embedding: [0.9, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 2, includeParents: true, maxContextChars: 100 },
       options: { topK: 2, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
@@ -1617,7 +1778,7 @@ describe("retrieve", () => {
       embedding: [0.9, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 2, includeParents: true, maxContextChars: 24 },
       options: { topK: 2, maxContextChars: 24, hyde: { enabled: false, threshold: 0.5 } },
@@ -1668,7 +1829,7 @@ describe("retrieve", () => {
     }
     addLexicalStats(index)
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "throwCriticalParserError", topK: 1, includeParents: true, maxContextChars: 100 },
       options: {
@@ -1685,7 +1846,6 @@ describe("retrieve", () => {
     expect(output.results.map((result) => result.topology.chunk.id)).toContain("exact")
     expect(output.results.find((result) => result.topology.chunk.id === "exact")?.retrieval).toMatchObject({
       mode: "hybrid",
-      hybridMode: "parallel",
       bm25Rank: 1,
     })
     expect(output.results[0].retrieval?.vectorRank).toBeUndefined()
@@ -1727,7 +1887,7 @@ describe("retrieve", () => {
     }
     addLexicalStats(index)
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "allowedNeedleBlocked", topK: 3, includeParents: true, maxContextChars: 100, paths: ["src/"] },
       options: {
@@ -1744,7 +1904,7 @@ describe("retrieve", () => {
     expect(output.results.map((result) => result.filePath)).toEqual(["src/allowed.ts"])
   })
 
-  test("hybrid with missing lexical data degrades to vector-only with diagnostic", async () => {
+  test("store-backed hybrid can use lexical candidates without hydrated lexical stats", async () => {
     const index = createEmptyIndex({
       projectId: "p",
       worktree: "/repo",
@@ -1766,7 +1926,7 @@ describe("retrieve", () => {
       embedding: [1, 0],
     }
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "a", topK: 1, includeParents: true, maxContextChars: 100 },
       options: {
@@ -1780,8 +1940,8 @@ describe("retrieve", () => {
       readSource: async () => "function a() {}",
     })
 
-    expect(output.results[0].retrieval).toEqual({ mode: "vector", vectorRank: 1 })
-    expect(output.diagnostics).toContain(
+    expect(output.results[0].retrieval).toMatchObject({ mode: "hybrid", vectorRank: 1, bm25Rank: 1 })
+    expect(output.diagnostics).not.toContain(
       "hybrid retrieval requested but lexical data is unavailable; using vector-only retrieval",
     )
   })
@@ -1822,7 +1982,7 @@ describe("retrieve", () => {
     }
     addLexicalStats(index)
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "exactDisabledHybrid", topK: 1, includeParents: true, maxContextChars: 100 },
       options: {
@@ -1838,132 +1998,6 @@ describe("retrieve", () => {
 
     expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["vector"])
     expect(output.results[0].retrieval).toEqual({ mode: "vector", vectorRank: 1 })
-  })
-
-  test("bm25-prefilter hybrid ranks deterministically within the lexical pool", async () => {
-    const index = createEmptyIndex({
-      projectId: "p",
-      worktree: "/repo",
-      cacheKey: "key",
-      maxChunkNonWhitespaceChars: 2000,
-    })
-    index.metadata.status = "ready"
-    index.chunks.alpha = {
-      id: "alpha",
-      filePath: "alpha.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 28, lineStart: 1, lineEnd: 1 },
-      text: "function prefilterNeedle() {}",
-      nonWhitespaceChars: 27,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [0, 1],
-    }
-    index.chunks.beta = {
-      id: "beta",
-      filePath: "beta.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 36, lineStart: 1, lineEnd: 1 },
-      text: "function prefilterNeedleBetter() {}",
-      nonWhitespaceChars: 35,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [1, 0],
-    }
-    index.chunks.gamma = {
-      id: "gamma",
-      filePath: "gamma.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 24, lineStart: 1, lineEnd: 1 },
-      text: "function unrelated() {}",
-      nonWhitespaceChars: 23,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [1, 0],
-    }
-    addLexicalStats(index)
-
-    const output = await retrieve({
-      index,
-      input: { query: "prefilterNeedle", topK: 2, includeParents: true, maxContextChars: 100 },
-      options: {
-        topK: 2,
-        maxContextChars: 100,
-        hyde: { enabled: false, threshold: 0.5 },
-        hybrid: hybridOptions({ mode: "bm25-prefilter", vectorWeight: 10, bm25Weight: 1 }),
-      },
-      embed: async () => [1, 0],
-      generateHyde: async () => "hyde text",
-      readSource: async (filePath) => index.chunks[filePath.replace(".ts", "")].text,
-    })
-
-    expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["beta", "alpha"])
-    expect(output.results.map((result) => result.retrieval?.hybridMode)).toEqual(["bm25-prefilter", "bm25-prefilter"])
-  })
-
-  test("vector-prefilter uses deterministic vector tie ordering before restricting BM25", async () => {
-    const index = createEmptyIndex({
-      projectId: "p",
-      worktree: "/repo",
-      cacheKey: "key",
-      maxChunkNonWhitespaceChars: 2000,
-    })
-    index.metadata.status = "ready"
-    index.chunks["a-unrelated"] = {
-      id: "a-unrelated",
-      filePath: "a-unrelated.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 24, lineStart: 1, lineEnd: 1 },
-      text: "function unrelated() {}",
-      nonWhitespaceChars: 23,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [1, 0],
-    }
-    index.chunks["z-exact"] = {
-      id: "z-exact",
-      filePath: "z-exact.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 34, lineStart: 1, lineEnd: 1 },
-      text: "function exactVectorTieNeedle() {}",
-      nonWhitespaceChars: 33,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [1, 0],
-    }
-    addLexicalStats(index)
-
-    const output = await retrieve({
-      index,
-      input: { query: "exactVectorTieNeedle", topK: 1, includeParents: true, maxContextChars: 100 },
-      options: {
-        topK: 1,
-        maxContextChars: 100,
-        hyde: { enabled: false, threshold: 0.5 },
-        hybrid: hybridOptions({ mode: "vector-prefilter", vectorCandidateMultiplier: 1, bm25CandidateMultiplier: 1 }),
-      },
-      embed: async () => [1, 0],
-      generateHyde: async () => "hyde text",
-      readSource: async (filePath) => index.chunks[filePath.replace(".ts", "")].text,
-    })
-
-    expect(output.results[0].topology.chunk.id).toBe("z-exact")
-    expect(output.results[0].retrieval).toMatchObject({
-      mode: "hybrid",
-      hybridMode: "vector-prefilter",
-      vectorRank: 2,
-      bm25Rank: 1,
-    })
   })
 
   test("HyDE-triggered hybrid uses HyDE vector candidates while preserving BM25 fusion", async () => {
@@ -2015,7 +2049,7 @@ describe("retrieve", () => {
     }
     addLexicalStats(index)
 
-    const output = await retrieve({
+    const output = await retrieveFromIndex({
       index,
       input: { query: "rareHybridNeedle", topK: 2, includeParents: true, maxContextChars: 100 },
       options: {
@@ -2033,64 +2067,5 @@ describe("retrieve", () => {
     expect(output.results.map((result) => result.topology.chunk.id)).toContain("hyde")
     expect(output.results.map((result) => result.topology.chunk.id)).toContain("exact")
     expect(output.results.find((result) => result.topology.chunk.id === "exact")?.retrieval?.bm25Rank).toBe(1)
-  })
-
-  test("HyDE-triggered bm25-prefilter uses HyDE vector ranks within the BM25 pool", async () => {
-    const index = createEmptyIndex({
-      projectId: "p",
-      worktree: "/repo",
-      cacheKey: "key",
-      maxChunkNonWhitespaceChars: 2000,
-    })
-    index.metadata.status = "ready"
-    index.chunks.exact = {
-      id: "exact",
-      filePath: "exact.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 36, lineStart: 1, lineEnd: 1 },
-      text: "function sharedHydePrefilterNeedle() {}",
-      nonWhitespaceChars: 35,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [0.8, 0.6],
-    }
-    index.chunks.hyde = {
-      id: "hyde",
-      filePath: "hyde.ts",
-      language: "typescript",
-      kind: "function",
-      range: { byteStart: 0, byteEnd: 41, lineStart: 1, lineEnd: 1 },
-      text: "function sharedHydePrefilterNeedleHyde() {}",
-      nonWhitespaceChars: 40,
-      nodeTypes: [],
-      symbolIds: [],
-      childChunkIds: [],
-      embedding: [0.1, Math.sqrt(0.99)],
-    }
-    addLexicalStats(index)
-
-    const output = await retrieve({
-      index,
-      input: { query: "sharedHydePrefilterNeedle", topK: 1, includeParents: true, maxContextChars: 100 },
-      options: {
-        topK: 1,
-        maxContextChars: 100,
-        hyde: { enabled: true, threshold: 0.95 },
-        hybrid: hybridOptions({ mode: "bm25-prefilter", vectorWeight: 10, bm25Weight: 1 }),
-      },
-      embed: async (text) => (text === "hyde text" ? [0, 1] : [1, 0]),
-      generateHyde: async () => "hyde text",
-      readSource: async (filePath) => index.chunks[filePath.replace(".ts", "")].text,
-    })
-
-    expect(output.status.hydeUsed).toBe(true)
-    expect(output.results[0].topology.chunk.id).toBe("hyde")
-    expect(output.results[0].retrieval).toMatchObject({
-      mode: "hybrid",
-      hybridMode: "bm25-prefilter",
-      vectorRank: 1,
-    })
   })
 })

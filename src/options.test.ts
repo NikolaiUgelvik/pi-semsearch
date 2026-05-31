@@ -46,7 +46,6 @@ describe("parseOptions", () => {
     )
     expect(options.retrieval.hybrid).toEqual({
       enabled: true,
-      mode: "parallel",
       rrfK: 60,
       vectorCandidateMultiplier: 8,
       bm25CandidateMultiplier: 8,
@@ -82,7 +81,6 @@ describe("parseOptions", () => {
         retrieval: {
           hybrid: {
             enabled: false,
-            mode: "bm25-prefilter",
             rrfK: 40,
             vectorCandidateMultiplier: 5,
             bm25CandidateMultiplier: 9,
@@ -96,7 +94,6 @@ describe("parseOptions", () => {
 
     expect(options.retrieval.hybrid).toEqual({
       enabled: false,
-      mode: "bm25-prefilter",
       rrfK: 40,
       vectorCandidateMultiplier: 5,
       bm25CandidateMultiplier: 9,
@@ -196,7 +193,6 @@ describe("parseOptions", () => {
         },
         retrieval: {
           hybrid: {
-            mode: "bad",
             rrfK: 0,
           },
         },
@@ -204,7 +200,6 @@ describe("parseOptions", () => {
       {},
     )
 
-    expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("retrieval.hybrid.mode:"))).toBe(true)
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("retrieval.hybrid.rrfK:"))).toBe(true)
   })
 
