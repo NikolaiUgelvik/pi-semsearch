@@ -38,12 +38,22 @@ describe("parseOptions", () => {
     expect(options.maxFileBytes).toBe(2 * 1024 * 1024)
     expect(options.topK).toBe(5)
     expect(options.includeGlobs).toEqual(["**/*"])
-    expect(options.excludeGlobs).toEqual(
-      expect.arrayContaining([
-        "**/*.{png,jpg,jpeg,gif,webp,ico,pdf,zip,gz,tgz,tar,7z,mp4,mov,mp3,woff,woff2,ttf,eot}",
-        "**/bun.lock",
-      ]),
-    )
+    for (const excludeGlob of [
+      "**/*.{png,jpg,jpeg,gif,webp,ico,pdf,zip,gz,tgz,tar,7z,mp4,mov,mp3,woff,woff2,ttf,eot}",
+      "**/bun.lock",
+      "**/__pycache__/**",
+      "**/*.{pyc,pyo,pyd}",
+      "**/.venv/**",
+      "**/coverage/**",
+      "**/.next/**",
+      "**/target/**",
+      "**/.gradle/**",
+      "**/*.{class,jar,war,ear}",
+      "**/.bundle/**",
+      "**/vendor/**",
+    ]) {
+      expect(options.excludeGlobs).toContain(excludeGlob)
+    }
     expect(options.retrieval.hybrid).toEqual({
       enabled: true,
       rrfK: 60,

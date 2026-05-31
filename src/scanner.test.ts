@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { chmod, mkdir, mkdtemp, rm, symlink, utimes } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { parseOptions } from "./options.js"
 import { createIndexer as createScannerIndexer } from "./scanner.js"
 import { createEmptyIndex, createIndexStore } from "./store.js"
 import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, SymbolRecord } from "./types.js"
@@ -1186,6 +1187,44 @@ describe("createIndexer", () => {
       expect(Object.keys(index.files)).toEqual(["kept.ts"])
     } finally {
       await chmod(excludedDir, 0o700).catch(() => undefined)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("skips default language artifact directories without traversing them", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const pycacheDir = path.join(dir, "__pycache__")
+    try {
+      await Bun.write(path.join(dir, "kept.py"), "def kept():\n    return True\n")
+      await mkdir(pycacheDir)
+      await Bun.write(path.join(pycacheDir, "kept.cpython-312.pyc"), new Uint8Array([1, 2, 3]))
+      await chmod(pycacheDir, 0)
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
+      const options = parseOptions({})
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: options.maxChunkNonWhitespaceChars,
+          includeGlobs: options.includeGlobs,
+          excludeGlobs: options.excludeGlobs,
+          topK: options.topK,
+          maxContextChars: options.maxContextChars,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => ({ language: "python", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+
+      expect(Object.keys(index.files)).toEqual(["kept.py"])
+    } finally {
+      await chmod(pycacheDir, 0o700).catch(() => undefined)
       await rm(dir, { recursive: true, force: true })
     }
   })
