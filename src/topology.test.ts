@@ -17,6 +17,17 @@ const base = {
   nonWhitespaceChars: 1,
 } satisfies Partial<ChunkRecord>
 
+function chunk(id: string, filePath: string, byteStart: number, byteEnd: number): ChunkRecord {
+  return {
+    ...base,
+    id,
+    filePath,
+    kind: "block",
+    range: { byteStart, byteEnd, lineStart: 1, lineEnd: 1 },
+    text: id,
+  } as ChunkRecord
+}
+
 describe("topology", () => {
   test("links children to parent symbols and siblings", () => {
     const parent: SymbolRecord = {
@@ -148,6 +159,32 @@ describe("topology", () => {
 
     expect(chunks[0].nextSiblingChunkId).toBeUndefined()
     expect(chunks[1].previousSiblingChunkId).toBeUndefined()
+  })
+
+  test("links immediate topology for nested chunks across multiple files", () => {
+    const chunks = attachTopology(
+      [
+        chunk("a:file", "src/a.ts", 0, 100),
+        chunk("a:class", "src/a.ts", 10, 90),
+        chunk("a:method", "src/a.ts", 20, 70),
+        chunk("a:block:1", "src/a.ts", 30, 40),
+        chunk("a:block:2", "src/a.ts", 50, 60),
+        chunk("b:file", "src/b.ts", 0, 100),
+        chunk("b:block", "src/b.ts", 10, 20),
+      ],
+      {},
+    )
+    const byId = Object.fromEntries(chunks.map((item) => [item.id, item]))
+
+    expect(byId["a:file"].childChunkIds).toEqual(["a:class"])
+    expect(byId["a:class"].parentChunkId).toBe("a:file")
+    expect(byId["a:class"].childChunkIds).toEqual(["a:method"])
+    expect(byId["a:method"].parentChunkId).toBe("a:class")
+    expect(byId["a:method"].childChunkIds).toEqual(["a:block:1", "a:block:2"])
+    expect(byId["a:block:1"].nextSiblingChunkId).toBe("a:block:2")
+    expect(byId["a:block:2"].previousSiblingChunkId).toBe("a:block:1")
+    expect(byId["b:file"].childChunkIds).toEqual(["b:block"])
+    expect(byId["b:block"].parentChunkId).toBe("b:file")
   })
 
   test("links symbol-less siblings only within the same direct parent", () => {

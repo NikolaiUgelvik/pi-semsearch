@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { load as loadSqliteVec } from "sqlite-vec"
+import { tokenizeCodeText } from "./lexical.js"
 import { matchesPaths } from "./path-filter.js"
 import type {
   CastIndex,
@@ -23,6 +24,7 @@ const SQLITE_VECTOR_PATH_FILTER_INITIAL_K = 100
 const SQLITE_VECTOR_PATH_FILTER_MAX_K = 10_000
 const SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER = 10
 const SQLITE_LEXICAL_PATH_FILTER_MAX_K = 1000
+const SQLITE_LEXICAL_FALLBACK_QUERY_TERMS = 16
 const INDEX_STATUSES: readonly unknown[] = ["empty", "indexing", "ready", "stale", "error"]
 const CHUNK_KINDS: readonly unknown[] = ["file", "class", "function", "method", "block", "fallback"]
 const SYMBOL_KINDS: readonly unknown[] = ["module", "class", "function", "method", "interface"]
@@ -962,29 +964,86 @@ function searchSqliteLexicalCandidates(
 
   const pathFilter = sqlPrefixPathFilter(paths)
   const queryLimit = lexicalCandidateLimit(target, paths)
-  let rows: Array<{ id: string; filePath: string; rank: number }>
   try {
-    rows = db
-      .query(
-        `select chunk_fts.id as id, chunks.file_path as filePath, chunk_fts.rank as rank
-         from chunk_fts
-         inner join chunks on chunks.run_id = chunk_fts.run_id and chunks.id = chunk_fts.id
-         where chunk_fts match ? and chunk_fts.run_id = ?${pathFilter.sql}
-         order by rank
-         limit ?`,
-      )
-      .all(query, activeRunId, ...pathFilter.args, queryLimit) as Array<{ id: string; filePath: string; rank: number }>
+    return lexicalRowsToCandidates(
+      querySqliteLexicalRows({ db, query, activeRunId, pathFilter, queryLimit }),
+      target,
+      paths,
+    )
+  } catch (error) {
+    if (isFtsQuerySyntaxError(error)) {
+      return searchTokenizedSqliteLexicalCandidates({ db, query, activeRunId, pathFilter, queryLimit, target, paths })
+    }
+    throw error
+  }
+}
+
+function querySqliteLexicalRows(input: {
+  db: Database
+  query: string
+  activeRunId: string
+  pathFilter: ReturnType<typeof sqlPrefixPathFilter>
+  queryLimit: number
+}) {
+  return input.db
+    .query(
+      `select chunk_fts.id as id, chunks.file_path as filePath, chunk_fts.rank as rank
+       from chunk_fts
+       inner join chunks on chunks.run_id = chunk_fts.run_id and chunks.id = chunk_fts.id
+       where chunk_fts match ? and chunk_fts.run_id = ?${input.pathFilter.sql}
+       order by rank
+       limit ?`,
+    )
+    .all(input.query, input.activeRunId, ...input.pathFilter.args, input.queryLimit) as Array<{
+    id: string
+    filePath: string
+    rank: number
+  }>
+}
+
+function searchTokenizedSqliteLexicalCandidates(input: {
+  db: Database
+  query: string
+  activeRunId: string
+  pathFilter: ReturnType<typeof sqlPrefixPathFilter>
+  queryLimit: number
+  target: number
+  paths?: string[]
+}) {
+  const fallbackQuery = tokenizedFtsQuery(input.query)
+  if (!fallbackQuery) {
+    return []
+  }
+  try {
+    return lexicalRowsToCandidates(
+      querySqliteLexicalRows({ ...input, query: fallbackQuery }),
+      input.target,
+      input.paths,
+    )
   } catch (error) {
     if (isFtsQuerySyntaxError(error)) {
       return []
     }
     throw error
   }
+}
 
+function lexicalRowsToCandidates(
+  rows: Array<{ id: string; filePath: string; rank: number }>,
+  target: number,
+  paths?: string[],
+) {
   return rows
     .filter((row) => matchesPaths(row.filePath, paths))
     .map((row) => ({ id: row.id, score: row.rank * -1, bm25Score: row.rank * -1 }))
     .slice(0, target)
+}
+
+function tokenizedFtsQuery(query: string) {
+  const terms = [...new Set(tokenizeCodeText(query))]
+    .filter((term) => term.length > 0)
+    .slice(0, SQLITE_LEXICAL_FALLBACK_QUERY_TERMS)
+  return terms.length === 0 ? undefined : terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR ")
 }
 
 function isFtsQuerySyntaxError(error: unknown) {

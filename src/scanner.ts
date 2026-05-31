@@ -32,6 +32,7 @@ type RefreshState = {
   nextChunks: CastIndex["chunks"]
   nextSymbols: CastIndex["symbols"]
   metadataDiagnostics: string[]
+  reusedFileResults: FileResult[]
   canReuseExistingRecords: boolean
   changed: boolean
 }
@@ -58,6 +59,7 @@ const BYTE_CARRIAGE_RETURN = 13
 const CONTROL_BYTE_LIMIT = 32
 const BINARY_CONTROL_RATIO = 0.3
 const DEFAULT_EMBEDDING_BATCH_SIZE = 16
+const DEFAULT_EMBEDDING_BATCH_CONCURRENCY = 1
 const DEFAULT_FILE_CONCURRENCY = 4
 const DEFAULT_FILE_RESULT_WRITE_BATCH_SIZE = 32
 
@@ -82,12 +84,11 @@ export function createIndexer(input: {
     async refresh() {
       const store = input.store
       const index = await store.read()
-      const initialStatus = index.metadata.status
       const canReuseExistingRecords =
         index.metadata.maxChunkNonWhitespaceChars === input.options.maxChunkNonWhitespaceChars &&
         sameChunkingOptions(index.metadata.chunking, input.options.chunking)
-      const runConfigHash = indexRunConfigHash(index, input.options)
-      const runStore = hasRunStore(store) && initialStatus !== "ready" ? store : undefined
+      const runConfigHash = indexRunConfigHash(index, input.worktree, input.options)
+      const runStore = hasRunStore(store) ? store : undefined
       const files = await scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs)
       const nextFiles: CastIndex["files"] = {}
       const nextChunks: CastIndex["chunks"] = {}
@@ -96,6 +97,15 @@ export function createIndexer(input: {
       const embeddingBatcher = createEmbeddingBatcher(input)
       const fileResultWriter = createFileResultWriter({ runStore, run: () => run })
       let changed = false
+      const state: RefreshState = {
+        nextFiles,
+        nextChunks,
+        nextSymbols,
+        metadataDiagnostics,
+        reusedFileResults: [],
+        canReuseExistingRecords,
+        changed,
+      }
       let run: { runId: string } | undefined
       let runPromise: Promise<{ runId: string } | undefined> | undefined
 
@@ -124,7 +134,7 @@ export function createIndexer(input: {
         files,
         input,
         index,
-        state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
+        state,
         runStore,
         run: () => run,
         ensureRun,
@@ -133,6 +143,7 @@ export function createIndexer(input: {
       })
 
       await embeddingBatcher.drain()
+      await persistReusedFileResults({ reusedFileResults: state.reusedFileResults, run: () => run, fileResultWriter })
       await fileResultWriter.flush()
       metadataDiagnostics.sort()
       const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols)
@@ -282,13 +293,31 @@ async function processScannedFile(input: {
 
 function reuseFileRecords(index: CastIndex, file: FileRecord, state: RefreshState) {
   state.nextFiles[file.path] = file
+  const chunks: Record<string, ChunkRecord> = {}
   for (const chunkId of file.chunkIds) {
     if (index.chunks[chunkId]) {
       state.nextChunks[chunkId] = index.chunks[chunkId]
+      chunks[chunkId] = index.chunks[chunkId]
     }
   }
+  const symbols: Record<string, SymbolRecord> = {}
   for (const symbol of Object.values(index.symbols).filter((symbol) => symbol.filePath === file.path)) {
     state.nextSymbols[symbol.id] = symbol
+    symbols[symbol.id] = symbol
+  }
+  state.reusedFileResults.push({ file, chunks, symbols })
+}
+
+async function persistReusedFileResults(input: {
+  reusedFileResults: FileResult[]
+  run: () => { runId: string } | undefined
+  fileResultWriter: FileResultWriter
+}) {
+  if (!input.run()) {
+    return
+  }
+  for (const fileResult of input.reusedFileResults) {
+    await input.fileResultWriter.add(fileResult)
   }
 }
 
@@ -441,18 +470,22 @@ function createEmbeddingBatcher(input: CreateIndexerInput): EmbeddingBatcher {
   type PendingEmbedding = { text: string; resolve: (result: EmbeddingResult) => void }
 
   const batchSize = Math.max(1, input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE)
+  const maxOutstanding = DEFAULT_EMBEDDING_BATCH_CONCURRENCY
   const queue: PendingEmbedding[] = []
   const outstanding = new Set<Promise<void>>()
   let scheduled = false
 
   const flush = () => {
     scheduled = false
-    if (queue.length === 0) {
+    if (queue.length === 0 || outstanding.size >= maxOutstanding) {
       return
     }
     const batch = queue.splice(0, batchSize)
     const run = embedPendingBatch(input, batch).finally(() => {
       outstanding.delete(run)
+      if (queue.length > 0) {
+        scheduleFlush()
+      }
     })
     outstanding.add(run)
   }
@@ -568,9 +601,14 @@ function hasBatchRunStore(store: IndexRunStore): store is IndexRunStore & Requir
   return Boolean(store.writeFileResults)
 }
 
-function indexRunConfigHash(index: CastIndex, options: Parameters<typeof createIndexer>[0]["options"]) {
+function indexRunConfigHash(
+  index: CastIndex,
+  worktree: string,
+  options: Parameters<typeof createIndexer>[0]["options"],
+) {
   return stableHash({
     schemaVersion: index.metadata.schemaVersion,
+    worktree,
     embeddingModel: index.metadata.embeddingModel,
     embeddingDimensions: index.metadata.embeddingDimensions,
     includeGlobs: options.includeGlobs,
@@ -746,8 +784,8 @@ async function scanFiles(root: string, includeGlobs: string[], excludeGlobs: str
   const files = await walk(root)
   return files.filter(
     (file) =>
-      includeGlobs.some((pattern) => minimatch(file, pattern)) &&
-      !excludeGlobs.some((pattern) => minimatch(file, pattern)),
+      includeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })) &&
+      !excludeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })),
   )
 }
 

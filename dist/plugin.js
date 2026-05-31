@@ -437,7 +437,7 @@ function unavailableToolResult(title, message) {
     return {
         title,
         output: `index unavailable${message ? `: ${message}` : ""}`,
-        metadata: { configured: false },
+        metadata: { configured: true, available: false },
     };
 }
 function searchToolResult(query, output, limits) {

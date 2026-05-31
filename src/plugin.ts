@@ -544,7 +544,7 @@ function unavailableToolResult(title: string, message: string | undefined) {
   return {
     title,
     output: `index unavailable${message ? `: ${message}` : ""}`,
-    metadata: { configured: false },
+    metadata: { configured: true, available: false },
   }
 }
 

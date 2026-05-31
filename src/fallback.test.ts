@@ -13,7 +13,7 @@ describe("fallbackChunks", () => {
 
     expect(chunk.text).toBe("const a = 1\n")
     expect(chunk.kind).toBe("fallback")
-    expect(chunk.range).toEqual({ byteStart: 0, byteEnd: 12, lineStart: 1, lineEnd: 2 })
+    expect(chunk.range).toEqual({ byteStart: 0, byteEnd: 12, lineStart: 1, lineEnd: 1 })
     expect(chunk.nonWhitespaceChars).toBe(8)
   })
 
@@ -27,7 +27,7 @@ describe("fallbackChunks", () => {
 
     expect(chunks.map((chunk) => chunk.text)).toEqual(["aaaa\nbbbb\n", "cccc\n"])
     expect(chunks.map((chunk) => chunk.range.lineStart)).toEqual([1, 3])
-    expect(chunks.map((chunk) => chunk.range.lineEnd)).toEqual([3, 4])
+    expect(chunks.map((chunk) => chunk.range.lineEnd)).toEqual([2, 3])
     expect(chunks[0].nextSiblingChunkId).toBe(chunks[1].id)
     expect(chunks[1].previousSiblingChunkId).toBe(chunks[0].id)
   })
@@ -40,7 +40,7 @@ describe("fallbackChunks", () => {
       byteStart: 0,
       byteEnd: new TextEncoder().encode(text).length,
       lineStart: 1,
-      lineEnd: 2,
+      lineEnd: 1,
     })
     expect(chunk.id).toBe(`src/a.ts:0:${new TextEncoder().encode(text).length}`)
   })
@@ -77,6 +77,7 @@ describe("fallbackChunks", () => {
 
   test("calculates ranges and non-whitespace sizes", () => {
     expect(nonWhitespaceLength("a b\n\tc")).toBe(3)
-    expect(rangeForSlice("one\ntwo\nthree\n", 4, 8)).toEqual({ byteStart: 4, byteEnd: 8, lineStart: 2, lineEnd: 3 })
+    expect(rangeForSlice("one\ntwo\nthree\n", 4, 8)).toEqual({ byteStart: 4, byteEnd: 8, lineStart: 2, lineEnd: 2 })
+    expect(rangeForSlice("a\nb\n", 0, 4)).toEqual({ byteStart: 0, byteEnd: 4, lineStart: 1, lineEnd: 2 })
   })
 })

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { load as loadSqliteVec } from "sqlite-vec";
+import { tokenizeCodeText } from "./lexical.js";
 import { matchesPaths } from "./path-filter.js";
 const INDEX_SCHEMA_VERSION = 1;
 const SQLITE_SCHEMA_VERSION = 4;
@@ -12,6 +13,7 @@ const SQLITE_VECTOR_PATH_FILTER_INITIAL_K = 100;
 const SQLITE_VECTOR_PATH_FILTER_MAX_K = 10_000;
 const SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER = 10;
 const SQLITE_LEXICAL_PATH_FILTER_MAX_K = 1000;
+const SQLITE_LEXICAL_FALLBACK_QUERY_TERMS = 16;
 const INDEX_STATUSES = ["empty", "indexing", "ready", "stale", "error"];
 const CHUNK_KINDS = ["file", "class", "function", "method", "block", "fallback"];
 const SYMBOL_KINDS = ["module", "class", "function", "method", "interface"];
@@ -765,16 +767,33 @@ function searchSqliteLexicalCandidates(db, query, topK, paths) {
     }
     const pathFilter = sqlPrefixPathFilter(paths);
     const queryLimit = lexicalCandidateLimit(target, paths);
-    let rows;
     try {
-        rows = db
-            .query(`select chunk_fts.id as id, chunks.file_path as filePath, chunk_fts.rank as rank
-         from chunk_fts
-         inner join chunks on chunks.run_id = chunk_fts.run_id and chunks.id = chunk_fts.id
-         where chunk_fts match ? and chunk_fts.run_id = ?${pathFilter.sql}
-         order by rank
-         limit ?`)
-            .all(query, activeRunId, ...pathFilter.args, queryLimit);
+        return lexicalRowsToCandidates(querySqliteLexicalRows({ db, query, activeRunId, pathFilter, queryLimit }), target, paths);
+    }
+    catch (error) {
+        if (isFtsQuerySyntaxError(error)) {
+            return searchTokenizedSqliteLexicalCandidates({ db, query, activeRunId, pathFilter, queryLimit, target, paths });
+        }
+        throw error;
+    }
+}
+function querySqliteLexicalRows(input) {
+    return input.db
+        .query(`select chunk_fts.id as id, chunks.file_path as filePath, chunk_fts.rank as rank
+       from chunk_fts
+       inner join chunks on chunks.run_id = chunk_fts.run_id and chunks.id = chunk_fts.id
+       where chunk_fts match ? and chunk_fts.run_id = ?${input.pathFilter.sql}
+       order by rank
+       limit ?`)
+        .all(input.query, input.activeRunId, ...input.pathFilter.args, input.queryLimit);
+}
+function searchTokenizedSqliteLexicalCandidates(input) {
+    const fallbackQuery = tokenizedFtsQuery(input.query);
+    if (!fallbackQuery) {
+        return [];
+    }
+    try {
+        return lexicalRowsToCandidates(querySqliteLexicalRows({ ...input, query: fallbackQuery }), input.target, input.paths);
     }
     catch (error) {
         if (isFtsQuerySyntaxError(error)) {
@@ -782,10 +801,18 @@ function searchSqliteLexicalCandidates(db, query, topK, paths) {
         }
         throw error;
     }
+}
+function lexicalRowsToCandidates(rows, target, paths) {
     return rows
         .filter((row) => matchesPaths(row.filePath, paths))
         .map((row) => ({ id: row.id, score: row.rank * -1, bm25Score: row.rank * -1 }))
         .slice(0, target);
+}
+function tokenizedFtsQuery(query) {
+    const terms = [...new Set(tokenizeCodeText(query))]
+        .filter((term) => term.length > 0)
+        .slice(0, SQLITE_LEXICAL_FALLBACK_QUERY_TERMS);
+    return terms.length === 0 ? undefined : terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR ");
 }
 function isFtsQuerySyntaxError(error) {
     if (!(error instanceof Error)) {

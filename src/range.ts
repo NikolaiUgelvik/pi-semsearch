@@ -15,7 +15,7 @@ export function rangeForSlice(source: string, byteStart: number, byteEnd: number
     byteStart,
     byteEnd,
     lineStart: before.split("\n").length,
-    lineEnd: before.split("\n").length + slice.split("\n").length - 1,
+    lineEnd: before.split("\n").length + lineSpan(slice) - 1,
   }
 }
 
@@ -40,4 +40,9 @@ function stringOffsetForByteOffset(source: string, byteOffset: number) {
   }
 
   return offset
+}
+
+function lineSpan(slice: string) {
+  const measured = slice.endsWith("\n") ? slice.slice(0, -1) : slice
+  return measured.split("\n").length
 }

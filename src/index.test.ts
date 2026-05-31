@@ -370,9 +370,9 @@ describe("cast plugin", () => {
       throw new Error("expected object tool results")
     }
     expect(searchResult.output).toContain("sqlite-vec failed to load")
-    expect(searchResult.metadata).toEqual({ configured: false })
+    expect(searchResult.metadata).toEqual({ configured: true, available: false })
     expect(chunkResult.output).toContain("sqlite-vec failed to load")
-    expect(chunkResult.metadata).toEqual({ configured: false })
+    expect(chunkResult.metadata).toEqual({ configured: true, available: false })
   })
 
   test("lazy store read failure returns unavailable diagnostics from both tools", async () => {
@@ -410,7 +410,9 @@ describe("cast plugin", () => {
       throw new Error("expected object tool results")
     }
     expect(searchResult.output).toContain("sqlite-vec failed to load lazily")
+    expect(searchResult.metadata).toEqual({ configured: true, available: false })
     expect(chunkResult.output).toContain("sqlite-vec failed to load lazily")
+    expect(chunkResult.metadata).toEqual({ configured: true, available: false })
   })
 
   test("lazy failed to open database read failure returns unavailable diagnostics from both tools", async () => {
@@ -448,7 +450,9 @@ describe("cast plugin", () => {
       throw new Error("expected object tool results")
     }
     expect(searchResult.output).toContain("failed to open database")
+    expect(searchResult.metadata).toEqual({ configured: true, available: false })
     expect(chunkResult.output).toContain("failed to open database")
+    expect(chunkResult.metadata).toEqual({ configured: true, available: false })
   })
 
   test("unrelated lazy read failures throw every time without poisoning store availability", async () => {
@@ -539,7 +543,7 @@ describe("cast plugin", () => {
       throw new Error("expected object tool result")
     }
     expect(result.output).toContain("sqlite-vec failed to load for candidates")
-    expect(result.metadata).toEqual({ configured: false })
+    expect(result.metadata).toEqual({ configured: true, available: false })
   })
 
   test("HyDE retry store candidate failure returns unavailable diagnostics from search", async () => {
@@ -597,7 +601,7 @@ describe("cast plugin", () => {
     expect(result.output).toContain("index unavailable")
     expect(result.output).toContain("sqlite-vec failed to load during HyDE candidates")
     expect(result.output).not.toContain("HyDE failed")
-    expect(result.metadata).toEqual({ configured: false })
+    expect(result.metadata).toEqual({ configured: true, available: false })
     expect(candidateSearches).toBe(2)
   })
 
@@ -631,7 +635,7 @@ describe("cast plugin", () => {
       throw new Error("expected object tool result")
     }
     expect(result.output).toContain("sqlite-vec failed to load during write")
-    expect(result.metadata).toEqual({ configured: false })
+    expect(result.metadata).toEqual({ configured: true, available: false })
     expect(refreshes).toBe(1)
   })
 

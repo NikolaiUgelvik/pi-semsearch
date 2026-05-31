@@ -1406,7 +1406,7 @@ describe("index store", () => {
     }
   })
 
-  test("returns empty lexical candidates for malformed FTS5 queries", async () => {
+  test("falls back to tokenized lexical search for malformed FTS5 queries", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
     try {
       const store = createIndexStore({
@@ -1426,12 +1426,15 @@ describe("index store", () => {
       await store.write(index)
 
       const results = await Promise.all(
-        ["foo:", "foo -bar", "class Foo {", '"unterminated', "*"].map((query) =>
-          store.searchLexicalCandidates?.(query, 3),
-        ),
+        ["foo:", "foo -bar", "class Foo {", '"foo'].map((query) => store.searchLexicalCandidates?.(query, 3)),
       )
 
-      expect(results).toEqual([[], [], [], [], []])
+      expect(results.map((result) => result?.map((candidate) => candidate.id))).toEqual([
+        ["alpha"],
+        ["alpha"],
+        ["alpha"],
+        ["alpha"],
+      ])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

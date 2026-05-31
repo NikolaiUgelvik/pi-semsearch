@@ -11,7 +11,7 @@ export function rangeForSlice(source, byteStart, byteEnd) {
         byteStart,
         byteEnd,
         lineStart: before.split("\n").length,
-        lineEnd: before.split("\n").length + slice.split("\n").length - 1,
+        lineEnd: before.split("\n").length + lineSpan(slice) - 1,
     };
 }
 export function stableChunkId(filePath, byteStart, byteEnd) {
@@ -31,4 +31,8 @@ function stringOffsetForByteOffset(source, byteOffset) {
         offset += character.length;
     }
     return offset;
+}
+function lineSpan(slice) {
+    const measured = slice.endsWith("\n") ? slice.slice(0, -1) : slice;
+    return measured.split("\n").length;
 }
