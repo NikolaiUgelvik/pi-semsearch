@@ -15,7 +15,7 @@ Add the plugin to your opencode config:
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "opencode-plugin-cast",
+      "opencode-plugin-cast@git+https://github.com/NikolaiUgelvik/opencode-plugin-cast.git",
       {
         "embedding": {
           "baseURL": "https://api.openai.com/v1",
@@ -58,7 +58,7 @@ OpenRouter can be used as the HyDE chat provider while embeddings come from a ve
 {
   "plugin": [
     [
-      "opencode-plugin-cast",
+      "opencode-plugin-cast@git+https://github.com/NikolaiUgelvik/opencode-plugin-cast.git",
       {
         "embedding": {
           "baseURL": "https://api.openai.com/v1",
@@ -85,7 +85,7 @@ OpenRouter's rerank endpoint can be used to reorder the candidates found by vect
 {
   "plugin": [
     [
-      "opencode-plugin-cast",
+      "opencode-plugin-cast@git+https://github.com/NikolaiUgelvik/opencode-plugin-cast.git",
       {
         "embedding": {
           "baseURL": "https://api.openai.com/v1",
