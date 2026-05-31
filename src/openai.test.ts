@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
 import { createOpenAIClient } from "./openai.js"
 
 describe("createOpenAIClient", () => {
@@ -75,7 +76,7 @@ describe("createOpenAIClient", () => {
       messages: [
         {
           role: "system",
-          content: "Produce a concise hypothetical code search target for the user's repository question.",
+          content: HYDE_SYSTEM_PROMPT,
         },
         { role: "user", content: "where is prompt handled?" },
       ],

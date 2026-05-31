@@ -3,6 +3,7 @@ import { realpath } from "node:fs/promises"
 import path from "node:path"
 import { type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
 import { getChunkById } from "./chunk-lookup.js"
+import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
 import { parseSource } from "./language.js"
 import { createOpenAIClient, type FetchLike } from "./openai.js"
 import { parseOptions } from "./options.js"
@@ -577,8 +578,7 @@ async function hydePromptText(
     body: {
       model: input.model,
       tools: {},
-      system:
-        "Write a concise hypothetical code or documentation excerpt that would satisfy the search query. Return only useful search text.",
+      system: HYDE_SYSTEM_PROMPT,
       parts: [{ type: "text", text: input.query }],
     },
   })

@@ -1,3 +1,5 @@
+import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
+
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>
 
 const TRAILING_SLASHES_PATTERN = /\/+$/
@@ -53,7 +55,7 @@ async function generateHyde(
         messages: [
           {
             role: "system",
-            content: "Produce a concise hypothetical code search target for the user's repository question.",
+            content: HYDE_SYSTEM_PROMPT,
           },
           { role: "user", content: input.query },
         ],

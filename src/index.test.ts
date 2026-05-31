@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
 import castPlugin from "./index.js"
 import { createCastPluginForTest } from "./plugin.js"
 import { createEmptyIndex } from "./store.js"
@@ -1270,7 +1271,7 @@ describe("cast plugin", () => {
           body: {
             model: { providerID: "local", modelID: "qwen3.6-27b-mtp" },
             tools: {},
-            system: expect.stringContaining("hypothetical"),
+            system: HYDE_SYSTEM_PROMPT,
             parts: [{ type: "text", text: "session" }],
           },
         },
