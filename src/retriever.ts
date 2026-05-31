@@ -170,7 +170,7 @@ export async function retrieve(input: {
         const outputText = source.ok && indexedChunkMatchesSource(source.text, chunk) ? chunk.text : ""
         const context = parentContext({
           chunk,
-          includeParents: input.input.includeParents,
+          includeParents: input.input.includeParents === true,
           maxContextChars,
           source,
           symbols: input.index.symbols,
@@ -375,7 +375,7 @@ function parentContext(input: {
   symbols: CastIndex["symbols"]
 }) {
   if (input.includeParents === false) {
-    return { breadcrumbs: [] }
+    return { breadcrumbs: breadcrumbsFor(input.chunk, input.symbols), parentText: undefined, parentRange: undefined }
   }
   if (input.source.ok && indexedChunkMatchesSource(input.source.text, input.chunk)) {
     return expandWithParentContext({

@@ -113,7 +113,7 @@ OpenRouter's rerank endpoint can be used to reorder the candidates found by vect
 - `query`: natural-language repository search query.
 - `topK`: optional number of final results. Defaults to `5`.
 - `maxContextChars`: optional context budget. Defaults to `12000`.
-- `includeParents`: optional parent context toggle. Defaults to `true`.
+- `includeParents`: optional expanded parent body text toggle. Defaults to `false`; set to `true` to opt in.
 - `refresh`: optional forced index refresh before searching.
 - `paths`: optional path filters. Entries can be exact file paths, directory prefixes, or glob patterns.
 
@@ -154,15 +154,19 @@ Each search result includes labeled topology entries that keep chunk IDs actiona
 }
 ```
 
+Search output is compact JSON by default: ranked matches include matched chunk text, scores, breadcrumbs, retrieval details, and topology IDs/labels. Use `semantic_get_chunk` with topology IDs when you need expanded parent, sibling, or child context.
+
 `semantic_get_chunk` inputs:
 
 - `id`: chunk ID returned from `semantic_search_code` topology.
 - `includeParents`: optional parent context toggle. Defaults to `true`.
 - `includeSiblings`: optional sibling context toggle. Defaults to `true`.
 - `includeChildren`: optional child context toggle. Defaults to `true`.
+- `childrenOffset`: optional child list offset for paging. Defaults to `0`.
+- `childrenLimit`: optional child list page size. Defaults to `20`.
 - `maxContextChars`: optional limit for parent and related chunk text. When omitted, lookup returns full stored related chunk text and full fitting parent context.
 
-`semantic_search_code` returns a JSON payload with ranked results, diagnostics, and retrieval status metadata. `semantic_get_chunk` returns the requested chunk, labeled topology, related chunks, diagnostics, and status metadata. When embedding config is missing or invalid, opencode still starts and the tools return a clear configuration error.
+`semantic_search_code` returns compact JSON search output with ranked results, diagnostics, and retrieval status metadata. `semantic_get_chunk` returns the requested chunk, labeled topology, related chunks, `related.childrenPage` paging metadata, diagnostics, and status metadata. When embedding config is missing or invalid, opencode still starts and the tools return a clear configuration error. If opencode `tool_output` limits require adaptive compaction, results include a diagnostic explaining that output was compacted.
 
 ## Retrieval
 

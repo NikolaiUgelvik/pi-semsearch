@@ -153,7 +153,16 @@ export type ChunkLookupInput = {
   includeParents?: boolean
   includeSiblings?: boolean
   includeChildren?: boolean
+  childrenOffset?: number
+  childrenLimit?: number
   maxContextChars?: number
+}
+
+export type ChunkLookupChildrenPage = {
+  offset: number
+  limit: number
+  total: number
+  hasMore: boolean
 }
 
 export type ChunkLookupOutput = {
@@ -173,6 +182,7 @@ export type ChunkLookupOutput = {
       previousSibling?: ChunkLookupRelatedChunk
       nextSibling?: ChunkLookupRelatedChunk
       children: ChunkLookupRelatedChunk[]
+      childrenPage: ChunkLookupChildrenPage
     }
   }
   diagnostics: string[]

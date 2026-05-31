@@ -1,5 +1,12 @@
 import { expandWithParentContext, summarizeChunk, summarizeTopology } from "./topology.js"
-import type { CastIndex, ChunkLookupInput, ChunkLookupOutput, ChunkLookupRelatedChunk, ChunkRecord } from "./types.js"
+import type {
+  CastIndex,
+  ChunkLookupChildrenPage,
+  ChunkLookupInput,
+  ChunkLookupOutput,
+  ChunkLookupRelatedChunk,
+  ChunkRecord,
+} from "./types.js"
 
 async function getChunkById(input: {
   index: CastIndex
@@ -36,6 +43,8 @@ async function getChunkById(input: {
   })
   const related = await relatedChunks({
     chunk,
+    childrenLimit: input.input.childrenLimit,
+    childrenOffset: input.input.childrenOffset,
     chunks: input.index.chunks,
     diagnostics,
     getSource,
@@ -66,6 +75,7 @@ async function getChunkById(input: {
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
+const DEFAULT_CHILDREN_LIMIT = 20
 
 type SourceReadResult = { text: string; ok: true } | { text: ""; ok: false }
 
@@ -99,6 +109,8 @@ function parentContext(input: {
 
 async function relatedChunks(input: {
   chunk: ChunkRecord
+  childrenLimit: number | undefined
+  childrenOffset: number | undefined
   chunks: CastIndex["chunks"]
   diagnostics: string[]
   getSource(filePath: string): Promise<SourceReadResult>
@@ -108,6 +120,12 @@ async function relatedChunks(input: {
   maxContextChars: number | undefined
   symbols: CastIndex["symbols"]
 }): Promise<NonNullable<ChunkLookupOutput["chunk"]>["related"]> {
+  const childrenPage = childPage({
+    childChunkIds: input.chunk.childChunkIds,
+    includeChildren: input.includeChildren,
+    limit: input.childrenLimit,
+    offset: input.childrenOffset,
+  })
   const [parent, previousSibling, nextSibling, children] = await Promise.all([
     input.includeParents === false
       ? undefined
@@ -136,25 +154,43 @@ async function relatedChunks(input: {
           diagnostics: input.diagnostics,
           getSource: input.getSource,
         }),
-    input.includeChildren === false
-      ? []
-      : Promise.all(
-          input.chunk.childChunkIds.map((id) =>
-            relatedChunk({
-              chunk: input.chunks[id],
-              symbols: input.symbols,
-              maxContextChars: input.maxContextChars,
-              diagnostics: input.diagnostics,
-              getSource: input.getSource,
-            }),
-          ),
-        ),
+    Promise.all(
+      childrenPage.childIds.map((id) =>
+        relatedChunk({
+          chunk: input.chunks[id],
+          symbols: input.symbols,
+          maxContextChars: input.maxContextChars,
+          diagnostics: input.diagnostics,
+          getSource: input.getSource,
+        }),
+      ),
+    ),
   ])
   return {
     parent,
     previousSibling,
     nextSibling,
     children: children.flatMap((child) => (child ? [child] : [])),
+    childrenPage: childrenPage.page,
+  }
+}
+
+function childPage(input: {
+  childChunkIds: string[]
+  includeChildren: boolean | undefined
+  limit: number | undefined
+  offset: number | undefined
+}): { childIds: string[]; page: ChunkLookupChildrenPage } {
+  const total = input.childChunkIds.length
+  if (input.includeChildren === false) {
+    return { childIds: [], page: { offset: 0, limit: 0, total, hasMore: false } }
+  }
+
+  const offset = Math.max(input.offset ?? 0, 0)
+  const limit = Math.max(input.limit ?? DEFAULT_CHILDREN_LIMIT, 0)
+  return {
+    childIds: input.childChunkIds.slice(offset, offset + limit),
+    page: { offset, limit, total, hasMore: offset + limit < total },
   }
 }
 

@@ -826,6 +826,95 @@ describe("retrieve", () => {
     expect(output.diagnostics).toContain("a.ts: embedding failed: boom")
   })
 
+  function searchParentContextFixture() {
+    const index = createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+    })
+    const source = "class Parser {\n  parse() {}\n}\n"
+    const parentText = source.trimEnd()
+    const childText = "parse() {}"
+    const parentRange = { byteStart: 0, byteEnd: parentText.length, lineStart: 1, lineEnd: 3 }
+    index.metadata.status = "ready"
+    index.symbols.sParent = {
+      id: "sParent",
+      name: "Parser",
+      kind: "class",
+      filePath: "src/parser.ts",
+      range: parentRange,
+      childSymbolIds: [],
+    }
+    index.chunks.parent = {
+      id: "parent",
+      filePath: "src/parser.ts",
+      language: "typescript",
+      kind: "class",
+      range: parentRange,
+      text: parentText,
+      nonWhitespaceChars: 22,
+      nodeTypes: [],
+      symbolIds: ["sParent"],
+      childChunkIds: ["child"],
+    }
+    index.chunks.child = {
+      id: "child",
+      filePath: "src/parser.ts",
+      language: "typescript",
+      kind: "method",
+      range: { byteStart: 17, byteEnd: 27, lineStart: 2, lineEnd: 2 },
+      text: childText,
+      nonWhitespaceChars: 9,
+      nodeTypes: [],
+      symbolIds: ["sParent"],
+      parentChunkId: "parent",
+      childChunkIds: [],
+      embedding: [1, 0],
+    }
+
+    return { childText, index, parentRange, parentText, source }
+  }
+
+  test("omits parent context from search results by default", async () => {
+    const { childText, index, source } = searchParentContextFixture()
+
+    const output = await retrieve({
+      index,
+      input: { query: "parse", topK: 1, maxContextChars: 100 },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => source,
+    })
+
+    expect(output.results[0].text).toBe(childText)
+    expect(output.results[0].breadcrumbs).toEqual(["class Parser"])
+    expect(output.results[0].parentText).toBeUndefined()
+    expect(output.results[0].parentRange).toBeUndefined()
+    expect(output.results[0].topology.parent).toEqual({
+      id: "parent",
+      label: "class Parser",
+      range: "src/parser.ts:1-3",
+    })
+  })
+
+  test("includes parent context from search results when explicitly requested", async () => {
+    const { index, parentRange, parentText, source } = searchParentContextFixture()
+
+    const output = await retrieve({
+      index,
+      input: { query: "parse", topK: 1, includeParents: true, maxContextChars: 100 },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => source,
+    })
+
+    expect(output.results[0].parentText).toBe(parentText)
+    expect(output.results[0].parentRange).toEqual(parentRange)
+  })
+
   test("returns empty result text and omits parent context when source read fails", async () => {
     const index = createEmptyIndex({
       projectId: "p",

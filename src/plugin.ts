@@ -9,6 +9,7 @@ import { parseOptions } from "./options.js"
 import { retrieve } from "./retriever.js"
 import { createIndexer } from "./scanner.js"
 import { createIndexStore } from "./store.js"
+import type { ChunkLookupOutput, SearchOutput } from "./types.js"
 
 interface VectorCandidateStore {
   searchVectorCandidates(
@@ -46,6 +47,36 @@ interface OpenCodeHydeClient {
     }>
   }
 }
+
+interface ToolOutputLimits {
+  maxLines?: number
+  maxBytes?: number
+}
+
+const COMPACTION_DIAGNOSTIC =
+  "output compacted to fit opencode tool_output limits; use semantic_get_chunk for more context"
+const LOOKUP_COMPACTION_DIAGNOSTIC =
+  "output compacted to fit opencode tool_output limits; narrow semantic_get_chunk args, page children, reduce included relations, or increase opencode tool_output limits"
+const LONG_COMPACT_TEXT_LENGTH = 200
+const MEDIUM_COMPACT_TEXT_LENGTH = 80
+const SHORT_COMPACT_TEXT_LENGTH = 20
+const OMITTED_TEXT_LENGTH = 0
+const MANY_COMPACT_CHILDREN = 5
+const SINGLE_COMPACT_CHILD = 1
+const NO_COMPACT_CHILDREN = 0
+const SEARCH_COMPACT_TEXT_LENGTHS = [
+  LONG_COMPACT_TEXT_LENGTH,
+  MEDIUM_COMPACT_TEXT_LENGTH,
+  SHORT_COMPACT_TEXT_LENGTH,
+  OMITTED_TEXT_LENGTH,
+]
+const LOOKUP_COMPACT_TEXT_LENGTHS = [LONG_COMPACT_TEXT_LENGTH, MEDIUM_COMPACT_TEXT_LENGTH, OMITTED_TEXT_LENGTH]
+const LOOKUP_COMPACT_CHILD_LIMITS = [
+  Number.MAX_SAFE_INTEGER,
+  MANY_COMPACT_CHILDREN,
+  SINGLE_COMPACT_CHILD,
+  NO_COMPACT_CHILDREN,
+]
 
 class IndexUnavailableError extends Error {
   constructor(message: string) {
@@ -93,6 +124,7 @@ export function createCastPluginForTest(
     }
     const client = createOpenAIClient(dependencies.fetch ? { fetch: dependencies.fetch } : {})
     const sessionModels = new Map<string, { providerID: string; modelID: string }>()
+    let outputLimits: ToolOutputLimits = {}
     let refresh: Promise<unknown> | undefined
     let refreshTail = Promise.resolve()
 
@@ -291,6 +323,13 @@ export function createCastPluginForTest(
     }
 
     return {
+      config: async (cfg) => {
+        const toolOutput = (cfg as { tool_output?: { max_lines?: unknown; max_bytes?: unknown } }).tool_output
+        outputLimits = {
+          maxLines: typeof toolOutput?.max_lines === "number" ? toolOutput.max_lines : undefined,
+          maxBytes: typeof toolOutput?.max_bytes === "number" ? toolOutput.max_bytes : undefined,
+        }
+      },
       "chat.message": async (event) => {
         if (event.model) {
           sessionModels.set(event.sessionID, event.model)
@@ -302,6 +341,8 @@ export function createCastPluginForTest(
 Find relevant code in the current repository by meaning instead of exact text, symbol, or implementation intent.
 
 Use this as the default first tool for code discovery in this repository, including when the user asks how something works, where behavior, features, APIs, errors, data flow, or relevant code lives, or asks about a known class, function, method, type, test, or feature name. Prefer this before grep/glob/read because it returns ranked, syntax-aware matches with surrounding implementation context and file/line references.
+
+Search results are compact ranked matches by default. Each result includes matched chunk text, scores, breadcrumbs, retrieval details, and topology IDs/labels. Parent body text is returned only when includeParents is true. Use semantic_get_chunk with topology IDs for expanded parent/sibling/child context.
 
 This tool searches syntax-aware code chunks such as functions, classes, methods, and nearby context where parser support is available. Use grep only when you need exhaustive literal matching, occurrence counts, mechanical text replacement preparation, or matches in files that are not meaningfully represented as code chunks. Use read after this tool returns candidates when you need larger surrounding context or exact verification. Use paths to restrict the search area. Use refresh if files may have changed since the index was built.
 `,
@@ -373,7 +414,13 @@ This tool searches syntax-aware code chunks such as functions, classes, methods,
 
             return {
               title: `Semantic code search: ${args.query}`,
-              output: JSON.stringify(output, null, 2),
+              output: serializeToolOutput({
+                output,
+                limits: outputLimits,
+                compact: compactSearchOutput,
+                minimal: minimalSearchOutput,
+                diagnosticsFocused: diagnosticsFocusedSearchOutput,
+              }),
               metadata: {
                 hydeUsed: output.status.hydeUsed,
                 rerankUsed: output.status.rerankUsed,
@@ -388,13 +435,15 @@ This tool searches syntax-aware code chunks such as functions, classes, methods,
           description: `
 Fetch an indexed semantic code chunk by ID returned from semantic_search_code.
 
-Use this after semantic_search_code when you need the exact cached chunk, its parent context, or nearby topology such as parents, siblings, and children.
+Use this after semantic_search_code when you need the exact cached chunk, expanded parent context, or nearby topology such as parents, siblings, and children. Use childrenOffset and childrenLimit to page large child lists; the response includes related.childrenPage metadata so callers can request more children when hasMore is true.
 `,
           args: {
             id: tool.schema.string(),
             includeParents: tool.schema.boolean().optional(),
             includeSiblings: tool.schema.boolean().optional(),
             includeChildren: tool.schema.boolean().optional(),
+            childrenOffset: tool.schema.number().int().optional(),
+            childrenLimit: tool.schema.number().int().optional(),
             maxContextChars: tool.schema.number().int().positive().optional(),
           },
           async execute(args) {
@@ -429,7 +478,13 @@ Use this after semantic_search_code when you need the exact cached chunk, its pa
 
             return {
               title: `Semantic chunk lookup: ${args.id}`,
-              output: JSON.stringify(output, null, 2),
+              output: serializeToolOutput({
+                output,
+                limits: outputLimits,
+                compact: compactChunkLookupOutput,
+                minimal: minimalChunkLookupOutput,
+                diagnosticsFocused: diagnosticsFocusedChunkLookupOutput,
+              }),
               metadata: { found: Boolean(output.chunk) },
             }
           },
@@ -459,6 +514,210 @@ function unavailableToolResult(title: string, message: string | undefined) {
     output: `index unavailable${message ? `: ${message}` : ""}`,
     metadata: { configured: false },
   }
+}
+
+function serializeToolOutput<T>(input: {
+  output: T
+  limits: ToolOutputLimits
+  compact: (output: T, limits: ToolOutputLimits) => unknown
+  minimal: (output: T) => unknown
+  diagnosticsFocused: (output: T) => unknown
+}) {
+  const preferred = serializeJson(input.output)
+  if (serializedFits(preferred, input.limits)) {
+    return preferred
+  }
+
+  const compacted = serializeJson(input.compact(input.output, input.limits))
+  if (serializedFits(compacted, input.limits)) {
+    return compacted
+  }
+
+  const minimalOutput = input.minimal(input.output)
+  const serializedMinimal = serializeJson(minimalOutput)
+  if (serializedFits(serializedMinimal, input.limits)) {
+    return serializedMinimal
+  }
+  const compactMinimal = JSON.stringify(minimalOutput)
+  if (serializedFits(compactMinimal, input.limits)) {
+    return compactMinimal
+  }
+
+  const diagnosticsOutput = input.diagnosticsFocused(input.output)
+  const serializedDiagnostics = serializeJson(diagnosticsOutput)
+  if (serializedFits(serializedDiagnostics, input.limits)) {
+    return serializedDiagnostics
+  }
+  const compactDiagnostics = JSON.stringify(diagnosticsOutput)
+  return serializedFits(compactDiagnostics, input.limits) ? compactDiagnostics : serializedDiagnostics
+}
+
+function serializeJson(value: unknown) {
+  return JSON.stringify(value, null, 2)
+}
+
+function serializedFits(serialized: string, limits: ToolOutputLimits) {
+  return (
+    (limits.maxBytes === undefined || Buffer.byteLength(serialized, "utf8") <= limits.maxBytes) &&
+    (limits.maxLines === undefined || serialized.split("\n").length <= limits.maxLines)
+  )
+}
+
+function compactSearchOutput(output: SearchOutput, limits: ToolOutputLimits): SearchOutput {
+  for (const maxTextLength of SEARCH_COMPACT_TEXT_LENGTHS) {
+    const compacted: SearchOutput = {
+      ...output,
+      results: output.results.map((result) => {
+        const { parentText: _parentText, parentRange: _parentRange, text, ...rest } = result
+        return { ...rest, text: trimText(text, maxTextLength) }
+      }),
+      diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+    }
+    if (serializedFits(serializeJson(compacted), limits)) {
+      return compacted
+    }
+  }
+  return {
+    ...output,
+    results: output.results.map((result) => {
+      const { parentText: _parentText, parentRange: _parentRange, text, ...rest } = result
+      return { ...rest, text: trimText(text, 0) }
+    }),
+    diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+  }
+}
+
+function minimalSearchOutput(output: SearchOutput) {
+  return {
+    status: output.status,
+    results: output.results.map((result, index) => ({
+      rank: index + SINGLE_COMPACT_CHILD,
+      id: result.topology.chunk.id,
+      label: result.topology.chunk.label,
+      range: result.topology.chunk.range,
+      score: result.score,
+      finalScore: result.finalScore,
+      retrieval: result.retrieval,
+    })),
+    diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+  }
+}
+
+function diagnosticsFocusedSearchOutput(output: SearchOutput) {
+  return {
+    status: output.status.status,
+    resultCount: output.results.length,
+    diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+  }
+}
+
+function compactChunkLookupOutput(output: ChunkLookupOutput, limits: ToolOutputLimits): ChunkLookupOutput {
+  for (const maxTextLength of LOOKUP_COMPACT_TEXT_LENGTHS) {
+    for (const maxChildren of LOOKUP_COMPACT_CHILD_LIMITS) {
+      const compacted = compactChunkLookupOutputWith(output, maxTextLength, maxChildren)
+      if (serializedFits(serializeJson(compacted), limits)) {
+        return compacted
+      }
+    }
+  }
+  return compactChunkLookupOutputWith(output, 0, 0)
+}
+
+function compactChunkLookupOutputWith(
+  output: ChunkLookupOutput,
+  maxTextLength: number,
+  maxChildren: number,
+): ChunkLookupOutput {
+  if (!output.chunk) {
+    return { ...output, diagnostics: diagnosticsWithLookupCompaction(output.diagnostics) }
+  }
+
+  const { parentText: _parentText, parentRange: _parentRange, text, related, ...chunk } = output.chunk
+  const children = related.children.slice(0, maxChildren).map(compactRelatedChunk)
+  return {
+    ...output,
+    chunk: {
+      ...chunk,
+      text: trimText(text, maxTextLength),
+      related: {
+        parent: compactRelatedChunk(related.parent),
+        previousSibling: compactRelatedChunk(related.previousSibling),
+        nextSibling: compactRelatedChunk(related.nextSibling),
+        children,
+        childrenPage: compactChildrenPage(related.childrenPage, children.length),
+      },
+    },
+    diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
+  }
+}
+
+function compactRelatedChunk<T extends { text?: string } | undefined>(chunk: T): T {
+  if (!chunk) {
+    return chunk
+  }
+  const { text: _text, ...rest } = chunk
+  return rest as T
+}
+
+function minimalChunkLookupOutput(output: ChunkLookupOutput) {
+  if (!output.chunk) {
+    return { status: output.status, diagnostics: diagnosticsWithLookupCompaction(output.diagnostics) }
+  }
+  return {
+    status: output.status,
+    chunk: {
+      filePath: output.chunk.filePath,
+      language: output.chunk.language,
+      range: output.chunk.range,
+      kind: output.chunk.kind,
+      breadcrumbs: output.chunk.breadcrumbs,
+      topology: output.chunk.topology,
+      related: {
+        parent: compactRelatedChunk(output.chunk.related.parent),
+        previousSibling: compactRelatedChunk(output.chunk.related.previousSibling),
+        nextSibling: compactRelatedChunk(output.chunk.related.nextSibling),
+        children: output.chunk.related.children.map(compactRelatedChunk),
+        childrenPage: output.chunk.related.childrenPage,
+      },
+    },
+    diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
+  }
+}
+
+function diagnosticsFocusedChunkLookupOutput(output: ChunkLookupOutput) {
+  return {
+    status: output.status.status,
+    found: Boolean(output.chunk),
+    diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
+  }
+}
+
+function compactChildrenPage(
+  page: NonNullable<ChunkLookupOutput["chunk"]>["related"]["childrenPage"],
+  emittedChildren: number,
+) {
+  if (emittedChildren === page.limit) {
+    return page
+  }
+  return {
+    ...page,
+    limit: emittedChildren,
+    hasMore: page.offset + emittedChildren < page.total,
+  }
+}
+
+function diagnosticsWithSearchCompaction(diagnostics: string[]) {
+  return diagnostics.includes(COMPACTION_DIAGNOSTIC) ? diagnostics : [...diagnostics, COMPACTION_DIAGNOSTIC]
+}
+
+function diagnosticsWithLookupCompaction(diagnostics: string[]) {
+  return diagnostics.includes(LOOKUP_COMPACTION_DIAGNOSTIC)
+    ? diagnostics
+    : [...diagnostics, LOOKUP_COMPACTION_DIAGNOSTIC]
+}
+
+function trimText(text: string, maxLength: number) {
+  return text.length > maxLength ? text.slice(0, maxLength) : text
 }
 
 function isStoreUnavailableError(error: unknown) {

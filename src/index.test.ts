@@ -37,9 +37,245 @@ describe("cast plugin", () => {
     const description = semanticSearchTool(hooks).description
     expect(description).toContain("by meaning instead of exact text")
     expect(description).toContain("behavior, features, APIs, errors, data flow")
+    expect(description).toContain("compact ranked matches")
+    expect(description).toContain("semantic_get_chunk")
     expect(description).toContain("Use paths to restrict the search area")
     expect(description).toContain("Use refresh if files may have changed")
     await hooks.dispose?.()
+  })
+
+  test("semantic_get_chunk description explains context expansion and child paging", async () => {
+    const hooks = await castPlugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const description = semanticGetChunkTool(hooks).description
+    expect(description).toContain("parent context")
+    expect(description).toContain("childrenOffset")
+    expect(description).toContain("childrenLimit")
+    await hooks.dispose?.()
+  })
+
+  test("semantic_search_code compacts output to configured opencode tool_output limits", async () => {
+    const diagnostic = "output compacted to fit opencode tool_output limits; use semantic_get_chunk for more context"
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [
+          {
+            filePath: "source.ts",
+            language: "typescript",
+            range: { byteStart: 0, byteEnd: 5000, lineStart: 1, lineEnd: 200 },
+            score: 0.9,
+            finalScore: 0.95,
+            kind: "function",
+            breadcrumbs: ["function large"],
+            text: "x".repeat(2000),
+            parentText: "parent".repeat(500),
+            parentRange: { byteStart: 0, byteEnd: 6000, lineStart: 1, lineEnd: 240 },
+            topology: {
+              chunk: { id: "c1", label: "function large", range: "source.ts:1-200" },
+              children: [],
+              symbols: ["function large"],
+            },
+            retrieval: { mode: "hybrid", vectorRank: 1, bm25Rank: 1, rerankRank: 1, rerankScore: 0.95 },
+          },
+        ],
+        diagnostics: [],
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+    hooks.config?.({ tool_output: { max_lines: 80, max_bytes: 900 } } as never)
+
+    const result = await semanticSearchTool(hooks).execute({ query: "a", includeParents: true }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(Buffer.byteLength(result.output, "utf8")).toBeLessThanOrEqual(900)
+    const output = JSON.parse(result.output)
+    expect(output.results[0].parentText).toBeUndefined()
+    expect(output.results[0].parentRange).toBeUndefined()
+    expect(output.diagnostics).toContain(diagnostic)
+  })
+
+  test("semantic_get_chunk compacts output to configured opencode tool_output limits", async () => {
+    const diagnostic =
+      "output compacted to fit opencode tool_output limits; narrow semantic_get_chunk args, page children, reduce included relations, or increase opencode tool_output limits"
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-plugin-"))
+    try {
+      const source = `${"a".repeat(1200)}\n${"b".repeat(1200)}\n${"c".repeat(1200)}\n`
+      await Bun.write(path.join(dir, "source.ts"), source)
+      const index = emptyReadyIndex()
+      index.metadata.worktree = dir
+      index.files["source.ts"] = {
+        path: "source.ts",
+        language: "typescript",
+        fingerprint: "fingerprint",
+        chunkIds: ["parent", "c1", "child"],
+        diagnostics: [],
+      }
+      index.chunks.parent = {
+        id: "parent",
+        filePath: "source.ts",
+        language: "typescript",
+        kind: "function",
+        range: { byteStart: 0, byteEnd: 1200, lineStart: 1, lineEnd: 1 },
+        text: "a".repeat(1200),
+        nonWhitespaceChars: 1200,
+        nodeTypes: ["function_declaration"],
+        symbolIds: [],
+        childChunkIds: ["c1"],
+        embedding: [1],
+      }
+      index.chunks.c1 = {
+        id: "c1",
+        filePath: "source.ts",
+        language: "typescript",
+        kind: "function",
+        range: { byteStart: 1201, byteEnd: 2401, lineStart: 2, lineEnd: 2 },
+        text: "b".repeat(1200),
+        nonWhitespaceChars: 1200,
+        nodeTypes: ["function_declaration"],
+        symbolIds: [],
+        parentChunkId: "parent",
+        childChunkIds: ["child"],
+        embedding: [1],
+      }
+      index.chunks.child = {
+        id: "child",
+        filePath: "source.ts",
+        language: "typescript",
+        kind: "function",
+        range: { byteStart: 2402, byteEnd: 3602, lineStart: 3, lineEnd: 3 },
+        text: "c".repeat(1200),
+        nonWhitespaceChars: 1200,
+        nodeTypes: ["function_declaration"],
+        symbolIds: [],
+        parentChunkId: "c1",
+        childChunkIds: [],
+        embedding: [1],
+      }
+      const plugin = createCastPluginForTest({
+        createIndexer: () => ({ refresh: async () => index }),
+        createStore: () => ({ read: async () => index, write: async () => undefined }),
+      })
+      const hooks = await plugin({ ...input, directory: dir, worktree: dir } as never, {
+        embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      })
+      hooks.config?.({ tool_output: { max_lines: 80, max_bytes: 500 } } as never)
+
+      const tool = semanticGetChunkTool(hooks)
+      expect(Object.keys(tool.args)).toEqual(expect.arrayContaining(["childrenOffset", "childrenLimit"]))
+      const result = await tool.execute({ id: "c1", includeParents: true, includeChildren: true }, {
+        worktree: dir,
+        directory: dir,
+      } as never)
+
+      expect(typeof result).toBe("object")
+      if (typeof result === "string") {
+        throw new Error("expected object tool result")
+      }
+      expect(Buffer.byteLength(result.output, "utf8")).toBeLessThanOrEqual(500)
+      const output = JSON.parse(result.output)
+      expect(output.status).toBe("ready")
+      expect(output.found).toBe(true)
+      expect(output.chunk).toBeUndefined()
+      expect(output.diagnostics).toContain(diagnostic)
+      expect(output.diagnostics.join("\n")).not.toContain("use semantic_get_chunk for more context")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("semantic_get_chunk compacts output and updates childrenPage when emitted children are reduced", async () => {
+    const childCount = 30
+    const sourceLines = ["root", ...Array.from({ length: childCount }, (_, index) => `child-${index}`)]
+    const source = `${sourceLines.join("\n")}\n`
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-plugin-"))
+    try {
+      await Bun.write(path.join(dir, "source.ts"), source)
+      const index = emptyReadyIndex()
+      index.metadata.worktree = dir
+      index.files["source.ts"] = {
+        path: "source.ts",
+        language: "typescript",
+        fingerprint: "fingerprint",
+        chunkIds: ["root", ...Array.from({ length: childCount }, (_, childIndex) => `child-${childIndex}`)],
+        diagnostics: [],
+      }
+      index.chunks.root = {
+        id: "root",
+        filePath: "source.ts",
+        language: "typescript",
+        kind: "function",
+        range: { byteStart: 0, byteEnd: 4, lineStart: 1, lineEnd: 1 },
+        text: "root",
+        nonWhitespaceChars: 4,
+        nodeTypes: ["function_declaration"],
+        symbolIds: [],
+        childChunkIds: Array.from({ length: childCount }, (_, childIndex) => `child-${childIndex}`),
+        embedding: [1],
+      }
+      let byteStart = "root\n".length
+      for (let childIndex = 0; childIndex < childCount; childIndex++) {
+        const text = `child-${childIndex}`
+        index.chunks[`child-${childIndex}`] = {
+          id: `child-${childIndex}`,
+          filePath: "source.ts",
+          language: "typescript",
+          kind: "function",
+          range: { byteStart, byteEnd: byteStart + text.length, lineStart: childIndex + 2, lineEnd: childIndex + 2 },
+          text,
+          nonWhitespaceChars: text.length,
+          nodeTypes: ["function_declaration"],
+          symbolIds: [],
+          parentChunkId: "root",
+          childChunkIds: [],
+          embedding: [1],
+        }
+        byteStart += text.length + 1
+      }
+      const plugin = createCastPluginForTest({
+        createIndexer: () => ({ refresh: async () => index }),
+        createStore: () => ({ read: async () => index, write: async () => undefined }),
+      })
+      const hooks = await plugin({ ...input, directory: dir, worktree: dir } as never, {
+        embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      })
+      hooks.config?.({ tool_output: { max_bytes: 7000 } } as never)
+
+      const result = await semanticGetChunkTool(hooks).execute({ id: "root", includeChildren: true }, {
+        worktree: dir,
+        directory: dir,
+      } as never)
+
+      expect(typeof result).toBe("object")
+      if (typeof result === "string") {
+        throw new Error("expected object tool result")
+      }
+      const output = JSON.parse(result.output)
+      expect(output.chunk.related.children.length).toBeLessThan(20)
+      expect(output.chunk.related.childrenPage).toMatchObject({
+        offset: 0,
+        limit: output.chunk.related.children.length,
+        total: childCount,
+        hasMore: true,
+      })
+      expect(output.chunk.related.childrenPage.offset + output.chunk.related.childrenPage.limit).toBe(
+        output.chunk.related.children.length,
+      )
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test("semantic_search_code returns configuration error when embeddings are missing", async () => {
