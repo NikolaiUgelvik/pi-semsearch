@@ -571,16 +571,13 @@ async function hydePromptText(client, hydeSessionID, input) {
     return nonEmptyHydeText(prompted.data.parts);
 }
 function isSessionNotFoundError(error) {
-    return (typeof error === "object" &&
-        error !== null &&
-        "name" in error &&
-        error.name === "NotFoundError" &&
-        "data" in error &&
-        typeof error.data === "object" &&
-        error.data !== null &&
-        "message" in error.data &&
-        typeof error.data.message === "string" &&
-        error.data.message.startsWith("Session not found:"));
+    if (!isRecord(error) || error.name !== "NotFoundError" || !isRecord(error.data)) {
+        return false;
+    }
+    return typeof error.data.message === "string" && error.data.message.startsWith("Session not found:");
+}
+function isRecord(value) {
+    return typeof value === "object" && value !== null;
 }
 function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));

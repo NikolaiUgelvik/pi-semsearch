@@ -717,18 +717,14 @@ async function hydePromptText(
 }
 
 function isSessionNotFoundError(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "name" in error &&
-    error.name === "NotFoundError" &&
-    "data" in error &&
-    typeof error.data === "object" &&
-    error.data !== null &&
-    "message" in error.data &&
-    typeof error.data.message === "string" &&
-    error.data.message.startsWith("Session not found:")
-  )
+  if (!isRecord(error) || error.name !== "NotFoundError" || !isRecord(error.data)) {
+    return false
+  }
+  return typeof error.data.message === "string" && error.data.message.startsWith("Session not found:")
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
 }
 
 function delay(ms: number) {

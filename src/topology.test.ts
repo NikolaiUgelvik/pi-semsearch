@@ -6,6 +6,7 @@ import {
   extractSymbols,
   summarizeTopology,
 } from "./topology.js"
+import { linkChunkTopology, linkSymbolsToChunks } from "./topology-relations.js"
 import type { ChunkRecord, SymbolRecord } from "./types.js"
 
 const base = {
@@ -29,6 +30,26 @@ function chunk(id: string, filePath: string, byteStart: number, byteEnd: number)
 }
 
 describe("topology", () => {
+  test("links relation helpers directly", () => {
+    const symbol: SymbolRecord = {
+      id: "sym:function:inner",
+      name: "inner",
+      kind: "function",
+      filePath: "src/a.ts",
+      range: { byteStart: 10, byteEnd: 20, lineStart: 2, lineEnd: 2 },
+      childSymbolIds: [],
+    }
+    const root = chunk("root", "src/a.ts", 0, 40)
+    const child = chunk("child", "src/a.ts", 10, 20)
+
+    const withSymbols = linkSymbolsToChunks([root, child], { [symbol.id]: symbol })
+    const withTopology = linkChunkTopology(withSymbols, { [symbol.id]: symbol })
+
+    expect(withTopology.find((candidate) => candidate.id === "child")?.symbolIds).toEqual([symbol.id])
+    expect(withTopology.find((candidate) => candidate.id === "child")?.parentChunkId).toBe("root")
+    expect(withTopology.find((candidate) => candidate.id === "root")?.childChunkIds).toEqual(["child"])
+  })
+
   test("links children to parent symbols and siblings", () => {
     const parent: SymbolRecord = {
       id: "sym:class:A",

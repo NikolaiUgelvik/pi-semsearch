@@ -1,12 +1,6 @@
 function linkSymbolsToChunks(chunks, symbols) {
     const symbolsByFile = groupByFile(Object.values(symbols));
-    return chunks.map((chunk) => ({
-        ...chunk,
-        symbolIds: (symbolsByFile[chunk.filePath] ?? [])
-            .filter((symbol) => containsRange(symbol.range.byteStart, symbol.range.byteEnd, chunk.range.byteStart, chunk.range.byteEnd))
-            .sort((left, right) => left.range.byteStart - right.range.byteStart || right.range.byteEnd - left.range.byteEnd)
-            .map((symbol) => symbol.id),
-    }));
+    return chunks.map((chunk) => ({ ...chunk, symbolIds: symbolIdsForChunk(chunk, symbolsByFile[chunk.filePath] ?? []) }));
 }
 function linkChunkTopology(chunks, symbols) {
     const relations = chunkRelations(chunks);
@@ -23,20 +17,41 @@ function chunkRelations(chunks) {
         relations[chunk.id] = { childChunkIds: [] };
     }
     for (const fileChunks of Object.values(groupByFile(chunks))) {
-        const stack = [];
-        for (const chunk of [...fileChunks].sort(compareForTopology)) {
-            while (stack.length > 0 && !containsChunk(stack.at(-1), chunk)) {
-                stack.pop();
-            }
-            const parent = stack.at(-1);
-            if (parent) {
-                relations[chunk.id].parentChunkId = parent.id;
-                relations[parent.id].childChunkIds.push(chunk.id);
-            }
-            stack.push(chunk);
-        }
+        linkFileChunkRelations(fileChunks, relations);
     }
     return relations;
+}
+function symbolIdsForChunk(chunk, symbols) {
+    return symbols
+        .filter((symbol) => containsSymbol(symbol, chunk))
+        .sort(compareSymbolsForChunk)
+        .map((symbol) => symbol.id);
+}
+function containsSymbol(symbol, chunk) {
+    return containsRange(symbol.range.byteStart, symbol.range.byteEnd, chunk.range.byteStart, chunk.range.byteEnd);
+}
+function compareSymbolsForChunk(left, right) {
+    return left.range.byteStart - right.range.byteStart || right.range.byteEnd - left.range.byteEnd;
+}
+function linkFileChunkRelations(fileChunks, relations) {
+    const stack = [];
+    for (const chunk of [...fileChunks].sort(compareForTopology)) {
+        pruneNonParents(stack, chunk);
+        recordParentRelation(chunk, stack.at(-1), relations);
+        stack.push(chunk);
+    }
+}
+function pruneNonParents(stack, chunk) {
+    while (stack.length > 0 && !containsChunk(stack.at(-1), chunk)) {
+        stack.pop();
+    }
+}
+function recordParentRelation(chunk, parent, relations) {
+    if (!parent) {
+        return;
+    }
+    relations[chunk.id].parentChunkId = parent.id;
+    relations[parent.id].childChunkIds.push(chunk.id);
 }
 function containsChunk(parent, child) {
     return strictlyContainsRange(parent.range.byteStart, parent.range.byteEnd, child.range.byteStart, child.range.byteEnd);

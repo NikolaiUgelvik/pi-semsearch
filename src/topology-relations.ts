@@ -2,15 +2,7 @@ import type { ChunkRecord, SymbolRecord } from "./types.js"
 
 function linkSymbolsToChunks(chunks: ChunkRecord[], symbols: Record<string, SymbolRecord>) {
   const symbolsByFile = groupByFile(Object.values(symbols))
-  return chunks.map((chunk) => ({
-    ...chunk,
-    symbolIds: (symbolsByFile[chunk.filePath] ?? [])
-      .filter((symbol) =>
-        containsRange(symbol.range.byteStart, symbol.range.byteEnd, chunk.range.byteStart, chunk.range.byteEnd),
-      )
-      .sort((left, right) => left.range.byteStart - right.range.byteStart || right.range.byteEnd - left.range.byteEnd)
-      .map((symbol) => symbol.id),
-  }))
+  return chunks.map((chunk) => ({ ...chunk, symbolIds: symbolIdsForChunk(chunk, symbolsByFile[chunk.filePath] ?? []) }))
 }
 
 function linkChunkTopology(chunks: ChunkRecord[], symbols: Record<string, SymbolRecord>) {
@@ -30,21 +22,55 @@ function chunkRelations(chunks: ChunkRecord[]) {
   }
 
   for (const fileChunks of Object.values(groupByFile(chunks))) {
-    const stack: ChunkRecord[] = []
-    for (const chunk of [...fileChunks].sort(compareForTopology)) {
-      while (stack.length > 0 && !containsChunk(stack.at(-1) as ChunkRecord, chunk)) {
-        stack.pop()
-      }
-      const parent = stack.at(-1)
-      if (parent) {
-        relations[chunk.id].parentChunkId = parent.id
-        relations[parent.id].childChunkIds.push(chunk.id)
-      }
-      stack.push(chunk)
-    }
+    linkFileChunkRelations(fileChunks, relations)
   }
 
   return relations
+}
+
+function symbolIdsForChunk(chunk: ChunkRecord, symbols: SymbolRecord[]) {
+  return symbols
+    .filter((symbol) => containsSymbol(symbol, chunk))
+    .sort(compareSymbolsForChunk)
+    .map((symbol) => symbol.id)
+}
+
+function containsSymbol(symbol: SymbolRecord, chunk: ChunkRecord) {
+  return containsRange(symbol.range.byteStart, symbol.range.byteEnd, chunk.range.byteStart, chunk.range.byteEnd)
+}
+
+function compareSymbolsForChunk(left: SymbolRecord, right: SymbolRecord) {
+  return left.range.byteStart - right.range.byteStart || right.range.byteEnd - left.range.byteEnd
+}
+
+function linkFileChunkRelations(
+  fileChunks: ChunkRecord[],
+  relations: Record<string, { parentChunkId?: string; childChunkIds: string[] }>,
+) {
+  const stack: ChunkRecord[] = []
+  for (const chunk of [...fileChunks].sort(compareForTopology)) {
+    pruneNonParents(stack, chunk)
+    recordParentRelation(chunk, stack.at(-1), relations)
+    stack.push(chunk)
+  }
+}
+
+function pruneNonParents(stack: ChunkRecord[], chunk: ChunkRecord) {
+  while (stack.length > 0 && !containsChunk(stack.at(-1) as ChunkRecord, chunk)) {
+    stack.pop()
+  }
+}
+
+function recordParentRelation(
+  chunk: ChunkRecord,
+  parent: ChunkRecord | undefined,
+  relations: Record<string, { parentChunkId?: string; childChunkIds: string[] }>,
+) {
+  if (!parent) {
+    return
+  }
+  relations[chunk.id].parentChunkId = parent.id
+  relations[parent.id].childChunkIds.push(chunk.id)
 }
 
 function containsChunk(parent: ChunkRecord, child: ChunkRecord) {
