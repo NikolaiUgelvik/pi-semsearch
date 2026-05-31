@@ -1,6 +1,7 @@
 import type { SourceRange } from "./types.js"
 
 const encoder = new TextEncoder()
+const decoder = new TextDecoder()
 const WHITESPACE_PATTERN = /\s/
 
 export function nonWhitespaceLength(text: string) {
@@ -20,6 +21,10 @@ export function rangeForSlice(source: string, byteStart: number, byteEnd: number
 
 export function stableChunkId(filePath: string, byteStart: number, byteEnd: number) {
   return `${filePath}:${byteStart}:${byteEnd}`
+}
+
+export function textForByteSlice(source: string, byteStart: number, byteEnd: number) {
+  return decoder.decode(encoder.encode(source).slice(byteStart, byteEnd))
 }
 
 function stringOffsetForByteOffset(source: string, byteOffset: number) {

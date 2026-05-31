@@ -214,28 +214,7 @@ export function createCastPluginForTest(
         read: () => wrapStoreOperation(() => indexStore.read()),
         write: (index) => wrapStoreOperation(() => indexStore.write(index)),
       }
-      const maybeRunStore = indexStore as Partial<IndexingStore>
-      if (typeof maybeRunStore.beginIndexRun === "function") {
-        wrapped.beginIndexRun = (input) =>
-          wrapStoreOperation(() => maybeRunStore.beginIndexRun?.(input) as Promise<{ runId: string }>)
-      }
-      if (typeof maybeRunStore.getCompletedFile === "function") {
-        wrapped.getCompletedFile = (runId, filePath, fingerprint) =>
-          wrapStoreOperation(
-            () =>
-              maybeRunStore.getCompletedFile?.(runId, filePath, fingerprint) as ReturnType<
-                NonNullable<IndexingStore["getCompletedFile"]>
-              >,
-          )
-      }
-      if (typeof maybeRunStore.writeFileResult === "function") {
-        wrapped.writeFileResult = (runId, fileResult) =>
-          wrapStoreOperation(() => maybeRunStore.writeFileResult?.(runId, fileResult) as Promise<void>)
-      }
-      if (typeof maybeRunStore.activateRun === "function") {
-        wrapped.activateRun = (runId, index) =>
-          wrapStoreOperation(() => maybeRunStore.activateRun?.(runId, index) as Promise<void>)
-      }
+      addRunStoreMethods(wrapped, indexStore, wrapStoreOperation)
       if (hasVectorCandidateStore(indexStore)) {
         wrapped.searchVectorCandidates = (queryEmbedding: number[], topK: number, paths?: string[]) =>
           wrapStoreOperation(() => indexStore.searchVectorCandidates(queryEmbedding, topK, paths))
@@ -261,8 +240,48 @@ export function createCastPluginForTest(
       }
     }
 
-    if (options.embedding && options.diagnostics.length === 0) {
-      queueRefresh({ background: true })
+    queueInitialRefresh(options, queueRefresh)
+
+    const semanticSearchUnavailable = () => {
+      if (!options.embedding || options.diagnostics.length > 0) {
+        return {
+          title: "Semantic code search is not configured",
+          output: options.diagnostics.join("\n"),
+          metadata: { configured: false },
+        }
+      }
+      return store ? undefined : unavailableToolResult("Semantic code search index unavailable", storeError)
+    }
+
+    const semanticSearchOutput = async (args: Parameters<typeof retrieve>[0]["input"], context: ToolContext) => {
+      const embedding = options.embedding
+      if (!embedding) {
+        throw new Error("embedding dependency unavailable")
+      }
+      await ensureSearchIndexReady(
+        args.refresh === true,
+        queueRefresh,
+        () => refresh,
+        () => storeError,
+      )
+      try {
+        return await (dependencies.retrieve ?? retrieve)({
+          index: await readIndex(),
+          input: args,
+          options: { ...options, hybrid: options.retrieval.hybrid, rerank: options.rerank },
+          embed: (text) => client.embed({ ...embedding, input: text }),
+          generateHyde: (query) =>
+            generateHydeText({ query, context, hyde: options.hyde, client, generateOpenCodeHyde }),
+          rerank: (query, documents) => rerankDocuments(query, documents, options.rerank, client),
+          readSource: async (filePath) => Bun.file(await resolveWorktreePath(input.worktree, filePath)).text(),
+          indexStore: vectorCandidateStore(),
+        })
+      } catch (error) {
+        if (!(error instanceof IndexUnavailableError)) {
+          throw error
+        }
+        throw new IndexUnavailableError(storeError ?? formatThrownError(error))
+      }
     }
 
     const generateOpenCodeHyde = async (query: string, context: ToolContext) => {
@@ -274,52 +293,7 @@ export function createCastPluginForTest(
       if (!opencodeClient?.session) {
         throw new Error("OpenCode client is not available for HyDE generation")
       }
-
-      const created = await opencodeClient.session.create({
-        body: { parentID: context.sessionID, title: "OpenCode Cast HyDE" },
-        query: { directory: context.directory },
-      })
-      if (created.error) {
-        throw new Error(`OpenCode HyDE session create failed: ${formatSdkError(created.error)}`)
-      }
-
-      const hydeSessionID = created.data?.id
-      if (!hydeSessionID) {
-        throw new Error("OpenCode HyDE session create returned no session id")
-      }
-      try {
-        const prompted = await opencodeClient.session.prompt({
-          path: { id: hydeSessionID },
-          query: { directory: context.directory },
-          body: {
-            model,
-            tools: {},
-            system:
-              "Write a concise hypothetical code or documentation excerpt that would satisfy the search query. Return only useful search text.",
-            parts: [{ type: "text", text: query }],
-          },
-        })
-        if (prompted.error) {
-          throw new Error(`OpenCode HyDE prompt failed: ${formatSdkError(prompted.error)}`)
-        }
-        if (!prompted.data) {
-          throw new Error("OpenCode HyDE prompt returned no response")
-        }
-
-        const text = prompted.data.parts
-          .filter((part) => part.type === "text" && typeof part.text === "string")
-          .map((part) => part.text)
-          .join("\n")
-          .trim()
-        if (!text) {
-          throw new Error("OpenCode HyDE prompt returned no text")
-        }
-        return text
-      } finally {
-        await opencodeClient.session
-          .delete({ path: { id: hydeSessionID }, query: { directory: context.directory } })
-          .catch(() => undefined)
-      }
+      return generateOpenCodeHydeText({ client: opencodeClient, query, context, model })
     }
 
     return {
@@ -356,78 +330,18 @@ This tool searches syntax-aware code chunks such as functions, classes, methods,
             paths: tool.schema.array(tool.schema.string()).optional(),
           },
           async execute(args, context) {
-            const embedding = options.embedding
-            if (!embedding || options.diagnostics.length > 0) {
-              return {
-                title: "Semantic code search is not configured",
-                output: options.diagnostics.join("\n"),
-                metadata: { configured: false },
-              }
+            const unavailable = semanticSearchUnavailable()
+            if (unavailable) {
+              return unavailable
             }
-            if (!store) {
-              return unavailableToolResult("Semantic code search index unavailable", storeError)
-            }
-
-            if (args.refresh) {
-              await queueRefresh()
-            }
-            await refresh
-            if (storeError) {
-              return unavailableToolResult("Semantic code search index unavailable", storeError)
-            }
-            let output: Awaited<ReturnType<typeof retrieve>>
             try {
-              const indexStore = vectorCandidateStore()
-              output = await (dependencies.retrieve ?? retrieve)({
-                index: await readIndex(),
-                input: args,
-                options: { ...options, hybrid: options.retrieval.hybrid, rerank: options.rerank },
-                embed: (text) => client.embed({ ...embedding, input: text }),
-                generateHyde: (query) =>
-                  options.hyde.mode === "openai-compatible" && options.hyde.baseURL && options.hyde.model
-                    ? client.generateHyde({
-                        baseURL: options.hyde.baseURL,
-                        apiKey: options.hyde.apiKey,
-                        model: options.hyde.model,
-                        query,
-                      })
-                    : generateOpenCodeHyde(query, context),
-                rerank: (query, documents) =>
-                  options.rerank
-                    ? client.rerank({
-                        baseURL: options.rerank.baseURL,
-                        apiKey: options.rerank.apiKey,
-                        model: options.rerank.model,
-                        query,
-                        documents,
-                      })
-                    : Promise.reject(new Error("Rerank is not configured")),
-                readSource: async (filePath) => Bun.file(await resolveWorktreePath(input.worktree, filePath)).text(),
-                indexStore,
-              })
+              const output = await semanticSearchOutput(args, context)
+              return searchToolResult(args.query, output, outputLimits)
             } catch (error) {
               if (!(error instanceof IndexUnavailableError)) {
                 throw error
               }
               return unavailableToolResult("Semantic code search index unavailable", storeError)
-            }
-
-            return {
-              title: `Semantic code search: ${args.query}`,
-              output: serializeToolOutput({
-                output,
-                limits: outputLimits,
-                compact: compactSearchOutput,
-                minimal: minimalSearchOutput,
-                diagnosticsFocused: diagnosticsFocusedSearchOutput,
-              }),
-              metadata: {
-                hydeUsed: output.status.hydeUsed,
-                rerankUsed: output.status.rerankUsed,
-                resultCount: output.results.length,
-                minFinalScore: output.status.minFinalScore,
-                filteredCount: output.status.filteredCount,
-              },
             }
           },
         }),
@@ -508,12 +422,191 @@ function hasVectorCandidateStore(value: unknown): value is VectorCandidateStore 
   )
 }
 
+function addRunStoreMethods(
+  wrapped: WrappedIndexingStore,
+  indexStore: NonNullable<ReturnType<typeof createIndexStore>>,
+  wrapStoreOperation: <T>(operation: () => Promise<T>) => Promise<T>,
+) {
+  const maybeRunStore = indexStore as Partial<IndexingStore>
+  if (typeof maybeRunStore.beginIndexRun === "function") {
+    wrapped.beginIndexRun = (input) =>
+      wrapStoreOperation(() => maybeRunStore.beginIndexRun?.(input) as Promise<{ runId: string }>)
+  }
+  if (typeof maybeRunStore.getCompletedFile === "function") {
+    wrapped.getCompletedFile = (runId, filePath, fingerprint) =>
+      wrapStoreOperation(
+        () =>
+          maybeRunStore.getCompletedFile?.(runId, filePath, fingerprint) as ReturnType<
+            NonNullable<IndexingStore["getCompletedFile"]>
+          >,
+      )
+  }
+  if (typeof maybeRunStore.writeFileResult === "function") {
+    wrapped.writeFileResult = (runId, fileResult) =>
+      wrapStoreOperation(() => maybeRunStore.writeFileResult?.(runId, fileResult) as Promise<void>)
+  }
+  if (typeof maybeRunStore.activateRun === "function") {
+    wrapped.activateRun = (runId, index) =>
+      wrapStoreOperation(() => maybeRunStore.activateRun?.(runId, index) as Promise<void>)
+  }
+}
+
 function unavailableToolResult(title: string, message: string | undefined) {
   return {
     title,
     output: `index unavailable${message ? `: ${message}` : ""}`,
     metadata: { configured: false },
   }
+}
+
+function searchToolResult(query: string, output: SearchOutput, limits: ToolOutputLimits) {
+  return {
+    title: `Semantic code search: ${query}`,
+    output: serializeToolOutput({
+      output,
+      limits,
+      compact: compactSearchOutput,
+      minimal: minimalSearchOutput,
+      diagnosticsFocused: diagnosticsFocusedSearchOutput,
+    }),
+    metadata: {
+      hydeUsed: output.status.hydeUsed,
+      rerankUsed: output.status.rerankUsed,
+      resultCount: output.results.length,
+      minFinalScore: output.status.minFinalScore,
+      filteredCount: output.status.filteredCount,
+    },
+  }
+}
+
+function queueInitialRefresh(
+  options: ReturnType<typeof parseOptions>,
+  queueRefresh: (input: { background?: boolean }) => Promise<unknown>,
+) {
+  if (options.embedding && options.diagnostics.length === 0) {
+    queueRefresh({ background: true })
+  }
+}
+
+async function ensureSearchIndexReady(
+  shouldRefresh: boolean,
+  queueRefresh: () => Promise<unknown>,
+  currentRefresh: () => Promise<unknown> | undefined,
+  currentStoreError: () => string | undefined,
+) {
+  if (shouldRefresh) {
+    await queueRefresh()
+  }
+  await currentRefresh()
+  const storeError = currentStoreError()
+  if (storeError) {
+    throw new IndexUnavailableError(storeError)
+  }
+}
+
+function generateHydeText(input: {
+  query: string
+  context: ToolContext
+  hyde: ReturnType<typeof parseOptions>["hyde"]
+  client: ReturnType<typeof createOpenAIClient>
+  generateOpenCodeHyde: (query: string, context: ToolContext) => Promise<string>
+}) {
+  const openAiHyde = openAiHydeInput(input.query, input.hyde)
+  return openAiHyde ? input.client.generateHyde(openAiHyde) : input.generateOpenCodeHyde(input.query, input.context)
+}
+
+function openAiHydeInput(query: string, hyde: ReturnType<typeof parseOptions>["hyde"]) {
+  return hyde.mode === "openai-compatible" && hyde.baseURL && hyde.model
+    ? { baseURL: hyde.baseURL, apiKey: hyde.apiKey, model: hyde.model, query }
+    : undefined
+}
+
+function rerankDocuments(
+  query: string,
+  documents: string[],
+  rerank: ReturnType<typeof parseOptions>["rerank"],
+  client: ReturnType<typeof createOpenAIClient>,
+) {
+  return rerank
+    ? client.rerank({
+        baseURL: rerank.baseURL,
+        apiKey: rerank.apiKey,
+        model: rerank.model,
+        query,
+        documents,
+      })
+    : Promise.reject(new Error("Rerank is not configured"))
+}
+
+async function generateOpenCodeHydeText(input: {
+  client: OpenCodeHydeClient
+  query: string
+  context: ToolContext
+  model: { providerID: string; modelID: string }
+}) {
+  const hydeSessionID = await createHydeSession(input.client, input.context)
+  try {
+    return hydePromptText(input.client, hydeSessionID, input)
+  } finally {
+    await deleteHydeSession(input.client, hydeSessionID, input.context)
+  }
+}
+
+async function createHydeSession(client: OpenCodeHydeClient, context: ToolContext) {
+  const created = await client.session.create({
+    body: { parentID: context.sessionID, title: "OpenCode Cast HyDE" },
+    query: { directory: context.directory },
+  })
+  if (created.error) {
+    throw new Error(`OpenCode HyDE session create failed: ${formatSdkError(created.error)}`)
+  }
+  if (!created.data?.id) {
+    throw new Error("OpenCode HyDE session create returned no session id")
+  }
+  return created.data.id
+}
+
+async function hydePromptText(
+  client: OpenCodeHydeClient,
+  hydeSessionID: string,
+  input: { query: string; context: ToolContext; model: { providerID: string; modelID: string } },
+) {
+  const prompted = await client.session.prompt({
+    path: { id: hydeSessionID },
+    query: { directory: input.context.directory },
+    body: {
+      model: input.model,
+      tools: {},
+      system:
+        "Write a concise hypothetical code or documentation excerpt that would satisfy the search query. Return only useful search text.",
+      parts: [{ type: "text", text: input.query }],
+    },
+  })
+  if (prompted.error) {
+    throw new Error(`OpenCode HyDE prompt failed: ${formatSdkError(prompted.error)}`)
+  }
+  if (!prompted.data) {
+    throw new Error("OpenCode HyDE prompt returned no response")
+  }
+  return nonEmptyHydeText(prompted.data.parts)
+}
+
+function nonEmptyHydeText(parts: Array<{ type: string; text?: string }>) {
+  const text = parts
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n")
+    .trim()
+  if (!text) {
+    throw new Error("OpenCode HyDE prompt returned no text")
+  }
+  return text
+}
+
+function deleteHydeSession(client: OpenCodeHydeClient, hydeSessionID: string, context: ToolContext) {
+  return client.session
+    .delete({ path: { id: hydeSessionID }, query: { directory: context.directory } })
+    .catch(() => undefined)
 }
 
 function serializeToolOutput<T>(input: {

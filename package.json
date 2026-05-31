@@ -24,7 +24,8 @@
   "scripts": {
     "format": "biome check --write .",
     "lint": "biome check .",
-    "check": "biome ci .",
+    "check": "biome ci . && bun run fallow",
+    "fallow": "fallow --ci --fail-on-issues",
     "test": "bun test --timeout 30000",
     "typecheck": "tsgo --noEmit",
     "build": "tsc",
@@ -46,7 +47,6 @@
   ],
   "dependencies": {
     "@opencode-ai/plugin": "1.15.12",
-    "chokidar": "4.0.3",
     "ignore": "7.0.5",
     "minimatch": "10.0.3",
     "sqlite-vec": "^0.1.9",
@@ -69,6 +69,7 @@
     "@types/bun": "1.3.13",
     "@types/node": "24.12.2",
     "@typescript/native-preview": "7.0.0-dev.20251207.1",
+    "fallow": "2.84.0",
     "typescript": "5.8.2"
   },
   "trustedDependencies": [

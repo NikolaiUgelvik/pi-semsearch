@@ -36,9 +36,9 @@ function connectorSuffixes(input: string) {
 }
 
 // biome-ignore lint/style/useConsistentTypeDefinitions: the public API explicitly exports this as a type alias.
-export type RankedResult = { id: string; score: number }
+type RankedResult = { id: string; score: number }
 
-export function tokenizeCodeText(input: string): string[] {
+function tokenizeCodeText(input: string): string[] {
   const tokens: string[] = []
   for (const match of input.matchAll(TOKEN_PATTERN)) {
     const raw = match[0].toLowerCase()
@@ -56,7 +56,7 @@ export function tokenizeCodeText(input: string): string[] {
   return tokens
 }
 
-export function buildLexicalIndex(
+function buildLexicalIndex(
   chunks: Record<string, ChunkRecord>,
   symbols: Record<string, SymbolRecord>,
 ): { lexical: LexicalIndex; chunks: Record<string, ChunkRecord> } {
@@ -95,7 +95,7 @@ export function buildLexicalIndex(
   }
 }
 
-export function bm25Search(
+function bm25Search(
   query: string,
   chunks: ChunkRecord[],
   lexical: LexicalIndex | undefined,
@@ -112,33 +112,41 @@ export function bm25Search(
   }
 
   const queryTerms = new Set(tokenizeCodeText(query))
-  const results = chunks.flatMap((chunk) => {
-    if (!chunk.lexical || chunk.lexical.length === 0) {
-      return []
-    }
-
-    let score = 0
-    for (const term of queryTerms) {
-      const frequency = chunk.lexical.termFrequencies[term] ?? 0
-      if (frequency === 0) {
-        continue
-      }
-
-      const documentFrequency = lexical.documentFrequencies[term] ?? 0
-      const inverseDocumentFrequency = Math.log(
-        1 + (lexical.documentCount - documentFrequency + BM25_IDF_SMOOTHING) / (documentFrequency + BM25_IDF_SMOOTHING),
-      )
-      const normalizedLength = 1 - BM25_B + BM25_B * (chunk.lexical.length / lexical.averageDocumentLength)
-      score += inverseDocumentFrequency * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * normalizedLength))
-    }
-
-    return score > 0 ? [{ id: chunk.id, score }] : []
-  })
+  const results = chunks.flatMap((chunk) => rankedBm25Chunk(chunk, queryTerms, lexical))
 
   return results.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, topK)
 }
 
-export function reciprocalRankFusion(input: {
+function rankedBm25Chunk(chunk: ChunkRecord, queryTerms: Set<string>, lexical: LexicalIndex) {
+  const score = bm25ChunkScore(chunk, queryTerms, lexical)
+  return score > 0 ? [{ id: chunk.id, score }] : []
+}
+
+function bm25ChunkScore(chunk: ChunkRecord, queryTerms: Set<string>, lexical: LexicalIndex) {
+  if (!chunk.lexical || chunk.lexical.length === 0) {
+    return 0
+  }
+  let score = 0
+  for (const term of queryTerms) {
+    score += bm25TermScore(term, chunk.lexical, lexical)
+  }
+  return score
+}
+
+function bm25TermScore(term: string, chunk: NonNullable<ChunkRecord["lexical"]>, lexical: LexicalIndex) {
+  const frequency = chunk.termFrequencies[term] ?? 0
+  if (frequency === 0) {
+    return 0
+  }
+  const documentFrequency = lexical.documentFrequencies[term] ?? 0
+  const inverseDocumentFrequency = Math.log(
+    1 + (lexical.documentCount - documentFrequency + BM25_IDF_SMOOTHING) / (documentFrequency + BM25_IDF_SMOOTHING),
+  )
+  const normalizedLength = 1 - BM25_B + BM25_B * (chunk.length / lexical.averageDocumentLength)
+  return inverseDocumentFrequency * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * normalizedLength))
+}
+
+function reciprocalRankFusion(input: {
   lists: { weight: number; results: RankedResult[] }[]
   rrfK: number
   topK: number
@@ -158,3 +166,6 @@ export function reciprocalRankFusion(input: {
     .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
     .slice(0, input.topK)
 }
+
+export type { RankedResult }
+export { bm25Search, buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText }

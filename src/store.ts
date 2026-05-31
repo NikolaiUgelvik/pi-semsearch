@@ -4,15 +4,15 @@ import { readFileSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { load as loadSqliteVec } from "sqlite-vec"
+import { matchesPaths } from "./path-filter.js"
 import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, LexicalIndex, SymbolRecord } from "./types.js"
 
-export const INDEX_SCHEMA_VERSION = 1
+const INDEX_SCHEMA_VERSION = 1
 const SQLITE_SCHEMA_VERSION = 3
-const GLOB_SYNTAX_PATTERN = /[*?[]/
-const REGEXP_SPECIAL_CHAR_PATTERN = /[\\^$.*+?()[\]{}|]/
-const CHARACTER_CLASS_SPECIAL_PATTERN = /[\\\]^]/
 const RUN_ID_RANDOM_RADIX = 36
-const globRegExpCache = new Map<string, RegExp>()
+const INDEX_STATUSES: readonly unknown[] = ["empty", "indexing", "ready", "stale", "error"]
+const CHUNK_KINDS: readonly unknown[] = ["file", "class", "function", "method", "block", "fallback"]
+const SYMBOL_KINDS: readonly unknown[] = ["module", "class", "function", "method", "interface"]
 
 const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = {
   overlap: 0,
@@ -27,7 +27,7 @@ class CorruptIndexError extends Error {
   }
 }
 
-export interface FileResult {
+interface FileResult {
   file: FileRecord
   chunks: Record<string, ChunkRecord>
   symbols: Record<string, SymbolRecord>
@@ -461,24 +461,7 @@ function writeSqliteIndex(db: Database, index: CastIndex) {
       insertFile(db, runId, file)
     }
 
-    let vectorRowid = 1
-    for (const chunk of Object.values(castIndex.chunks)) {
-      db.run("insert into chunks (run_id, id, file_path, kind, record_json) values (?, ?, ?, ?, ?)", [
-        runId,
-        chunk.id,
-        chunk.filePath,
-        chunk.kind,
-        JSON.stringify(chunkForStorage(chunk)),
-      ])
-      if (chunk.embedding) {
-        db.run("insert into chunk_vectors (rowid, embedding) values (?, ?)", [
-          vectorRowid,
-          JSON.stringify(chunk.embedding),
-        ])
-        db.run("insert into chunk_rowids (run_id, chunk_id, rowid) values (?, ?, ?)", [runId, chunk.id, vectorRowid])
-        vectorRowid += 1
-      }
-    }
+    insertChunksWithVectorRowids(db, runId, Object.values(castIndex.chunks), 1)
 
     for (const symbol of Object.values(castIndex.symbols)) {
       insertSymbol(db, runId, symbol)
@@ -702,7 +685,11 @@ function insertFile(db: Database, runId: string, file: FileRecord, updateGlobalF
 }
 
 function insertChunks(db: Database, runId: string, chunks: ChunkRecord[]) {
-  let vectorRowid = nextVectorRowid(db)
+  insertChunksWithVectorRowids(db, runId, chunks, nextVectorRowid(db))
+}
+
+function insertChunksWithVectorRowids(db: Database, runId: string, chunks: ChunkRecord[], initialVectorRowid: number) {
+  let vectorRowid = initialVectorRowid
   for (const chunk of chunks) {
     db.run("insert into chunks (run_id, id, file_path, kind, record_json) values (?, ?, ?, ?, ?)", [
       runId,
@@ -850,99 +837,6 @@ export function searchVectors(query: number[], vectors: Array<{ id: string; vect
     .slice(0, Math.max(0, topK))
 }
 
-function matchesPaths(filePath: string, paths: string[] | undefined) {
-  if (!paths || paths.length === 0) {
-    return true
-  }
-  return paths.some((filter) => {
-    if (hasGlobSyntax(filter)) {
-      return globToRegExp(filter).test(filePath)
-    }
-    return filePath === filter || filePath.startsWith(filter.endsWith("/") ? filter : `${filter}/`)
-  })
-}
-
-function hasGlobSyntax(filter: string) {
-  return GLOB_SYNTAX_PATTERN.test(filter)
-}
-
-function globToRegExp(glob: string) {
-  const cached = globRegExpCache.get(glob)
-  if (cached) {
-    return cached
-  }
-  let pattern = "^"
-  for (let index = 0; index < glob.length; index++) {
-    const part = globPatternPart(glob, index)
-    pattern += part.pattern
-    index = part.endIndex
-  }
-  const expression = new RegExp(`${pattern}$`)
-  globRegExpCache.set(glob, expression)
-  return expression
-}
-
-function globPatternPart(glob: string, index: number) {
-  const char = glob[index]
-  const next = glob[index + 1]
-  if (char === "*" && next === "*" && glob[index + 2] === "/") {
-    return { pattern: "(?:.*/)?", endIndex: index + 2 }
-  }
-  if (char === "*" && next === "*") {
-    return { pattern: ".*", endIndex: index + 1 }
-  }
-  if (char === "*") {
-    return { pattern: "[^/]*", endIndex: index }
-  }
-  if (char === "?") {
-    return { pattern: "[^/]", endIndex: index }
-  }
-  if (char === "[") {
-    return globCharacterClass(glob, index) ?? { pattern: escapeRegExp(char), endIndex: index }
-  }
-  if (char === "\\" && next) {
-    return { pattern: escapeRegExp(next), endIndex: index + 1 }
-  }
-  return { pattern: escapeRegExp(char), endIndex: index }
-}
-
-function globCharacterClass(glob: string, startIndex: number) {
-  let endIndex = -1
-  for (let index = startIndex + 1; index < glob.length; index++) {
-    if (glob[index] === "]" && glob[index - 1] !== "\\") {
-      endIndex = index
-      break
-    }
-  }
-  if (endIndex <= startIndex + 1) {
-    return
-  }
-
-  const content = glob.slice(startIndex + 1, endIndex)
-  if (content.includes("/")) {
-    return
-  }
-
-  return { pattern: `[${escapeCharacterClassContent(content)}]`, endIndex }
-}
-
-function escapeCharacterClassContent(content: string) {
-  let escaped = ""
-  for (let index = 0; index < content.length; index++) {
-    const char = content[index]
-    if (char === "-" && index > 0 && index < content.length - 1) {
-      escaped += char
-      continue
-    }
-    escaped += CHARACTER_CLASS_SPECIAL_PATTERN.test(char) ? `\\${char}` : char
-  }
-  return escaped
-}
-
-function escapeRegExp(char: string) {
-  return REGEXP_SPECIAL_CHAR_PATTERN.test(char) ? `\\${char}` : char
-}
-
 function isCastIndex(value: unknown): value is CastIndex {
   return (
     isObject(value) &&
@@ -958,20 +852,19 @@ function isIndexMetadata(value: unknown) {
   if (!isObject(value)) {
     return false
   }
-  return (
-    value.schemaVersion === INDEX_SCHEMA_VERSION &&
-    typeof value.projectId === "string" &&
-    typeof value.worktree === "string" &&
-    typeof value.cacheKey === "string" &&
-    typeof value.maxChunkNonWhitespaceChars === "number" &&
-    isChunkingOptions(value.chunking) &&
-    typeof value.updatedAt === "number" &&
-    typeof value.status === "string" &&
-    ["empty", "indexing", "ready", "stale", "error"].includes(value.status) &&
-    isStringArray(value.diagnostics) &&
-    isOptionalString(value.embeddingModel) &&
-    (value.embeddingDimensions === undefined || typeof value.embeddingDimensions === "number")
-  )
+  return allPass([
+    value.schemaVersion === INDEX_SCHEMA_VERSION,
+    typeof value.projectId === "string",
+    typeof value.worktree === "string",
+    typeof value.cacheKey === "string",
+    typeof value.maxChunkNonWhitespaceChars === "number",
+    isChunkingOptions(value.chunking),
+    typeof value.updatedAt === "number",
+    INDEX_STATUSES.includes(value.status),
+    isStringArray(value.diagnostics),
+    isOptionalString(value.embeddingModel),
+    isOptionalNumber(value.embeddingDimensions),
+  ])
 }
 
 function isChunkingOptions(value: unknown): value is ChunkingOptions {
@@ -998,26 +891,27 @@ function isFileRecord(value: unknown) {
 }
 
 function isChunkRecord(value: unknown) {
-  return (
-    isObject(value) &&
-    typeof value.id === "string" &&
-    typeof value.filePath === "string" &&
-    typeof value.language === "string" &&
-    typeof value.kind === "string" &&
-    ["file", "class", "function", "method", "block", "fallback"].includes(value.kind) &&
-    isSourceRange(value.range) &&
-    typeof value.text === "string" &&
-    typeof value.nonWhitespaceChars === "number" &&
-    isStringArray(value.nodeTypes) &&
-    isStringArray(value.symbolIds) &&
-    isStringArray(value.childChunkIds) &&
-    isOptionalString(value.parentChunkId) &&
-    isOptionalString(value.previousSiblingChunkId) &&
-    isOptionalString(value.nextSiblingChunkId) &&
-    (value.embedding === undefined || isNumberArray(value.embedding)) &&
-    isOptionalString(value.embeddingError) &&
-    (value.lexical === undefined || isChunkLexicalStats(value.lexical))
-  )
+  if (!isObject(value)) {
+    return false
+  }
+  return allPass([
+    typeof value.id === "string",
+    typeof value.filePath === "string",
+    typeof value.language === "string",
+    CHUNK_KINDS.includes(value.kind),
+    isSourceRange(value.range),
+    typeof value.text === "string",
+    typeof value.nonWhitespaceChars === "number",
+    isStringArray(value.nodeTypes),
+    isStringArray(value.symbolIds),
+    isStringArray(value.childChunkIds),
+    isOptionalString(value.parentChunkId),
+    isOptionalString(value.previousSiblingChunkId),
+    isOptionalString(value.nextSiblingChunkId),
+    isOptionalNumberArray(value.embedding),
+    isOptionalString(value.embeddingError),
+    value.lexical === undefined || isChunkLexicalStats(value.lexical),
+  ])
 }
 
 function isLexicalIndex(value: unknown) {
@@ -1034,17 +928,18 @@ function isChunkLexicalStats(value: unknown) {
 }
 
 function isSymbolRecord(value: unknown) {
-  return (
-    isObject(value) &&
-    typeof value.id === "string" &&
-    typeof value.name === "string" &&
-    typeof value.kind === "string" &&
-    ["module", "class", "function", "method", "interface"].includes(value.kind) &&
-    typeof value.filePath === "string" &&
-    isSourceRange(value.range) &&
-    isOptionalString(value.parentSymbolId) &&
-    isStringArray(value.childSymbolIds)
-  )
+  if (!isObject(value)) {
+    return false
+  }
+  return allPass([
+    typeof value.id === "string",
+    typeof value.name === "string",
+    SYMBOL_KINDS.includes(value.kind),
+    typeof value.filePath === "string",
+    isSourceRange(value.range),
+    isOptionalString(value.parentSymbolId),
+    isStringArray(value.childSymbolIds),
+  ])
 }
 
 function isSourceRange(value: unknown) {
@@ -1073,10 +968,22 @@ function isNumberArray(value: unknown) {
   return Array.isArray(value) && value.every((item) => typeof item === "number")
 }
 
+function isOptionalNumberArray(value: unknown) {
+  return value === undefined || isNumberArray(value)
+}
+
 function isNonnegativeNumber(value: unknown) {
   return typeof value === "number" && value >= 0
 }
 
 function isOptionalString(value: unknown) {
   return value === undefined || typeof value === "string"
+}
+
+function isOptionalNumber(value: unknown) {
+  return value === undefined || typeof value === "number"
+}
+
+function allPass(checks: boolean[]) {
+  return checks.every(Boolean)
 }

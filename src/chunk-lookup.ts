@@ -1,4 +1,10 @@
-import { expandWithParentContext, summarizeChunk, summarizeTopology } from "./topology.js"
+import {
+  chunkBreadcrumbs,
+  chunkMatchesSource,
+  expandWithParentContext,
+  summarizeChunk,
+  summarizeTopology,
+} from "./topology.js"
 import type {
   CastIndex,
   ChunkLookupChildrenPage,
@@ -73,8 +79,6 @@ async function getChunkById(input: {
   }
 }
 
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
 const DEFAULT_CHILDREN_LIMIT = 20
 
 type SourceReadResult = { text: string; ok: true } | { text: ""; ok: false }
@@ -88,10 +92,10 @@ function parentContext(input: {
   source: SourceReadResult
 }): { breadcrumbs: string[]; parentText?: string; parentRange?: ChunkRecord["range"] } {
   if (input.includeParents === false) {
-    return { breadcrumbs: breadcrumbsFor(input.chunk, input.index.symbols) }
+    return { breadcrumbs: chunkBreadcrumbs(input.chunk, input.index.symbols) }
   }
 
-  if (input.source.ok && indexedChunkMatchesSource(input.source.text, input.chunk)) {
+  if (input.source.ok && chunkMatchesSource(input.source.text, input.chunk)) {
     return expandWithParentContext({
       chunk: input.chunk,
       symbols: input.index.symbols,
@@ -104,7 +108,7 @@ function parentContext(input: {
   } else {
     input.diagnostics.push(`source read failed for ${input.chunk.filePath}; parent context omitted`)
   }
-  return { breadcrumbs: breadcrumbsFor(input.chunk, input.index.symbols) }
+  return { breadcrumbs: chunkBreadcrumbs(input.chunk, input.index.symbols) }
 }
 
 async function relatedChunks(input: {
@@ -222,7 +226,7 @@ function validatedChunkText(
     diagnostics.push(`source read failed for ${chunk.filePath}:${chunk.id}; ${omittedReason}`)
     return ""
   }
-  if (!indexedChunkMatchesSource(source.text, chunk)) {
+  if (!chunkMatchesSource(source.text, chunk)) {
     diagnostics.push(`source mismatch for ${chunk.filePath}:${chunk.id}; ${omittedReason}`)
     return ""
   }
@@ -243,18 +247,6 @@ function readSourceCached(
     .catch((): SourceReadResult => ({ text: "", ok: false }))
   sourceCache.set(filePath, source)
   return source
-}
-
-function indexedChunkMatchesSource(source: string, chunk: ChunkRecord) {
-  return textForByteSlice(source, chunk.range.byteStart, chunk.range.byteEnd) === chunk.text
-}
-
-function breadcrumbsFor(chunk: ChunkRecord, symbols: CastIndex["symbols"]) {
-  return chunk.symbolIds.flatMap((id) => (symbols[id] ? [`${symbols[id].kind} ${symbols[id].name}`] : []))
-}
-
-function textForByteSlice(source: string, byteStart: number, byteEnd: number) {
-  return decoder.decode(encoder.encode(source).slice(byteStart, byteEnd))
 }
 
 export { getChunkById }

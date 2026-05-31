@@ -1,9 +1,7 @@
 import { fallbackChunks } from "./fallback.js"
-import { nonWhitespaceLength, rangeForSlice, stableChunkId } from "./range.js"
+import { nonWhitespaceLength, rangeForSlice, stableChunkId, textForByteSlice } from "./range.js"
 import type { ChunkingOptions, ChunkKind, ChunkRecord } from "./types.js"
 
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
 const IDENTIFIER_PATTERN = /[A-Za-z_$][\w$]*/
 const PUNCTUATION_OR_SYMBOL_PATTERN = /^[\p{P}\p{S}\s]+$/u
 
@@ -200,13 +198,25 @@ function parentMetadataForRange(byteStart: number, byteEnd: number, left: ChunkW
 
   const parentByteStart = left.parentByteStart ?? right.parentByteStart
   const parentByteEnd = left.parentByteEnd ?? right.parentByteEnd
-  if (parentByteStart === undefined || parentByteEnd === undefined) {
+  const parentBounds = { parentByteStart, parentByteEnd }
+  if (!hasParentBounds(parentBounds)) {
     return { parentChunkId }
   }
-  if (byteStart < parentByteStart || byteEnd > parentByteEnd) {
+  if (!rangeWithinParent(byteStart, byteEnd, parentBounds.parentByteStart, parentBounds.parentByteEnd)) {
     return {}
   }
-  return { parentChunkId, parentByteStart, parentByteEnd }
+  return { parentChunkId, parentByteStart: parentBounds.parentByteStart, parentByteEnd: parentBounds.parentByteEnd }
+}
+
+function hasParentBounds(input: { parentByteStart: number | undefined; parentByteEnd: number | undefined }): input is {
+  parentByteStart: number
+  parentByteEnd: number
+} {
+  return input.parentByteStart !== undefined && input.parentByteEnd !== undefined
+}
+
+function rangeWithinParent(byteStart: number, byteEnd: number, parentByteStart: number, parentByteEnd: number) {
+  return byteStart >= parentByteStart && byteEnd <= parentByteEnd
 }
 
 function normalizeTrivialWindows(
@@ -361,8 +371,4 @@ function kindFor(nodeTypes: string[]) {
     return "function"
   }
   return "block"
-}
-
-function textForByteSlice(source: string, byteStart: number, byteEnd: number) {
-  return decoder.decode(encoder.encode(source).slice(byteStart, byteEnd))
 }

@@ -9,12 +9,12 @@ import { buildLexicalIndex } from "./lexical.js"
 import { assignSymbolsToChunks, attachTopology, extractSymbols } from "./topology.js"
 import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, SymbolRecord } from "./types.js"
 
-type FileResult = {
+export type FileResult = {
   file: FileRecord
   chunks: Record<string, ChunkRecord>
   symbols: Record<string, SymbolRecord>
 }
-type Store = {
+export type Store = {
   read(): Promise<CastIndex>
   write(index: CastIndex): Promise<void>
   beginIndexRun?(input: { configHash: string; metadata: CastIndex["metadata"] }): Promise<{ runId: string }>
@@ -23,6 +23,17 @@ type Store = {
   activateRun?(runId: string, index: CastIndex): Promise<void>
 }
 type GitignoreMatcher = { base: string; matcher: Ignore }
+type CreateIndexerInput = Parameters<typeof createIndexer>[0]
+type IndexRunStore = Store &
+  Required<Pick<Store, "beginIndexRun" | "getCompletedFile" | "writeFileResult" | "activateRun">>
+type RefreshState = {
+  nextFiles: CastIndex["files"]
+  nextChunks: CastIndex["chunks"]
+  nextSymbols: CastIndex["symbols"]
+  metadataDiagnostics: string[]
+  canReuseExistingRecords: boolean
+  changed: boolean
+}
 const BINARY_SAMPLE_BYTES = Number("16") * Number("1024")
 const BYTE_NUL = 0
 const BYTE_BACKSPACE = 8
@@ -84,117 +95,24 @@ export function createIndexer(input: {
       }
 
       for (const relativePath of files) {
-        const absolutePath = path.join(input.worktree, relativePath)
-        const file = Bun.file(absolutePath)
-        const skipDiagnostic = await skipFileDiagnostic(relativePath, file, input.options.maxFileBytes)
-        if (skipDiagnostic) {
-          metadataDiagnostics.push(skipDiagnostic)
-          continue
-        }
-        const currentFingerprint = await fingerprint(absolutePath)
-        const previousFile = index.files[relativePath]
-        if (canReuseFile(index, previousFile, relativePath, currentFingerprint, canReuseExistingRecords)) {
-          nextFiles[relativePath] = previousFile
-          for (const chunkId of previousFile.chunkIds) {
-            if (index.chunks[chunkId]) {
-              nextChunks[chunkId] = index.chunks[chunkId]
-            }
-          }
-          for (const symbol of Object.values(index.symbols).filter((symbol) => symbol.filePath === relativePath)) {
-            nextSymbols[symbol.id] = symbol
-          }
-          continue
-        }
-        changed = true
-        const activeRun = await ensureRun()
-        if (activeRun && runStore) {
-          const completed = await runStore.getCompletedFile(activeRun.runId, relativePath, currentFingerprint)
-          if (completed) {
-            const completedIndex = {
-              ...index,
-              files: { [relativePath]: completed.file },
-              chunks: completed.chunks,
-              symbols: completed.symbols,
-            }
-            if (canReuseFile(completedIndex, completed.file, relativePath, currentFingerprint, true)) {
-              nextFiles[relativePath] = completed.file
-              Object.assign(nextChunks, completed.chunks)
-              Object.assign(nextSymbols, completed.symbols)
-              continue
-            }
-          }
-        }
-
-        const text = await Bun.file(absolutePath).text()
-        const parsed = await input.parse(absolutePath, text).catch((error) => ({
-          language: "text",
-          root: undefined,
-          diagnostic: String(error),
-        }))
-        const rawChunks = parsed.root
-          ? castChunks({
-              filePath: relativePath,
-              language: parsed.language,
-              source: text,
-              root: parsed.root,
-              maxNonWhitespaceChars: input.options.maxChunkNonWhitespaceChars,
-              chunking: input.options.chunking,
-            })
-          : fallbackChunks({
-              filePath: relativePath,
-              language: parsed.language,
-              text,
-              maxNonWhitespaceChars: input.options.maxChunkNonWhitespaceChars,
-            })
-        const symbols = parsed.root
-          ? extractSymbols({ filePath: relativePath, source: text, nodes: parsed.root.children })
-          : []
-        const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]))
-        const chunks = attachTopology(assignSymbolsToChunks(rawChunks, symbolsById), symbolsById)
-        const fileDiagnostics = "diagnostic" in parsed ? [String(parsed.diagnostic)] : []
-
-        const fileChunks: CastIndex["chunks"] = {}
-        for (const chunk of chunks) {
-          const embedded = await input
-            .embed(embeddingText(relativePath, parsed.language, chunk, symbolsById, input.options.chunking.expansion))
-            .then((embedding) => ({ embedding }))
-            .catch((error) => ({ embeddingError: error instanceof Error ? error.message : String(error) }))
-          if ("embeddingError" in embedded) {
-            fileDiagnostics.push(`embedding failed: ${embedded.embeddingError}`)
-          }
-          fileChunks[chunk.id] = { ...chunk, ...embedded }
-        }
-        Object.assign(nextChunks, fileChunks)
-        for (const symbol of symbols) {
-          nextSymbols[symbol.id] = symbol
-        }
-        const fileRecord = {
-          path: relativePath,
-          language: parsed.language,
-          fingerprint: currentFingerprint,
-          chunkIds: chunks.map((chunk) => chunk.id),
-          diagnostics: fileDiagnostics,
-        }
-        nextFiles[relativePath] = fileRecord
-        if (run && runStore) {
-          await runStore.writeFileResult(run.runId, {
-            file: fileRecord,
-            chunks: fileChunks,
-            symbols: Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol])),
-          })
-        }
+        await processScannedFile({
+          input,
+          index,
+          state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
+          relativePath,
+          runStore,
+          run: () => run,
+          ensureRun,
+        }).then((nextChanged) => {
+          changed = nextChanged
+        })
       }
 
       const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols)
       const hasFileSetChange = !sameStringArray(Object.keys(index.files).sort(), Object.keys(nextFiles).sort())
       const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, metadataDiagnostics)
       if (
-        index.metadata.status === "ready" &&
-        !changed &&
-        !hasFileSetChange &&
-        !hasDiagnosticsChange &&
-        index.metadata.worktree === input.worktree &&
-        canReuseExistingRecords
+        canSkipRefresh(index, input.worktree, changed, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange)
       ) {
         return index
       }
@@ -209,19 +127,224 @@ export function createIndexer(input: {
       index.metadata.diagnostics = metadataDiagnostics
       index.metadata.status = "ready"
       index.metadata.updatedAt = Date.now()
-      if (run && runStore) {
-        await runStore.activateRun(run.runId, index)
-      } else if (runStore) {
-        const activeRun = await ensureRun()
-        if (activeRun) {
-          await runStore.activateRun(activeRun.runId, index)
-        }
-      } else {
-        await store.write(index)
-      }
+      await persistRefreshedIndex({ index, store, runStore, run: () => run, ensureRun })
       return index
     },
   }
+}
+
+function canSkipRefresh(
+  index: CastIndex,
+  worktree: string,
+  changed: boolean,
+  canReuseExistingRecords: boolean,
+  hasFileSetChange: boolean,
+  hasDiagnosticsChange: boolean,
+) {
+  return (
+    index.metadata.status === "ready" &&
+    !changed &&
+    unchangedIndexShape(index, worktree, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange)
+  )
+}
+
+function unchangedIndexShape(
+  index: CastIndex,
+  worktree: string,
+  canReuseExistingRecords: boolean,
+  hasFileSetChange: boolean,
+  hasDiagnosticsChange: boolean,
+) {
+  return [
+    !hasFileSetChange,
+    !hasDiagnosticsChange,
+    index.metadata.worktree === worktree,
+    canReuseExistingRecords,
+  ].every(Boolean)
+}
+
+async function persistRefreshedIndex(input: {
+  index: CastIndex
+  store: Store
+  runStore: IndexRunStore | undefined
+  run: () => { runId: string } | undefined
+  ensureRun: () => Promise<{ runId: string } | undefined>
+}) {
+  const run = input.run() ?? (input.runStore ? await input.ensureRun() : undefined)
+  if (run && input.runStore) {
+    await input.runStore.activateRun(run.runId, input.index)
+    return
+  }
+  await input.store.write(input.index)
+}
+
+async function processScannedFile(input: {
+  input: CreateIndexerInput
+  index: CastIndex
+  state: RefreshState
+  relativePath: string
+  runStore: IndexRunStore | undefined
+  run: () => { runId: string } | undefined
+  ensureRun: () => Promise<{ runId: string } | undefined>
+}) {
+  const absolutePath = path.join(input.input.worktree, input.relativePath)
+  const file = Bun.file(absolutePath)
+  const skipDiagnostic = await skipFileDiagnostic(input.relativePath, file, input.input.options.maxFileBytes)
+  if (skipDiagnostic) {
+    input.state.metadataDiagnostics.push(skipDiagnostic)
+    return input.state.changed
+  }
+  const currentFingerprint = await fingerprint(absolutePath)
+  const previousFile = input.index.files[input.relativePath]
+  if (
+    canReuseFile(input.index, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords)
+  ) {
+    reuseFileRecords(input.index, previousFile, input.state)
+    return input.state.changed
+  }
+
+  const activeRun = await input.ensureRun()
+  const completed = activeRun
+    ? await completedFileResult(input.runStore, activeRun.runId, input.relativePath, currentFingerprint)
+    : undefined
+  if (completed && canReuseCompletedFile(input.index, completed, input.relativePath, currentFingerprint)) {
+    reuseCompletedFileRecords(completed, input.state)
+    return true
+  }
+
+  await indexFile({ ...input, absolutePath, currentFingerprint })
+  return true
+}
+
+function reuseFileRecords(index: CastIndex, file: FileRecord, state: RefreshState) {
+  state.nextFiles[file.path] = file
+  for (const chunkId of file.chunkIds) {
+    if (index.chunks[chunkId]) {
+      state.nextChunks[chunkId] = index.chunks[chunkId]
+    }
+  }
+  for (const symbol of Object.values(index.symbols).filter((symbol) => symbol.filePath === file.path)) {
+    state.nextSymbols[symbol.id] = symbol
+  }
+}
+
+function completedFileResult(
+  runStore: IndexRunStore | undefined,
+  runId: string,
+  relativePath: string,
+  currentFingerprint: string,
+) {
+  return runStore?.getCompletedFile(runId, relativePath, currentFingerprint)
+}
+
+function canReuseCompletedFile(
+  index: CastIndex,
+  completed: FileResult,
+  relativePath: string,
+  currentFingerprint: string,
+) {
+  const completedIndex = {
+    ...index,
+    files: { [relativePath]: completed.file },
+    chunks: completed.chunks,
+    symbols: completed.symbols,
+  }
+  return canReuseFile(completedIndex, completed.file, relativePath, currentFingerprint, true)
+}
+
+function reuseCompletedFileRecords(completed: FileResult, state: RefreshState) {
+  state.nextFiles[completed.file.path] = completed.file
+  Object.assign(state.nextChunks, completed.chunks)
+  Object.assign(state.nextSymbols, completed.symbols)
+}
+
+async function indexFile(input: {
+  input: CreateIndexerInput
+  state: RefreshState
+  relativePath: string
+  absolutePath: string
+  currentFingerprint: string
+  runStore: IndexRunStore | undefined
+  run: () => { runId: string } | undefined
+}) {
+  const text = await Bun.file(input.absolutePath).text()
+  const parsed = await input.input.parse(input.absolutePath, text).catch((error) => ({
+    language: "text",
+    root: undefined,
+    diagnostic: String(error),
+  }))
+  const rawChunks = parsed.root
+    ? castChunks({
+        filePath: input.relativePath,
+        language: parsed.language,
+        source: text,
+        root: parsed.root,
+        maxNonWhitespaceChars: input.input.options.maxChunkNonWhitespaceChars,
+        chunking: input.input.options.chunking,
+      })
+    : fallbackChunks({
+        filePath: input.relativePath,
+        language: parsed.language,
+        text,
+        maxNonWhitespaceChars: input.input.options.maxChunkNonWhitespaceChars,
+      })
+  const symbols = parsed.root
+    ? extractSymbols({ filePath: input.relativePath, source: text, nodes: parsed.root.children })
+    : []
+  const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]))
+  const chunks = attachTopology(assignSymbolsToChunks(rawChunks, symbolsById), symbolsById)
+  const fileDiagnostics = "diagnostic" in parsed ? [String(parsed.diagnostic)] : []
+  const fileChunks = await embedChunks({ ...input, parsed, chunks, symbolsById, fileDiagnostics })
+  Object.assign(input.state.nextChunks, fileChunks)
+  for (const symbol of symbols) {
+    input.state.nextSymbols[symbol.id] = symbol
+  }
+  const fileRecord = {
+    path: input.relativePath,
+    language: parsed.language,
+    fingerprint: input.currentFingerprint,
+    chunkIds: chunks.map((chunk) => chunk.id),
+    diagnostics: fileDiagnostics,
+  }
+  input.state.nextFiles[input.relativePath] = fileRecord
+  const run = input.run()
+  if (run && input.runStore) {
+    await input.runStore.writeFileResult(run.runId, {
+      file: fileRecord,
+      chunks: fileChunks,
+      symbols: Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol])),
+    })
+  }
+}
+
+async function embedChunks(input: {
+  input: CreateIndexerInput
+  relativePath: string
+  parsed: { language: string }
+  chunks: ChunkRecord[]
+  symbolsById: Record<string, SymbolRecord>
+  fileDiagnostics: string[]
+}) {
+  const fileChunks: CastIndex["chunks"] = {}
+  for (const chunk of input.chunks) {
+    const embedded = await input.input
+      .embed(
+        embeddingText(
+          input.relativePath,
+          input.parsed.language,
+          chunk,
+          input.symbolsById,
+          input.input.options.chunking.expansion,
+        ),
+      )
+      .then((embedding) => ({ embedding }))
+      .catch((error) => ({ embeddingError: error instanceof Error ? error.message : String(error) }))
+    if ("embeddingError" in embedded) {
+      input.fileDiagnostics.push(`embedding failed: ${embedded.embeddingError}`)
+    }
+    fileChunks[chunk.id] = { ...chunk, ...embedded }
+  }
+  return fileChunks
 }
 
 function hasRunStore(
@@ -283,19 +406,18 @@ function isProbablyBinary(bytes: Uint8Array) {
     if (byte === BYTE_NUL) {
       return true
     }
-    if (
-      byte < CONTROL_BYTE_LIMIT &&
-      byte !== BYTE_BACKSPACE &&
-      byte !== BYTE_TAB &&
-      byte !== BYTE_LINE_FEED &&
-      byte !== BYTE_FORM_FEED &&
-      byte !== BYTE_CARRIAGE_RETURN
-    ) {
+    if (byte < CONTROL_BYTE_LIMIT && !isTextControlByte(byte)) {
       suspicious++
     }
   }
   return suspicious / bytes.length > BINARY_CONTROL_RATIO
 }
+
+function isTextControlByte(byte: number) {
+  return TEXT_CONTROL_BYTES.has(byte)
+}
+
+const TEXT_CONTROL_BYTES = new Set([BYTE_BACKSPACE, BYTE_TAB, BYTE_LINE_FEED, BYTE_FORM_FEED, BYTE_CARRIAGE_RETURN])
 
 function canReuseFile(
   index: CastIndex,
@@ -328,14 +450,30 @@ function canReuseFile(
   }
   return Object.values(index.symbols)
     .filter((symbol) => symbol.filePath === file.path)
-    .every(
-      (symbol) =>
-        index.symbols[symbol.id]?.id === symbol.id &&
-        (!symbol.parentSymbolId ||
-          (index.symbols[symbol.parentSymbolId]?.id === symbol.parentSymbolId &&
-            index.symbols[symbol.parentSymbolId]?.filePath === file.path)) &&
-        symbol.childSymbolIds.every((id) => index.symbols[id]?.id === id && index.symbols[id]?.filePath === file.path),
-    )
+    .every((symbol) => validSymbolRecord(index, symbol, file.path))
+}
+
+function validSymbolRecord(index: CastIndex, symbol: SymbolRecord, filePath: string) {
+  return validSymbolIdentity(index, symbol, filePath) && validSymbolRelations(index, symbol, filePath)
+}
+
+function validSymbolIdentity(index: CastIndex, symbol: SymbolRecord, filePath: string) {
+  return index.symbols[symbol.id]?.id === symbol.id && index.symbols[symbol.id]?.filePath === filePath
+}
+
+function validSymbolRelations(index: CastIndex, symbol: SymbolRecord, filePath: string) {
+  return (
+    validParentSymbol(index, symbol, filePath) &&
+    symbol.childSymbolIds.every((id) => validSymbolId(index, id, filePath))
+  )
+}
+
+function validParentSymbol(index: CastIndex, symbol: SymbolRecord, filePath: string) {
+  return !symbol.parentSymbolId || validSymbolId(index, symbol.parentSymbolId, filePath)
+}
+
+function validSymbolId(index: CastIndex, id: string, filePath: string) {
+  return index.symbols[id]?.id === id && index.symbols[id]?.filePath === filePath
 }
 
 function sameChunkingOptions(left: ChunkingOptions | undefined, right: ChunkingOptions) {
@@ -351,14 +489,17 @@ function sameStringArray(left: string[], right: string[]) {
 }
 
 function hasDanglingChunkReference(index: CastIndex, chunk: CastIndex["chunks"][string], chunkIds: Set<string>) {
-  return Boolean(
-    (chunk.parentChunkId && !(chunkIds.has(chunk.parentChunkId) && index.chunks[chunk.parentChunkId])) ||
-      (chunk.previousSiblingChunkId &&
-        !(chunkIds.has(chunk.previousSiblingChunkId) && index.chunks[chunk.previousSiblingChunkId])) ||
-      (chunk.nextSiblingChunkId &&
-        !(chunkIds.has(chunk.nextSiblingChunkId) && index.chunks[chunk.nextSiblingChunkId])) ||
-      chunk.childChunkIds.some((id) => !(chunkIds.has(id) && index.chunks[id])),
+  return referencedChunkIds(chunk).some((id) => !validChunkReference(index, chunkIds, id))
+}
+
+function referencedChunkIds(chunk: CastIndex["chunks"][string]) {
+  return [chunk.parentChunkId, chunk.previousSiblingChunkId, chunk.nextSiblingChunkId, ...chunk.childChunkIds].filter(
+    (id): id is string => Boolean(id),
   )
+}
+
+function validChunkReference(index: CastIndex, chunkIds: Set<string>, id: string) {
+  return chunkIds.has(id) && Boolean(index.chunks[id])
 }
 
 function embeddingText(

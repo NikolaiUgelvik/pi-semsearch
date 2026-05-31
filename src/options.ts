@@ -51,6 +51,7 @@ const OptionsSchema = z.object({
   includeGlobs: z.array(z.string()).optional(),
   excludeGlobs: z.array(z.string()).optional(),
 })
+const OptionsRecord = z.record(z.string(), z.unknown())
 
 const OptionFields = OptionsSchema.shape
 const ApiFields = ApiConfig.shape
@@ -89,140 +90,207 @@ const DEFAULT_EXCLUDE_GLOBS = [
   "**/*.min.js",
   "**/*.map",
 ]
-
-export type CastPluginOptions = ReturnType<typeof parseOptions>
+const DEFAULT_RESULT_OPTIONS = {
+  maxChunkNonWhitespaceChars: DEFAULT_MAX_CHUNK_NON_WHITESPACE_CHARS,
+  maxFileBytes: DEFAULT_MAX_FILE_BYTES,
+  maxContextChars: DEFAULT_MAX_CONTEXT_CHARS,
+  topK: DEFAULT_TOP_K,
+  includeGlobs: ["**/*"],
+  excludeGlobs: DEFAULT_EXCLUDE_GLOBS,
+}
 
 export function parseOptions(input: unknown, env: Record<string, string | undefined> = process.env) {
-  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  const inputRecord = parseInputRecord(input)
+  const parsed = parseOptionFields(inputRecord.success ? inputRecord.data : {})
+  const diagnostics = diagnosticsForOptions(inputRecord, parsed)
+  const raw = rawOptions(inputRecord.success ? inputRecord.data : {}, parsed)
+  return assembleOptions(raw, diagnostics, env)
+}
+
+function parseInputRecord(input: unknown) {
+  return OptionsRecord.safeParse(input ?? {})
+}
+
+function parseOptionFields(data: Record<string, unknown>) {
+  return {
+    embedding: OptionFields.embedding.safeParse(data.embedding),
+    hyde: OptionFields.hyde.safeParse(data.hyde),
+    rerank: OptionFields.rerank.safeParse(data.rerank),
+    retrieval: OptionFields.retrieval.safeParse(data.retrieval),
+    chunking: OptionFields.chunking.safeParse(data.chunking),
+    maxChunkNonWhitespaceChars: OptionFields.maxChunkNonWhitespaceChars.safeParse(data.maxChunkNonWhitespaceChars),
+    maxFileBytes: OptionFields.maxFileBytes.safeParse(data.maxFileBytes),
+    maxContextChars: OptionFields.maxContextChars.safeParse(data.maxContextChars),
+    topK: OptionFields.topK.safeParse(data.topK),
+    cacheDir: OptionFields.cacheDir.safeParse(data.cacheDir),
+    includeGlobs: OptionFields.includeGlobs.safeParse(data.includeGlobs),
+    excludeGlobs: OptionFields.excludeGlobs.safeParse(data.excludeGlobs),
+  }
+}
+
+function diagnosticsForOptions(
+  inputRecord: ReturnType<typeof parseInputRecord>,
+  parsed: ReturnType<typeof parseOptionFields>,
+) {
   const diagnostics = inputRecord.success
     ? []
     : inputRecord.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`)
-  const parsed = {
-    embedding: OptionFields.embedding.safeParse(inputRecord.success ? inputRecord.data.embedding : undefined),
-    hyde: OptionFields.hyde.safeParse(inputRecord.success ? inputRecord.data.hyde : undefined),
-    rerank: OptionFields.rerank.safeParse(inputRecord.success ? inputRecord.data.rerank : undefined),
-    retrieval: OptionFields.retrieval.safeParse(inputRecord.success ? inputRecord.data.retrieval : undefined),
-    chunking: OptionFields.chunking.safeParse(inputRecord.success ? inputRecord.data.chunking : undefined),
-    maxChunkNonWhitespaceChars: OptionFields.maxChunkNonWhitespaceChars.safeParse(
-      inputRecord.success ? inputRecord.data.maxChunkNonWhitespaceChars : undefined,
-    ),
-    maxFileBytes: OptionFields.maxFileBytes.safeParse(inputRecord.success ? inputRecord.data.maxFileBytes : undefined),
-    maxContextChars: OptionFields.maxContextChars.safeParse(
-      inputRecord.success ? inputRecord.data.maxContextChars : undefined,
-    ),
-    topK: OptionFields.topK.safeParse(inputRecord.success ? inputRecord.data.topK : undefined),
-    cacheDir: OptionFields.cacheDir.safeParse(inputRecord.success ? inputRecord.data.cacheDir : undefined),
-    includeGlobs: OptionFields.includeGlobs.safeParse(inputRecord.success ? inputRecord.data.includeGlobs : undefined),
-    excludeGlobs: OptionFields.excludeGlobs.safeParse(inputRecord.success ? inputRecord.data.excludeGlobs : undefined),
-  }
-  const raw = {
-    embedding: parsed.embedding.success
-      ? parsed.embedding.data
-      : parseApiConfig(inputRecord.success ? inputRecord.data.embedding : undefined),
-    hyde: parsed.hyde.success
-      ? parsed.hyde.data
-      : parseHydeConfig(inputRecord.success ? inputRecord.data.hyde : undefined),
-    rerank: parsed.rerank.success
-      ? parsed.rerank.data
-      : parseRerankConfig(inputRecord.success ? inputRecord.data.rerank : undefined),
-    retrieval: parsed.retrieval.success
-      ? parsed.retrieval.data
-      : parseRetrievalOptions(inputRecord.success ? inputRecord.data.retrieval : undefined),
-    chunking: parsed.chunking.success
-      ? parsed.chunking.data
-      : parseChunkingOptions(inputRecord.success ? inputRecord.data.chunking : undefined),
-    maxChunkNonWhitespaceChars: parsed.maxChunkNonWhitespaceChars.success
-      ? parsed.maxChunkNonWhitespaceChars.data
-      : undefined,
-    maxFileBytes: parsed.maxFileBytes.success ? parsed.maxFileBytes.data : undefined,
-    maxContextChars: parsed.maxContextChars.success ? parsed.maxContextChars.data : undefined,
-    topK: parsed.topK.success ? parsed.topK.data : undefined,
-    cacheDir: parsed.cacheDir.success ? parsed.cacheDir.data : undefined,
-    includeGlobs: parsed.includeGlobs.success ? parsed.includeGlobs.data : undefined,
-    excludeGlobs: parsed.excludeGlobs.success ? parsed.excludeGlobs.data : undefined,
-  }
   for (const [key, result] of Object.entries(parsed)) {
-    if (result.success) {
-      continue
+    if (!result.success) {
+      diagnostics.push(...result.error.issues.map((issue) => diagnosticMessage(key, issue)))
     }
-    diagnostics.push(
-      ...result.error.issues.map((issue) => `${[key, ...issue.path].filter(Boolean).join(".")}: ${issue.message}`),
-    )
   }
-  const embeddingApiKey = resolveSecret(raw.embedding?.apiKey, raw.embedding?.apiKeyEnv, env)
-  const rerankApiKey = resolveSecret(raw.rerank?.apiKey, raw.rerank?.apiKeyEnv, env)
-  const embedding =
-    raw.embedding?.baseURL && raw.embedding.model
-      ? {
-          baseURL: raw.embedding.baseURL,
-          apiKey: embeddingApiKey,
-          model: raw.embedding.model,
-          dimensions: raw.embedding.dimensions,
-        }
-      : undefined
-  const hasEmbeddingConfig = Boolean(embedding?.baseURL && embedding.model)
-  const hydeHasExplicitOpenAiConfig = Boolean(raw.hyde?.baseURL && raw.hyde?.model)
-  const hydeEnabled = raw.hyde?.enabled ?? hasEmbeddingConfig
-  const hydeMode: HydeOptions["mode"] = hydeHasExplicitOpenAiConfig ? "openai-compatible" : "opencode"
-  const hyde: HydeOptions = {
-    mode: hydeMode,
-    baseURL: hydeMode === "openai-compatible" ? raw.hyde?.baseURL : undefined,
-    apiKey: hydeMode === "openai-compatible" ? resolveSecret(raw.hyde?.apiKey, raw.hyde?.apiKeyEnv, env) : undefined,
-    model: hydeMode === "openai-compatible" ? raw.hyde?.model : undefined,
-    threshold: raw.hyde?.threshold ?? DEFAULT_HYDE_THRESHOLD,
-    enabled: hydeEnabled,
-  }
+  return diagnostics
+}
 
-  if (!raw.embedding?.baseURL) {
-    diagnostics.push("embedding.baseURL is required")
+function diagnosticMessage(key: string, issue: z.ZodIssue) {
+  return `${[key, ...issue.path].filter(Boolean).join(".")}: ${issue.message}`
+}
+
+function rawOptions(data: Record<string, unknown>, parsed: ReturnType<typeof parseOptionFields>) {
+  return {
+    embedding: parsedValue(parsed.embedding) ?? parseApiConfig(data.embedding),
+    hyde: parsedValue(parsed.hyde) ?? parseHydeConfig(data.hyde),
+    rerank: parsedValue(parsed.rerank) ?? parseRerankConfig(data.rerank),
+    retrieval: parsedValue(parsed.retrieval) ?? parseRetrievalOptions(data.retrieval),
+    chunking: parsedValue(parsed.chunking) ?? parseChunkingOptions(data.chunking),
+    maxChunkNonWhitespaceChars: parsedValue(parsed.maxChunkNonWhitespaceChars),
+    maxFileBytes: parsedValue(parsed.maxFileBytes),
+    maxContextChars: parsedValue(parsed.maxContextChars),
+    topK: parsedValue(parsed.topK),
+    cacheDir: parsedValue(parsed.cacheDir),
+    includeGlobs: parsedValue(parsed.includeGlobs),
+    excludeGlobs: parsedValue(parsed.excludeGlobs),
   }
-  if (!raw.embedding?.model) {
-    diagnostics.push("embedding.model is required")
-  }
+}
+
+function parsedValue<T>(result: { success: true; data: T } | { success: false }) {
+  return result.success ? result.data : undefined
+}
+
+function assembleOptions(
+  raw: ReturnType<typeof rawOptions>,
+  diagnostics: string[],
+  env: Record<string, string | undefined>,
+) {
+  const embedding = embeddingOptions(raw.embedding, apiKeyOption(raw.embedding, env))
+  const hyde = hydeOptions(raw.hyde, hasEmbedding(embedding), env)
+  addEmbeddingDiagnostics(raw.embedding, diagnostics)
 
   return {
     embedding,
     hyde,
-    rerank:
-      raw.rerank?.baseURL && raw.rerank.model
-        ? {
-            baseURL: raw.rerank.baseURL,
-            apiKey: rerankApiKey,
-            model: raw.rerank.model,
-            candidateMultiplier: raw.rerank.candidateMultiplier ?? DEFAULT_RERANK_CANDIDATE_MULTIPLIER,
-          }
-        : undefined,
-    retrieval: {
-      hybrid: {
-        enabled: raw.retrieval?.hybrid?.enabled ?? DEFAULT_HYBRID_OPTIONS.enabled,
-        mode: raw.retrieval?.hybrid?.mode ?? DEFAULT_HYBRID_OPTIONS.mode,
-        rrfK: raw.retrieval?.hybrid?.rrfK ?? DEFAULT_HYBRID_OPTIONS.rrfK,
-        vectorCandidateMultiplier:
-          raw.retrieval?.hybrid?.vectorCandidateMultiplier ?? DEFAULT_HYBRID_OPTIONS.vectorCandidateMultiplier,
-        bm25CandidateMultiplier:
-          raw.retrieval?.hybrid?.bm25CandidateMultiplier ?? DEFAULT_HYBRID_OPTIONS.bm25CandidateMultiplier,
-        vectorWeight: raw.retrieval?.hybrid?.vectorWeight ?? DEFAULT_HYBRID_OPTIONS.vectorWeight,
-        bm25Weight: raw.retrieval?.hybrid?.bm25Weight ?? DEFAULT_HYBRID_OPTIONS.bm25Weight,
-      },
-    },
-    chunking: {
-      overlap: raw.chunking?.overlap ?? DEFAULT_CHUNKING_OPTIONS.overlap,
-      expansion: raw.chunking?.expansion ?? DEFAULT_CHUNKING_OPTIONS.expansion,
-      minSemanticNonWhitespaceChars:
-        raw.chunking?.minSemanticNonWhitespaceChars ?? DEFAULT_CHUNKING_OPTIONS.minSemanticNonWhitespaceChars,
-    },
-    maxChunkNonWhitespaceChars: raw.maxChunkNonWhitespaceChars ?? DEFAULT_MAX_CHUNK_NON_WHITESPACE_CHARS,
-    maxFileBytes: raw.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
-    maxContextChars: raw.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS,
-    topK: raw.topK ?? DEFAULT_TOP_K,
-    cacheDir:
-      raw.cacheDir ??
-      env.OPENCODE_CAST_CACHE_DIR ??
-      path.join(env.XDG_CACHE_HOME ?? path.join(env.HOME ?? process.cwd(), ".cache"), "opencode", "cast"),
-    includeGlobs: raw.includeGlobs ?? ["**/*"],
-    excludeGlobs: raw.excludeGlobs ?? DEFAULT_EXCLUDE_GLOBS,
+    rerank: rerankOptions(raw.rerank, apiKeyOption(raw.rerank, env)),
+    retrieval: { hybrid: hybridOptions(raw.retrieval?.hybrid) },
+    chunking: chunkingOptions(raw.chunking),
+    ...resultOptions(raw),
+    cacheDir: cacheDirOption(raw.cacheDir, env),
     diagnostics,
   }
+}
+
+function apiKeyOption(
+  raw: { apiKey?: string; apiKeyEnv?: string } | undefined,
+  env: Record<string, string | undefined>,
+) {
+  return resolveSecret(raw?.apiKey, raw?.apiKeyEnv, env)
+}
+
+function hasEmbedding(embedding: ReturnType<typeof embeddingOptions>) {
+  return Boolean(embedding)
+}
+
+function resultOptions(raw: ReturnType<typeof rawOptions>) {
+  return { ...DEFAULT_RESULT_OPTIONS, ...definedProperties(selectResultOptions(raw)) }
+}
+
+function selectResultOptions(raw: ReturnType<typeof rawOptions>) {
+  return {
+    maxChunkNonWhitespaceChars: raw.maxChunkNonWhitespaceChars,
+    maxFileBytes: raw.maxFileBytes,
+    maxContextChars: raw.maxContextChars,
+    topK: raw.topK,
+    includeGlobs: raw.includeGlobs,
+    excludeGlobs: raw.excludeGlobs,
+  }
+}
+
+function addEmbeddingDiagnostics(raw: ReturnType<typeof rawOptions>["embedding"], diagnostics: string[]) {
+  if (!raw?.baseURL) {
+    diagnostics.push("embedding.baseURL is required")
+  }
+  if (!raw?.model) {
+    diagnostics.push("embedding.model is required")
+  }
+}
+
+function withDefault<T>(value: T | undefined, defaultValue: T) {
+  return value ?? defaultValue
+}
+
+function cacheDirOption(cacheDir: string | undefined, env: Record<string, string | undefined>) {
+  return cacheDir ?? env.OPENCODE_CAST_CACHE_DIR ?? path.join(cacheBaseDir(env), "opencode", "cast")
+}
+
+function cacheBaseDir(env: Record<string, string | undefined>) {
+  return env.XDG_CACHE_HOME ?? path.join(env.HOME ?? process.cwd(), ".cache")
+}
+
+function embeddingOptions(raw: ReturnType<typeof rawOptions>["embedding"], apiKey: string | undefined) {
+  return raw?.baseURL && raw.model
+    ? { baseURL: raw.baseURL, apiKey, model: raw.model, dimensions: raw.dimensions }
+    : undefined
+}
+
+function hydeOptions(
+  raw: ReturnType<typeof rawOptions>["hyde"],
+  hasEmbeddingConfig: boolean,
+  env: Record<string, string | undefined>,
+): HydeOptions {
+  const api = openAiCompatibleConfig(raw)
+  return {
+    mode: api ? "openai-compatible" : "opencode",
+    baseURL: api?.baseURL,
+    apiKey: apiKeyForOpenAiHyde(api, raw, env),
+    model: api?.model,
+    threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
+    enabled: withDefault(raw?.enabled, hasEmbeddingConfig),
+  }
+}
+
+function apiKeyForOpenAiHyde(
+  api: { baseURL: string; model: string } | undefined,
+  raw: ReturnType<typeof rawOptions>["hyde"],
+  env: Record<string, string | undefined>,
+) {
+  return api ? resolveSecret(raw?.apiKey, raw?.apiKeyEnv, env) : undefined
+}
+
+function openAiCompatibleConfig(raw: ReturnType<typeof rawOptions>["hyde"]) {
+  return raw?.baseURL && raw.model ? { baseURL: raw.baseURL, model: raw.model } : undefined
+}
+
+function rerankOptions(raw: ReturnType<typeof rawOptions>["rerank"], apiKey: string | undefined) {
+  return raw?.baseURL && raw.model
+    ? {
+        baseURL: raw.baseURL,
+        apiKey,
+        model: raw.model,
+        candidateMultiplier: raw.candidateMultiplier ?? DEFAULT_RERANK_CANDIDATE_MULTIPLIER,
+      }
+    : undefined
+}
+
+function hybridOptions(raw: NonNullable<ReturnType<typeof rawOptions>["retrieval"]>["hybrid"]) {
+  return { ...DEFAULT_HYBRID_OPTIONS, ...definedProperties(raw) }
+}
+
+function chunkingOptions(raw: ReturnType<typeof rawOptions>["chunking"]): ChunkingOptions {
+  return { ...DEFAULT_CHUNKING_OPTIONS, ...definedProperties(raw) }
+}
+
+function definedProperties<T extends object>(input: T | undefined) {
+  return Object.fromEntries(Object.entries(input ?? {}).filter(([, value]) => value !== undefined)) as Partial<T>
 }
 
 function resolveSecret(
@@ -234,73 +302,52 @@ function resolveSecret(
 }
 
 function parseApiConfig(input: unknown) {
-  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  const inputRecord = OptionsRecord.safeParse(input ?? {})
   if (!inputRecord.success) {
     return
   }
 
-  const parsed = {
-    baseURL: ApiFields.baseURL.safeParse(inputRecord.data.baseURL),
-    apiKey: ApiFields.apiKey.safeParse(inputRecord.data.apiKey),
-    apiKeyEnv: ApiFields.apiKeyEnv.safeParse(inputRecord.data.apiKeyEnv),
-    model: ApiFields.model.safeParse(inputRecord.data.model),
-    dimensions: ApiFields.dimensions.safeParse(inputRecord.data.dimensions),
-  }
-
   return {
-    baseURL: parsed.baseURL.success ? parsed.baseURL.data : undefined,
-    apiKey: parsed.apiKey.success ? parsed.apiKey.data : undefined,
-    apiKeyEnv: parsed.apiKeyEnv.success ? parsed.apiKeyEnv.data : undefined,
-    model: parsed.model.success ? parsed.model.data : undefined,
-    dimensions: parsed.dimensions.success ? parsed.dimensions.data : undefined,
+    baseURL: safeField(ApiFields.baseURL, inputRecord.data.baseURL),
+    apiKey: safeField(ApiFields.apiKey, inputRecord.data.apiKey),
+    apiKeyEnv: safeField(ApiFields.apiKeyEnv, inputRecord.data.apiKeyEnv),
+    model: safeField(ApiFields.model, inputRecord.data.model),
+    dimensions: safeField(ApiFields.dimensions, inputRecord.data.dimensions),
   }
 }
 
 function parseHydeConfig(input: unknown) {
-  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  const inputRecord = OptionsRecord.safeParse(input ?? {})
   if (!inputRecord.success) {
     return
   }
 
   const api = parseApiConfig(input)
-  const parsed = {
-    enabled: HydeFields.enabled.safeParse(inputRecord.data.enabled),
-    threshold: HydeFields.threshold.safeParse(inputRecord.data.threshold),
-  }
-
   return {
-    baseURL: api?.baseURL,
-    apiKey: api?.apiKey,
-    apiKeyEnv: api?.apiKeyEnv,
-    model: api?.model,
-    dimensions: api?.dimensions,
-    enabled: parsed.enabled.success ? parsed.enabled.data : undefined,
-    threshold: parsed.threshold.success ? parsed.threshold.data : undefined,
+    ...api,
+    enabled: safeField(HydeFields.enabled, inputRecord.data.enabled),
+    threshold: safeField(HydeFields.threshold, inputRecord.data.threshold),
   }
 }
 
 function parseRerankConfig(input: unknown) {
-  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  const inputRecord = OptionsRecord.safeParse(input ?? {})
   if (!inputRecord.success) {
     return
   }
 
   const api = parseApiConfig(input)
-  const parsed = {
-    candidateMultiplier: RerankFields.candidateMultiplier.safeParse(inputRecord.data.candidateMultiplier),
-  }
-
   return {
     baseURL: api?.baseURL,
     apiKey: api?.apiKey,
     apiKeyEnv: api?.apiKeyEnv,
     model: api?.model,
-    candidateMultiplier: parsed.candidateMultiplier.success ? parsed.candidateMultiplier.data : undefined,
+    candidateMultiplier: safeField(RerankFields.candidateMultiplier, inputRecord.data.candidateMultiplier),
   }
 }
 
 function parseRetrievalOptions(input: unknown) {
-  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  const inputRecord = OptionsRecord.safeParse(input ?? {})
   if (!inputRecord.success) {
     return
   }
@@ -311,55 +358,42 @@ function parseRetrievalOptions(input: unknown) {
 }
 
 function parseChunkingOptions(input: unknown) {
-  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  const inputRecord = OptionsRecord.safeParse(input ?? {})
   if (!inputRecord.success) {
     return
   }
 
-  const parsed = {
-    overlap: ChunkingFields.overlap.safeParse(inputRecord.data.overlap),
-    expansion: ChunkingFields.expansion.safeParse(inputRecord.data.expansion),
-    minSemanticNonWhitespaceChars: ChunkingFields.minSemanticNonWhitespaceChars.safeParse(
+  return {
+    overlap: safeField(ChunkingFields.overlap, inputRecord.data.overlap),
+    expansion: safeField(ChunkingFields.expansion, inputRecord.data.expansion),
+    minSemanticNonWhitespaceChars: safeField(
+      ChunkingFields.minSemanticNonWhitespaceChars,
       inputRecord.data.minSemanticNonWhitespaceChars,
     ),
-  }
-
-  return {
-    overlap: parsed.overlap.success ? parsed.overlap.data : undefined,
-    expansion: parsed.expansion.success ? parsed.expansion.data : undefined,
-    minSemanticNonWhitespaceChars: parsed.minSemanticNonWhitespaceChars.success
-      ? parsed.minSemanticNonWhitespaceChars.data
-      : undefined,
   }
 }
 
 function parseHybridOptions(input: unknown) {
-  const inputRecord = z.record(z.string(), z.unknown()).safeParse(input ?? {})
+  const inputRecord = OptionsRecord.safeParse(input ?? {})
   if (!inputRecord.success) {
     return
   }
 
-  const parsed = {
-    enabled: HybridFields.enabled.safeParse(inputRecord.data.enabled),
-    mode: HybridFields.mode.safeParse(inputRecord.data.mode),
-    rrfK: HybridFields.rrfK.safeParse(inputRecord.data.rrfK),
-    vectorCandidateMultiplier: HybridFields.vectorCandidateMultiplier.safeParse(
+  return {
+    enabled: safeField(HybridFields.enabled, inputRecord.data.enabled),
+    mode: safeField(HybridFields.mode, inputRecord.data.mode),
+    rrfK: safeField(HybridFields.rrfK, inputRecord.data.rrfK),
+    vectorCandidateMultiplier: safeField(
+      HybridFields.vectorCandidateMultiplier,
       inputRecord.data.vectorCandidateMultiplier,
     ),
-    bm25CandidateMultiplier: HybridFields.bm25CandidateMultiplier.safeParse(inputRecord.data.bm25CandidateMultiplier),
-    vectorWeight: HybridFields.vectorWeight.safeParse(inputRecord.data.vectorWeight),
-    bm25Weight: HybridFields.bm25Weight.safeParse(inputRecord.data.bm25Weight),
+    bm25CandidateMultiplier: safeField(HybridFields.bm25CandidateMultiplier, inputRecord.data.bm25CandidateMultiplier),
+    vectorWeight: safeField(HybridFields.vectorWeight, inputRecord.data.vectorWeight),
+    bm25Weight: safeField(HybridFields.bm25Weight, inputRecord.data.bm25Weight),
   }
+}
 
-  return {
-    enabled: parsed.enabled.success ? parsed.enabled.data : undefined,
-    mode: parsed.mode.success ? parsed.mode.data : undefined,
-    rrfK: parsed.rrfK.success ? parsed.rrfK.data : undefined,
-    vectorCandidateMultiplier: parsed.vectorCandidateMultiplier.success
-      ? parsed.vectorCandidateMultiplier.data
-      : undefined,
-    bm25CandidateMultiplier: parsed.bm25CandidateMultiplier.success ? parsed.bm25CandidateMultiplier.data : undefined,
-    vectorWeight: parsed.vectorWeight.success ? parsed.vectorWeight.data : undefined,
-    bm25Weight: parsed.bm25Weight.success ? parsed.bm25Weight.data : undefined,
-  }
+function safeField<T>(schema: z.ZodType<T>, input: unknown) {
+  const parsed = schema.safeParse(input)
+  return parsed.success ? parsed.data : undefined
 }
