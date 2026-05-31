@@ -522,10 +522,7 @@ function validChunkReference(index, chunkIds, id) {
 function embeddingText(filePath, language, chunk, symbols, expansion) {
     const fields = [`path: ${filePath}`, `language: ${language}`];
     if (expansion) {
-        const lineEnd = chunk.text.endsWith("\n")
-            ? Math.max(chunk.range.lineStart, chunk.range.lineEnd - 1)
-            : chunk.range.lineEnd;
-        fields.push(`chunk:\nkind: ${chunk.kind}\nrange: ${chunk.range.lineStart}-${lineEnd}`);
+        fields.push(`chunk:\nkind: ${chunk.kind}\nrange: ${chunk.range.lineStart}-${chunk.range.lineEnd}`);
     }
     fields.push(`symbols:\n${chunk.symbolIds
         .map((id) => symbols[id])
@@ -536,7 +533,7 @@ function embeddingText(filePath, language, chunk, symbols, expansion) {
     return fields.join("\n");
 }
 async function scanFiles(root, includeGlobs, excludeGlobs) {
-    const files = await walk(root);
+    const files = await walk(root, "", [], excludeGlobs);
     return files.filter((file) => includeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })) &&
         !excludeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })));
 }
@@ -577,7 +574,7 @@ async function loadGitignore(root, prefix) {
     }
     return { base: prefix, matcher };
 }
-async function walk(root, prefix = "", inheritedGitignores = []) {
+async function walk(root, prefix = "", inheritedGitignores = [], excludeGlobs = []) {
     const entries = await readdir(path.join(root, prefix), { withFileTypes: true });
     const localGitignore = await loadGitignore(root, prefix);
     const gitignores = localGitignore ? [...inheritedGitignores, localGitignore] : inheritedGitignores;
@@ -585,13 +582,22 @@ async function walk(root, prefix = "", inheritedGitignores = []) {
     const nested = await Promise.all(entries
         .filter((entry) => {
         const relative = path.join(prefix, entry.name);
-        return !(ignored.has(entry.name) || entry.isSymbolicLink() || isGitignored(relative, gitignores));
+        return !(ignored.has(entry.name) ||
+            entry.isSymbolicLink() ||
+            isGitignored(relative, gitignores) ||
+            (entry.isDirectory() && isExcludedDirectory(relative, excludeGlobs)));
     })
         .map((entry) => {
         const relative = path.join(prefix, entry.name);
-        return entry.isDirectory() ? walk(root, relative, gitignores) : Promise.resolve([relative]);
+        return entry.isDirectory() ? walk(root, relative, gitignores, excludeGlobs) : Promise.resolve([relative]);
     }));
     return nested.flat();
+}
+function isExcludedDirectory(relativePath, excludeGlobs) {
+    const globPath = toGitignorePath(relativePath);
+    return excludeGlobs.some((pattern) => minimatch(globPath, pattern, { dot: true }) ||
+        minimatch(`${globPath}/`, pattern, { dot: true }) ||
+        minimatch(`${globPath}/__placeholder__`, pattern, { dot: true }));
 }
 function isGitignored(relativePath, gitignores) {
     return gitignores.some(({ base, matcher }) => {

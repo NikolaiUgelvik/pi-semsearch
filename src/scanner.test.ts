@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, symlink, utimes } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, rm, symlink, utimes } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { createIndexer as createScannerIndexer } from "./scanner.js"
@@ -1153,6 +1153,43 @@ describe("createIndexer", () => {
     }
   })
 
+  test("does not traverse directories excluded by scanner globs", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const excludedDir = path.join(dir, "excluded")
+    try {
+      await Bun.write(path.join(dir, "kept.ts"), "export const kept = true\n")
+      await mkdir(excludedDir)
+      await Bun.write(path.join(excludedDir, "hidden.ts"), "export const hidden = true\n")
+      await chmod(excludedDir, 0)
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: ["excluded/**"],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+
+      expect(Object.keys(index.files)).toEqual(["kept.ts"])
+    } finally {
+      await chmod(excludedDir, 0o700).catch(() => undefined)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("skips binary files and reports a diagnostic", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
@@ -1929,6 +1966,54 @@ describe("createIndexer", () => {
       expect(embeddedTexts[0]).toContain("chunk:\nkind: file")
       expect(embeddedTexts[0]).toContain("range: 1-1")
       expect(embeddedTexts[0]).toContain("text:\nexport function findWidget() { return 1 }")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("reports multiline trailing-newline ranges in expansion metadata", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const source = "const a = 1\nconst b = 2\n"
+      await Bun.write(path.join(dir, "multi.ts"), source)
+      let index = createEmptyIndex({
+        projectId: "p",
+        worktree: dir,
+        cacheKey: "key",
+        maxChunkNonWhitespaceChars: 2000,
+        chunking: { overlap: 0, expansion: true, minSemanticNonWhitespaceChars: 8 },
+      })
+      const embeddedTexts: string[] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          chunking: { overlap: 0, expansion: true, minSemanticNonWhitespaceChars: 8 },
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async (_filePath, text) => ({
+          language: "typescript",
+          root: { type: "program", startIndex: 0, endIndex: text.length, children: [] },
+        }),
+        embed: async (text) => {
+          embeddedTexts.push(text)
+          return [1, 0]
+        },
+      })
+
+      await indexer.refresh()
+
+      expect(Object.values(index.chunks)[0].range.lineEnd).toBe(2)
+      expect(embeddedTexts[0]).toContain("range: 1-2")
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

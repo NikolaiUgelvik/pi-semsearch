@@ -10,7 +10,7 @@ import { parseOptions } from "./options.js"
 import { type RetrievalIndexStore, retrieveFromStore } from "./retriever.js"
 import { createIndexer } from "./scanner.js"
 import { createIndexStore } from "./store.js"
-import type { ChunkLookupOutput, LexicalChunkCandidate, SearchOutput } from "./types.js"
+import type { CastIndex, ChunkLookupOutput, HydratedChunkSet, LexicalChunkCandidate, SearchOutput } from "./types.js"
 
 interface VectorCandidateStore {
   searchVectorCandidates(
@@ -216,6 +216,20 @@ export function createCastPluginForTest(
         }
         throw new IndexUnavailableError(storeError ?? formatThrownError(error))
       }
+    }
+
+    const readChunkLookupIndex = async (id: string) => {
+      if (!store) {
+        throw new Error(storeError ?? "index unavailable")
+      }
+      if (!hasHydrateChunksStore(store)) {
+        return readIndex()
+      }
+      const indexStore = store
+      if (hasReadMetadataStore(indexStore)) {
+        await wrapStoreOperation(() => indexStore.readMetadata())
+      }
+      return hydratedChunkSetToIndex(await wrapStoreOperation(() => indexStore.hydrateChunks([id])))
     }
 
     const wrapStoreOperation = async <T>(operation: () => Promise<T>) => {
@@ -447,7 +461,7 @@ Use this after semantic_search_code when you need the exact cached chunk, expand
             let output: Awaited<ReturnType<typeof getChunkById>>
             try {
               output = await getChunkById({
-                index: await readIndex(),
+                index: await readChunkLookupIndex(args.id),
                 input: args,
                 readSource: async (filePath) => Bun.file(await resolveWorktreePath(input.worktree, filePath)).text(),
               })
@@ -479,6 +493,19 @@ Use this after semantic_search_code when you need the exact cached chunk, expand
       },
     }
   }
+}
+
+function hydratedChunkSetToIndex(hydrated: HydratedChunkSet): CastIndex {
+  const index: CastIndex = {
+    metadata: hydrated.metadata,
+    files: hydrated.files,
+    chunks: hydrated.chunks,
+    symbols: hydrated.symbols,
+  }
+  if (hydrated.lexical) {
+    index.lexical = hydrated.lexical
+  }
+  return index
 }
 
 function hasVectorCandidateStore(value: unknown): value is VectorCandidateStore {
@@ -759,7 +786,9 @@ function serializeToolOutput<T>(input: {
     return serializedDiagnostics
   }
   const compactDiagnostics = JSON.stringify(diagnosticsOutput)
-  return serializedFits(compactDiagnostics, input.limits) ? compactDiagnostics : serializedDiagnostics
+  return serializedFits(compactDiagnostics, input.limits)
+    ? compactDiagnostics
+    : forceFitSerialized(compactDiagnostics, input.limits)
 }
 
 function serializeJson(value: unknown) {
@@ -771,6 +800,25 @@ function serializedFits(serialized: string, limits: ToolOutputLimits) {
     (limits.maxBytes === undefined || Buffer.byteLength(serialized, "utf8") <= limits.maxBytes) &&
     (limits.maxLines === undefined || serialized.split("\n").length <= limits.maxLines)
   )
+}
+
+function forceFitSerialized(serialized: string, limits: ToolOutputLimits) {
+  let output = serialized
+  if (limits.maxLines !== undefined) {
+    output = output.split("\n").slice(0, Math.max(limits.maxLines, 0)).join("\n")
+  }
+  if (limits.maxBytes !== undefined) {
+    output = truncateUtf8(output, Math.max(limits.maxBytes, 0))
+  }
+  return output
+}
+
+function truncateUtf8(value: string, maxBytes: number) {
+  let output = Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8")
+  while (Buffer.byteLength(output, "utf8") > maxBytes) {
+    output = output.slice(0, -1)
+  }
+  return output
 }
 
 function compactSearchOutput(output: SearchOutput, limits: ToolOutputLimits): SearchOutput {

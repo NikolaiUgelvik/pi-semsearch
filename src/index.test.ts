@@ -197,6 +197,101 @@ describe("cast plugin", () => {
     }
   })
 
+  test("semantic_get_chunk uses targeted store hydration without reading the full index", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-plugin-"))
+    const calls: string[] = []
+    try {
+      await Bun.write(path.join(dir, "alpha.ts"), "function alpha() {}\n")
+      const metadata = { ...emptyReadyIndex().metadata, worktree: dir }
+      const plugin = createCastPluginForTest({
+        createStore: () => ({
+          read: async () => {
+            calls.push("read")
+            throw new Error("full index read should not be called")
+          },
+          write: async () => undefined,
+          hydrateChunks: async (chunkIds) => {
+            calls.push(`hydrateChunks:${chunkIds.join(",")}`)
+            return {
+              metadata,
+              files: {
+                "alpha.ts": {
+                  path: "alpha.ts",
+                  language: "typescript",
+                  fingerprint: "fp",
+                  chunkIds: ["alpha"],
+                  diagnostics: [],
+                },
+              },
+              chunks: {
+                alpha: {
+                  id: "alpha",
+                  filePath: "alpha.ts",
+                  language: "typescript",
+                  kind: "function",
+                  range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+                  text: "function alpha() {}",
+                  nonWhitespaceChars: 17,
+                  nodeTypes: [],
+                  symbolIds: [],
+                  childChunkIds: [],
+                },
+              },
+              symbols: {},
+              diagnostics: [],
+            }
+          },
+        }),
+        createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      })
+      const hooks = await plugin({ ...input, directory: dir, worktree: dir } as never, {
+        embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed", dimensions: 2 },
+      })
+
+      const result = await semanticGetChunkTool(hooks).execute({ id: "alpha", includeParents: false }, {
+        worktree: dir,
+        directory: dir,
+      } as never)
+
+      expect(typeof result).toBe("object")
+      if (typeof result === "string") {
+        throw new Error("expected object tool result")
+      }
+      expect(JSON.parse(result.output).chunk.filePath).toBe("alpha.ts")
+      expect(calls).toEqual(["hydrateChunks:alpha"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("semantic_search_code hard-caps diagnostics fallback output", async () => {
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: ["x".repeat(2000)],
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+    hooks.config?.({ tool_output: { max_lines: 4, max_bytes: 120 } } as never)
+
+    const result = await semanticSearchTool(hooks).execute({ query: "a" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(Buffer.byteLength(result.output, "utf8")).toBeLessThanOrEqual(120)
+    expect(result.output.split("\n").length).toBeLessThanOrEqual(4)
+  })
+
   test("semantic_get_chunk compacts output and updates childrenPage when emitted children are reduced", async () => {
     const childCount = 30
     const sourceLines = ["root", ...Array.from({ length: childCount }, (_, index) => `child-${index}`)]
