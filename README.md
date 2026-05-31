@@ -1,6 +1,6 @@
 # opencode-plugin-cast
 
-Unofficial cAST semantic code search plugin for opencode. Code Retrieval-Augmented Generation with structural chunking via abstract syntax tree.
+Semantic code search plugin for opencode using code retrieval-augmented generation with structural chunking via abstract syntax tree.
 
 This is an unofficial community plugin. It is not affiliated with, endorsed by, sponsored by, or maintained by opencode, opencode.ai, or the `@opencode-ai` npm organization. It depends on `@opencode-ai/plugin` only for the public plugin API.
 
