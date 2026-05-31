@@ -91,7 +91,7 @@ function labelForChunk(chunk: ChunkRecord, symbols: Record<string, SymbolRecord>
   }
   const localLabel = localSnippetLabel(chunk)
   if (localLabel) {
-    return `${chunk.kind} ${localLabel}`
+    return `${chunk.kind} ${withoutDuplicateKindPrefix(chunk.kind, localLabel)}`
   }
   const enclosingSymbol = nearestEnclosingSymbol(chunk, symbols)
   return enclosingSymbol ? `${enclosingSymbol.kind} ${enclosingSymbol.name}` : `${chunk.kind} chunk`
@@ -113,6 +113,14 @@ function nearestEnclosingSymbol(chunk: ChunkRecord, symbols: Record<string, Symb
 
 function rangesTightlyOverlap(symbol: SymbolRecord, chunk: ChunkRecord) {
   return symbol.range.byteStart >= chunk.range.byteStart && symbol.range.byteStart <= chunk.range.byteEnd
+}
+
+function withoutDuplicateKindPrefix(kind: ChunkRecord["kind"], label: string) {
+  const prefixes = kind === "function" ? ["async function ", "function "] : [`${kind} `]
+  return prefixes.reduce(
+    (current, prefix) => (current.startsWith(prefix) ? current.slice(prefix.length) : current),
+    label,
+  )
 }
 
 function localSnippetLabel(chunk: ChunkRecord) {

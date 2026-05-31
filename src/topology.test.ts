@@ -426,6 +426,19 @@ describe("topology", () => {
     expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).chunk.label).toBe("block return parseOptions(input)")
   })
 
+  test("does not duplicate chunk kind in local fallback labels", () => {
+    const chunk = {
+      ...base,
+      id: "chunk:function",
+      kind: "function",
+      range: { byteStart: 20, byteEnd: 50, lineStart: 2, lineEnd: 4 },
+      text: "function parseOptions() {\n  return {}\n}",
+      symbolIds: [],
+    } as ChunkRecord
+
+    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).chunk.label).toBe("function parseOptions() {")
+  })
+
   test("extracts enclosing class and assigns it to contained chunks", () => {
     const source = "class A {\n  a() {}\n}\n"
     const symbols = extractSymbols({

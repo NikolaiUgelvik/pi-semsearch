@@ -1485,6 +1485,46 @@ describe("cast plugin", () => {
     ])
   })
 
+  test("opencode HyDE fallback retries prompt when the created session is not immediately visible", async () => {
+    const index = emptyReadyIndex()
+    const fakeClient = createFakeClient({ promptNotFoundFailures: 1 })
+    let hydeText = ""
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({ refresh: async () => index }),
+      createStore: () => ({ read: async () => index, write: async () => undefined }),
+      retrieve: async (input) => {
+        hydeText = await input.generateHyde("session")
+        return {
+          status: searchStatus(index.metadata, { hydeUsed: true }),
+          results: [],
+          diagnostics: [],
+        }
+      },
+    })
+    const hooks = await plugin({ ...input, client: fakeClient.client } as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      hyde: { enabled: true, threshold: 1 },
+    })
+
+    await hooks["chat.message"]?.(
+      {
+        sessionID: "s1",
+        messageID: "m1",
+        agent: "build",
+        model: { providerID: "local", modelID: "qwen3.6-27b-mtp" },
+      },
+      {} as never,
+    )
+    await semanticSearchTool(hooks).execute({ query: "session" }, {
+      sessionID: "s1",
+      directory: "/repo",
+      worktree: "/repo",
+    } as never)
+
+    expect(hydeText).toBe("synthetic session document")
+    expect(fakeClient.calls.map((call) => call.type)).toEqual(["create", "prompt", "prompt", "delete"])
+  })
+
   test("opencode HyDE fallback reports a clear error when no model was tracked", async () => {
     const index = emptyReadyIndex()
     let errorMessage = ""
@@ -1723,8 +1763,9 @@ function semanticGetChunkTool(hooks: Awaited<ReturnType<typeof castPlugin>>) {
   return semanticGetChunk
 }
 
-function createFakeClient() {
+function createFakeClient(options: { promptNotFoundFailures?: number } = {}) {
   const calls: Array<{ type: "create" | "prompt" | "delete"; parameters: unknown }> = []
+  let remainingPromptNotFoundFailures = options.promptNotFoundFailures ?? 0
   return {
     calls,
     client: {
@@ -1747,6 +1788,12 @@ function createFakeClient() {
           }
         }) => {
           calls.push({ type: "prompt", parameters })
+          if (remainingPromptNotFoundFailures > 0) {
+            remainingPromptNotFoundFailures--
+            return {
+              error: { name: "NotFoundError", data: { message: `Session not found: ${parameters.path.id}` } },
+            }
+          }
           return { data: { info: {}, parts: [{ type: "text", text: "synthetic session document" }] }, error: undefined }
         },
         delete: async (parameters: { path: { id: string }; query?: { directory?: string } }) => {

@@ -61,7 +61,7 @@ function labelForChunk(chunk, symbols) {
     }
     const localLabel = localSnippetLabel(chunk);
     if (localLabel) {
-        return `${chunk.kind} ${localLabel}`;
+        return `${chunk.kind} ${withoutDuplicateKindPrefix(chunk.kind, localLabel)}`;
     }
     const enclosingSymbol = nearestEnclosingSymbol(chunk, symbols);
     return enclosingSymbol ? `${enclosingSymbol.kind} ${enclosingSymbol.name}` : `${chunk.kind} chunk`;
@@ -80,6 +80,10 @@ function nearestEnclosingSymbol(chunk, symbols) {
 }
 function rangesTightlyOverlap(symbol, chunk) {
     return symbol.range.byteStart >= chunk.range.byteStart && symbol.range.byteStart <= chunk.range.byteEnd;
+}
+function withoutDuplicateKindPrefix(kind, label) {
+    const prefixes = kind === "function" ? ["async function ", "function "] : [`${kind} `];
+    return prefixes.reduce((current, prefix) => (current.startsWith(prefix) ? current.slice(prefix.length) : current), label);
 }
 function localSnippetLabel(chunk) {
     const firstLine = chunk.text

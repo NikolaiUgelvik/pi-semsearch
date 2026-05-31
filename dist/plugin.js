@@ -15,6 +15,9 @@ const LOOKUP_COMPACTION_DIAGNOSTIC = "output compacted to fit opencode tool_outp
 const LONG_COMPACT_TEXT_LENGTH = 200;
 const MEDIUM_COMPACT_TEXT_LENGTH = 80;
 const SHORT_COMPACT_TEXT_LENGTH = 20;
+const HYDE_PROMPT_FIRST_RETRY_DELAY_MS = 100;
+const HYDE_PROMPT_SECOND_RETRY_DELAY_MS = 250;
+const HYDE_PROMPT_RETRY_DELAYS_MS = [HYDE_PROMPT_FIRST_RETRY_DELAY_MS, HYDE_PROMPT_SECOND_RETRY_DELAY_MS];
 const OMITTED_TEXT_LENGTH = 0;
 const MANY_COMPACT_CHILDREN = 5;
 const SINGLE_COMPACT_CHILD = 1;
@@ -484,7 +487,7 @@ function rerankDocuments(query, documents, rerank, client) {
 async function generateOpenCodeHydeText(input) {
     const hydeSessionID = await createHydeSession(input.client, input.context);
     try {
-        return hydePromptText(input.client, hydeSessionID, input);
+        return await hydePromptText(input.client, hydeSessionID, input);
     }
     finally {
         await deleteHydeSession(input.client, hydeSessionID, input.context);
@@ -504,7 +507,7 @@ async function createHydeSession(client, context) {
     return created.data.id;
 }
 async function hydePromptText(client, hydeSessionID, input) {
-    const prompted = await client.session.prompt({
+    const parameters = {
         path: { id: hydeSessionID },
         query: { directory: input.context.directory },
         body: {
@@ -513,7 +516,17 @@ async function hydePromptText(client, hydeSessionID, input) {
             system: HYDE_SYSTEM_PROMPT,
             parts: [{ type: "text", text: input.query }],
         },
-    });
+    };
+    let prompted = await client.session.prompt(parameters);
+    for (const delayMs of HYDE_PROMPT_RETRY_DELAYS_MS) {
+        if (!isSessionNotFoundError(prompted.error)) {
+            break;
+        }
+        // Retries must be sequential because each one waits for opencode to make the new child session visible.
+        // biome-ignore lint: the retry delay is intentionally ordered.
+        await delay(delayMs);
+        prompted = await client.session.prompt(parameters);
+    }
     if (prompted.error) {
         throw new Error(`OpenCode HyDE prompt failed: ${formatSdkError(prompted.error)}`);
     }
@@ -521,6 +534,21 @@ async function hydePromptText(client, hydeSessionID, input) {
         throw new Error("OpenCode HyDE prompt returned no response");
     }
     return nonEmptyHydeText(prompted.data.parts);
+}
+function isSessionNotFoundError(error) {
+    return (typeof error === "object" &&
+        error !== null &&
+        "name" in error &&
+        error.name === "NotFoundError" &&
+        "data" in error &&
+        typeof error.data === "object" &&
+        error.data !== null &&
+        "message" in error.data &&
+        typeof error.data.message === "string" &&
+        error.data.message.startsWith("Session not found:"));
+}
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 function nonEmptyHydeText(parts) {
     const text = parts
