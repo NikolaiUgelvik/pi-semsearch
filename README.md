@@ -112,6 +112,7 @@ OpenRouter's rerank endpoint can be used to reorder the candidates found by vect
 
 - `query`: natural-language repository search query.
 - `topK`: optional number of final results. Defaults to `5`.
+- `minFinalScore`: optional minimum final retrieval score. Defaults to `0.01`; set to `0` to include zero-score candidates. Negative values are clamped to `0`.
 - `maxContextChars`: optional context budget. Defaults to `12000`.
 - `includeParents`: optional expanded parent body text toggle. Defaults to `false`; set to `true` to opt in.
 - `refresh`: optional forced index refresh before searching.
@@ -214,6 +215,21 @@ Configure file scanning with plugin options:
 }
 ```
 
+Configure chunking with plugin options:
+
+```json
+{
+  "maxChunkNonWhitespaceChars": 2000,
+  "chunking": {
+    "overlap": 0,
+    "expansion": false,
+    "minSemanticNonWhitespaceChars": 8
+  }
+}
+```
+
+`maxChunkNonWhitespaceChars` controls the target chunk size. `chunking.overlap` adds neighboring AST-window overlap, `chunking.expansion` adds chunk metadata to the embedded text, and `chunking.minSemanticNonWhitespaceChars` controls when trivial syntax windows are merged into nearby chunks. These are indexing options, not `semantic_search_code` arguments.
+
 Override the cache location with plugin config:
 
 ```json
@@ -257,13 +273,27 @@ Complete OpenAI-compatible HyDE requires both `hyde.baseURL` and `hyde.model`. H
 
 ## Local Development
 
-Install dependencies, run tests, typecheck, and build:
+Install dependencies:
 
 ```bash
-npm_config_nodedir=/usr npm exec --yes bun@1.3.14 -- install
-npm exec --yes bun@1.3.14 -- test --timeout 30000
-npm exec --yes bun@1.3.14 -- run typecheck
-npm exec --yes bun@1.3.14 -- run build
+npm_config_nodedir=/usr bun install
+```
+
+Run the usual local verification:
+
+```bash
+bun run lint
+bun test --timeout 30000
+bun run typecheck
+bun run build
+```
+
+Before packaging, run the same checks as `prepack`:
+
+```bash
+bun run check
+bun run typecheck
+bun run build
 ```
 
 To test a local build in opencode, point config at the built file URL:
