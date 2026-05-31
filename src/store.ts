@@ -175,6 +175,14 @@ function createSqliteIndexStore(cacheDir: string, cacheKey: string, embeddingDim
         db.close()
       }
     },
+    async writeFileResults(runId: string, fileResults: FileResult[]) {
+      const db = await openSqliteIndex(file, embeddingDimensions ?? inferFileResultsEmbeddingDimensions(fileResults))
+      try {
+        writeSqliteFileResults(db, runId, fileResults)
+      } finally {
+        db.close()
+      }
+    },
     async activateRun(runId: string, index: CastIndex) {
       const db = await openSqliteIndex(file, embeddingDimensions ?? inferEmbeddingDimensions(index))
       try {
@@ -786,27 +794,30 @@ function getCompletedSqliteFile(
 }
 
 function writeSqliteFileResult(db: Database, runId: string, fileResult: FileResult) {
-  const write = db.transaction((result: FileResult) => {
-    deleteRunFile(db, runId, result.file.path)
-    insertFile(db, runId, result.file, false)
-    insertChunks(db, runId, Object.values(result.chunks))
-    for (const symbol of Object.values(result.symbols)) {
-      insertSymbol(db, runId, symbol)
+  writeSqliteFileResults(db, runId, [fileResult])
+}
+
+function writeSqliteFileResults(db: Database, runId: string, fileResults: FileResult[]) {
+  const write = db.transaction((results: FileResult[]) => {
+    for (const result of results) {
+      deleteRunFile(db, runId, result.file.path)
+      insertFile(db, runId, result.file, false)
+      insertChunks(db, runId, Object.values(result.chunks))
+      for (const symbol of Object.values(result.symbols)) {
+        insertSymbol(db, runId, symbol)
+      }
     }
   })
-  write(fileResult)
+  write(fileResults)
 }
 
 function activateSqliteRun(db: Database, runId: string, index: CastIndex) {
   const activate = db.transaction((castIndex: CastIndex) => {
-    deleteRunRecords(db, runId)
+    validateCompletedRunRows(db, runId, castIndex)
     for (const file of Object.values(castIndex.files)) {
-      insertFile(db, runId, file)
+      upsertGlobalFile(db, file)
     }
-    insertChunks(db, runId, Object.values(castIndex.chunks))
-    for (const symbol of Object.values(castIndex.symbols)) {
-      insertSymbol(db, runId, symbol)
-    }
+    db.run("delete from lexical where run_id = ?", [runId])
     if (castIndex.lexical) {
       insertLexical(db, runId, castIndex.lexical)
     }
@@ -819,6 +830,22 @@ function activateSqliteRun(db: Database, runId: string, index: CastIndex) {
     pruneSupersededRuns(db, runId)
   })
   activate(index)
+}
+
+function validateCompletedRunRows(db: Database, runId: string, index: CastIndex) {
+  const run = db.query("select status from runs where id = ?").get(runId) as { status: string } | null
+  const expected = Object.keys(index.files).sort()
+  const rows = db.query("select path from file_runs where run_id = ? order by path").all(runId) as Array<{
+    path: string
+  }>
+  const actual = rows.map((row) => row.path)
+  if (run?.status !== "indexing" || !sameStringArray(actual, expected)) {
+    throw new Error("incomplete indexing run cannot be activated")
+  }
+}
+
+function sameStringArray(left: string[], right: string[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function searchSqliteVectorCandidates(db: Database, queryEmbedding: number[], topK: number, paths?: string[]) {
@@ -1078,12 +1105,7 @@ function insertRun(db: Database, runId: string, index: CastIndex) {
 
 function insertFile(db: Database, runId: string, file: FileRecord, updateGlobalFile = true) {
   if (updateGlobalFile) {
-    db.run("insert or replace into files (path, language, fingerprint, diagnostics_json) values (?, ?, ?, ?)", [
-      file.path,
-      file.language,
-      file.fingerprint,
-      JSON.stringify(file.diagnostics),
-    ])
+    upsertGlobalFile(db, file)
   }
   db.run(
     "insert or replace into file_runs (run_id, path, language, fingerprint, diagnostics_json, chunk_ids_json) values (?, ?, ?, ?, ?, ?)",
@@ -1096,6 +1118,15 @@ function insertFile(db: Database, runId: string, file: FileRecord, updateGlobalF
       JSON.stringify(file.chunkIds),
     ],
   )
+}
+
+function upsertGlobalFile(db: Database, file: FileRecord) {
+  db.run("insert or replace into files (path, language, fingerprint, diagnostics_json) values (?, ?, ?, ?)", [
+    file.path,
+    file.language,
+    file.fingerprint,
+    JSON.stringify(file.diagnostics),
+  ])
 }
 
 function insertChunks(db: Database, runId: string, chunks: ChunkRecord[]) {
@@ -1235,6 +1266,10 @@ function inferEmbeddingDimensions(index: CastIndex) {
 
 function inferFileResultEmbeddingDimensions(fileResult: FileResult) {
   return Object.values(fileResult.chunks).find((chunk) => chunk.embedding)?.embedding?.length
+}
+
+function inferFileResultsEmbeddingDimensions(fileResults: FileResult[]) {
+  return fileResults.map(inferFileResultEmbeddingDimensions).find((dimensions) => dimensions !== undefined)
 }
 
 function addColumnIfMissing(db: Database, table: string, column: string, definition: string) {

@@ -20,6 +20,7 @@ export type Store = {
   beginIndexRun?(input: { configHash: string; metadata: CastIndex["metadata"] }): Promise<{ runId: string }>
   getCompletedFile?(runId: string, filePath: string, fingerprint: string): Promise<FileResult | undefined>
   writeFileResult?(runId: string, fileResult: FileResult): Promise<void>
+  writeFileResults?(runId: string, fileResults: FileResult[]): Promise<void>
   activateRun?(runId: string, index: CastIndex): Promise<void>
 }
 type GitignoreMatcher = { base: string; matcher: Ignore }
@@ -34,6 +35,19 @@ type RefreshState = {
   canReuseExistingRecords: boolean
   changed: boolean
 }
+type LoadedFile = {
+  fingerprint: string
+  text: string
+}
+type EmbeddingResult = { embedding: number[] } | { embeddingError: string }
+type EmbeddingBatcher = {
+  embed(text: string): Promise<EmbeddingResult>
+  drain(): Promise<void>
+}
+type FileResultWriter = {
+  add(fileResult: FileResult): Promise<void>
+  flush(): Promise<void>
+}
 const BINARY_SAMPLE_BYTES = Number("16") * Number("1024")
 const BYTE_NUL = 0
 const BYTE_BACKSPACE = 8
@@ -44,6 +58,8 @@ const BYTE_CARRIAGE_RETURN = 13
 const CONTROL_BYTE_LIMIT = 32
 const BINARY_CONTROL_RATIO = 0.3
 const DEFAULT_EMBEDDING_BATCH_SIZE = 16
+const DEFAULT_FILE_CONCURRENCY = 4
+const DEFAULT_FILE_RESULT_WRITE_BATCH_SIZE = 32
 
 export function createIndexer(input: {
   worktree: string
@@ -77,8 +93,11 @@ export function createIndexer(input: {
       const nextChunks: CastIndex["chunks"] = {}
       const nextSymbols: CastIndex["symbols"] = {}
       const metadataDiagnostics: string[] = []
+      const embeddingBatcher = createEmbeddingBatcher(input)
+      const fileResultWriter = createFileResultWriter({ runStore, run: () => run })
       let changed = false
       let run: { runId: string } | undefined
+      let runPromise: Promise<{ runId: string } | undefined> | undefined
 
       const markIndexing = () => {
         index.metadata.status = "indexing"
@@ -90,27 +109,47 @@ export function createIndexer(input: {
         if (!runStore) {
           return
         }
-        if (!run) {
-          markIndexing()
-          run = await runStore.beginIndexRun({ configHash: runConfigHash, metadata: index.metadata })
+        if (run) {
+          return run
         }
+        if (!runPromise) {
+          markIndexing()
+          runPromise = runStore.beginIndexRun({ configHash: runConfigHash, metadata: index.metadata })
+        }
+        run = await runPromise
         return run
       }
 
-      for (const relativePath of files) {
-        await processScannedFile({
-          input,
-          index,
-          state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
-          relativePath,
-          runStore,
-          run: () => run,
-          ensureRun,
-        }).then((nextChanged) => {
-          changed = nextChanged
+      try {
+        await mapWithConcurrency(files, DEFAULT_FILE_CONCURRENCY, async (relativePath) => {
+          const nextChanged = await processScannedFile({
+            input,
+            index,
+            state: { nextFiles, nextChunks, nextSymbols, metadataDiagnostics, canReuseExistingRecords, changed },
+            relativePath,
+            runStore,
+            run: () => run,
+            ensureRun,
+            embeddingBatcher,
+            fileResultWriter,
+          })
+          changed = changed || nextChanged
         })
+      } catch (error) {
+        try {
+          await fileResultWriter.flush()
+        } catch (flushError) {
+          if (flushError === error) {
+            throw error
+          }
+          throw new AggregateError([error, flushError], "refresh failed and flushing file results failed")
+        }
+        throw error
       }
 
+      await embeddingBatcher.drain()
+      await fileResultWriter.flush()
+      metadataDiagnostics.sort()
       const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols)
       const hasFileSetChange = !sameStringArray(Object.keys(index.files).sort(), Object.keys(nextFiles).sort())
       const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, metadataDiagnostics)
@@ -189,6 +228,8 @@ async function processScannedFile(input: {
   runStore: IndexRunStore | undefined
   run: () => { runId: string } | undefined
   ensureRun: () => Promise<{ runId: string } | undefined>
+  embeddingBatcher: EmbeddingBatcher
+  fileResultWriter: FileResultWriter
 }) {
   const absolutePath = path.join(input.input.worktree, input.relativePath)
   const file = Bun.file(absolutePath)
@@ -197,7 +238,8 @@ async function processScannedFile(input: {
     input.state.metadataDiagnostics.push(skipDiagnostic)
     return input.state.changed
   }
-  const currentFingerprint = await fingerprint(absolutePath)
+  const loaded = await loadTextFileForIndexing(absolutePath)
+  const currentFingerprint = loaded.fingerprint
   const previousFile = input.index.files[input.relativePath]
   if (
     canReuseFile(input.index, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords)
@@ -215,7 +257,7 @@ async function processScannedFile(input: {
     return true
   }
 
-  await indexFile({ ...input, absolutePath, currentFingerprint })
+  await indexFile({ ...input, absolutePath, currentFingerprint, text: loaded.text })
   return true
 }
 
@@ -267,11 +309,13 @@ async function indexFile(input: {
   relativePath: string
   absolutePath: string
   currentFingerprint: string
+  text: string
   runStore: IndexRunStore | undefined
   run: () => { runId: string } | undefined
+  embeddingBatcher: EmbeddingBatcher
+  fileResultWriter: FileResultWriter
 }) {
-  const text = await Bun.file(input.absolutePath).text()
-  const parsed = await input.input.parse(input.absolutePath, text).catch((error) => ({
+  const parsed = await input.input.parse(input.absolutePath, input.text).catch((error) => ({
     language: "text",
     root: undefined,
     diagnostic: String(error),
@@ -280,7 +324,7 @@ async function indexFile(input: {
     ? castChunks({
         filePath: input.relativePath,
         language: parsed.language,
-        source: text,
+        source: input.text,
         root: parsed.root,
         maxNonWhitespaceChars: input.input.options.maxChunkNonWhitespaceChars,
         chunking: input.input.options.chunking,
@@ -288,11 +332,11 @@ async function indexFile(input: {
     : fallbackChunks({
         filePath: input.relativePath,
         language: parsed.language,
-        text,
+        text: input.text,
         maxNonWhitespaceChars: input.input.options.maxChunkNonWhitespaceChars,
       })
   const symbols = parsed.root
-    ? extractSymbols({ filePath: input.relativePath, source: text, nodes: parsed.root.children })
+    ? extractSymbols({ filePath: input.relativePath, source: input.text, nodes: parsed.root.children })
     : []
   const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]))
   const chunks = attachTopology(assignSymbolsToChunks(rawChunks, symbolsById), symbolsById)
@@ -310,14 +354,156 @@ async function indexFile(input: {
     diagnostics: fileDiagnostics,
   }
   input.state.nextFiles[input.relativePath] = fileRecord
-  const run = input.run()
-  if (run && input.runStore) {
-    await input.runStore.writeFileResult(run.runId, {
-      file: fileRecord,
-      chunks: fileChunks,
-      symbols: Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol])),
+  await input.fileResultWriter.add({
+    file: fileRecord,
+    chunks: fileChunks,
+    symbols: Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol])),
+  })
+}
+
+function createFileResultWriter(input: {
+  runStore: IndexRunStore | undefined
+  run: () => { runId: string } | undefined
+}): FileResultWriter {
+  const pending: FileResult[] = []
+  let writeChain = Promise.resolve()
+
+  const enqueue = (batch: FileResult[]) => {
+    writeChain = writeChain.then(async () => {
+      const run = input.run()
+      const runStore = input.runStore
+      if (!run) {
+        return
+      }
+      if (!runStore) {
+        return
+      }
+      if (hasBatchRunStore(runStore)) {
+        await runStore.writeFileResults(run.runId, batch)
+        return
+      }
+      for (const fileResult of batch) {
+        await runStore.writeFileResult(run.runId, fileResult)
+      }
     })
+    return writeChain
   }
+
+  const flushPending = () => {
+    if (pending.length === 0) {
+      return writeChain
+    }
+    return enqueue(pending.splice(0, pending.length))
+  }
+
+  return {
+    add(fileResult) {
+      const runStore = input.runStore
+      if (!runStore) {
+        return Promise.resolve()
+      }
+      const run = input.run()
+      if (!run) {
+        return Promise.resolve()
+      }
+      if (!hasBatchRunStore(runStore)) {
+        return enqueue([fileResult])
+      }
+      pending.push(fileResult)
+      return pending.length >= DEFAULT_FILE_RESULT_WRITE_BATCH_SIZE ? flushPending() : writeChain
+    },
+    flush() {
+      return flushPending()
+    },
+  }
+}
+
+function createEmbeddingBatcher(input: CreateIndexerInput): EmbeddingBatcher {
+  type PendingEmbedding = { text: string; resolve: (result: EmbeddingResult) => void }
+
+  const batchSize = Math.max(1, input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE)
+  const queue: PendingEmbedding[] = []
+  const outstanding = new Set<Promise<void>>()
+  let scheduled = false
+
+  const flush = () => {
+    scheduled = false
+    if (queue.length === 0) {
+      return
+    }
+    const batch = queue.splice(0, batchSize)
+    const run = embedPendingBatch(input, batch).finally(() => {
+      outstanding.delete(run)
+    })
+    outstanding.add(run)
+  }
+
+  const scheduleFlush = () => {
+    if (scheduled) {
+      return
+    }
+    scheduled = true
+    setTimeout(flush, 0)
+  }
+
+  return {
+    embed(text) {
+      return new Promise((resolve) => {
+        queue.push({ text, resolve })
+        if (queue.length >= batchSize) {
+          flush()
+          return
+        }
+        scheduleFlush()
+      })
+    },
+    async drain() {
+      while (queue.length > 0 || outstanding.size > 0) {
+        flush()
+        await Promise.all(Array.from(outstanding))
+      }
+    },
+  }
+}
+
+async function embedPendingBatch(
+  input: CreateIndexerInput,
+  batch: { text: string; resolve(result: EmbeddingResult): void }[],
+) {
+  const errorResult = (error: unknown): EmbeddingResult => ({
+    embeddingError: error instanceof Error ? error.message : String(error),
+  })
+
+  if (input.embedBatch) {
+    await Promise.resolve()
+      .then(() => input.embedBatch?.(batch.map((item) => item.text)) ?? [])
+      .then((embeddings) => {
+        for (const [index, item] of batch.entries()) {
+          item.resolve(
+            embeddings[index]
+              ? { embedding: embeddings[index] }
+              : { embeddingError: "embedding batch response omitted this input" },
+          )
+        }
+      })
+      .catch((error) => {
+        const result = errorResult(error)
+        for (const item of batch) {
+          item.resolve(result)
+        }
+      })
+    return
+  }
+
+  await Promise.all(
+    batch.map(async (item) => {
+      const result = await Promise.resolve()
+        .then(() => input.embed(item.text))
+        .then((embedding) => ({ embedding }))
+        .catch(errorResult)
+      item.resolve(result)
+    }),
+  )
 }
 
 async function embedChunks(input: {
@@ -327,14 +513,12 @@ async function embedChunks(input: {
   chunks: ChunkRecord[]
   symbolsById: Record<string, SymbolRecord>
   fileDiagnostics: string[]
+  embeddingBatcher: EmbeddingBatcher
 }) {
-  if (input.input.embedBatch) {
-    return embedChunkBatches(input)
-  }
   const fileChunks: CastIndex["chunks"] = {}
-  for (const chunk of input.chunks) {
-    const embedded = await input.input
-      .embed(
+  const embeddedChunks = await Promise.all(
+    input.chunks.map(async (chunk) => {
+      const embedded = await input.embeddingBatcher.embed(
         embeddingText(
           input.relativePath,
           input.parsed.language,
@@ -343,8 +527,10 @@ async function embedChunks(input: {
           input.input.options.chunking.expansion,
         ),
       )
-      .then((embedding) => ({ embedding }))
-      .catch((error) => ({ embeddingError: error instanceof Error ? error.message : String(error) }))
+      return { chunk, embedded }
+    }),
+  )
+  for (const { chunk, embedded } of embeddedChunks) {
     if ("embeddingError" in embedded) {
       input.fileDiagnostics.push(`embedding failed: ${embedded.embeddingError}`)
     }
@@ -353,47 +539,14 @@ async function embedChunks(input: {
   return fileChunks
 }
 
-async function embedChunkBatches(input: {
-  input: CreateIndexerInput
-  relativePath: string
-  parsed: { language: string }
-  chunks: ChunkRecord[]
-  symbolsById: Record<string, SymbolRecord>
-  fileDiagnostics: string[]
-}) {
-  const fileChunks: CastIndex["chunks"] = {}
-  const batchSize = input.input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE
-  for (let start = 0; start < input.chunks.length; start += batchSize) {
-    const chunks = input.chunks.slice(start, start + batchSize)
-    const texts = chunks.map((chunk) =>
-      embeddingText(
-        input.relativePath,
-        input.parsed.language,
-        chunk,
-        input.symbolsById,
-        input.input.options.chunking.expansion,
-      ),
-    )
-    const embedded = await input.input
-      .embedBatch?.(texts)
-      .then((embeddings) => embeddings.map((embedding) => ({ embedding })))
-      .catch((error) => chunks.map(() => ({ embeddingError: error instanceof Error ? error.message : String(error) })))
-
-    for (const [index, chunk] of chunks.entries()) {
-      const result = embedded?.[index] ?? { embeddingError: "embedding batch response omitted this input" }
-      if ("embeddingError" in result) {
-        input.fileDiagnostics.push(`embedding failed: ${result.embeddingError}`)
-      }
-      fileChunks[chunk.id] = { ...chunk, ...result }
-    }
-  }
-  return fileChunks
-}
-
 function hasRunStore(
   store: Store,
 ): store is Store & Required<Pick<Store, "beginIndexRun" | "getCompletedFile" | "writeFileResult" | "activateRun">> {
   return Boolean(store.beginIndexRun && store.getCompletedFile && store.writeFileResult && store.activateRun)
+}
+
+function hasBatchRunStore(store: IndexRunStore): store is IndexRunStore & Required<Pick<Store, "writeFileResults">> {
+  return Boolean(store.writeFileResults)
 }
 
 function indexRunConfigHash(index: CastIndex, options: Parameters<typeof createIndexer>[0]["options"]) {
@@ -579,6 +732,30 @@ async function scanFiles(root: string, includeGlobs: string[], excludeGlobs: str
   )
 }
 
+async function mapWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
+  let next = 0
+  let failed = false
+  let firstError: unknown
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (!failed && next < items.length) {
+      const item = items[next]
+      next += 1
+      try {
+        await worker(item)
+      } catch (error) {
+        if (!failed) {
+          failed = true
+          firstError = error
+        }
+      }
+    }
+  })
+  await Promise.allSettled(workers)
+  if (failed) {
+    throw firstError
+  }
+}
+
 async function loadGitignore(root: string, prefix: string): Promise<GitignoreMatcher | undefined> {
   const matcher = ignore()
   try {
@@ -624,8 +801,14 @@ function toGitignorePath(relativePath: string) {
   return relativePath.split(path.sep).join("/")
 }
 
-async function fingerprint(filePath: string) {
-  return createHash("sha256")
-    .update(Buffer.from(await Bun.file(filePath).arrayBuffer()))
-    .digest("hex")
+async function loadTextFileForIndexing(filePath: string): Promise<LoadedFile> {
+  const bytes = Buffer.from(await Bun.file(filePath).arrayBuffer())
+  return {
+    fingerprint: fingerprintBytes(bytes),
+    text: new TextDecoder().decode(bytes),
+  }
+}
+
+function fingerprintBytes(bytes: Uint8Array) {
+  return createHash("sha256").update(bytes).digest("hex")
 }

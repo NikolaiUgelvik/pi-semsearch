@@ -22,6 +22,16 @@ type ResumableStore = ReturnType<typeof createIndexStore> & {
     fileResult: { file: FileRecord; chunks: Record<string, ChunkRecord>; symbols: Record<string, SymbolRecord> },
   ): Promise<void>
 }
+type BatchResumableStore = ResumableStore & {
+  writeFileResults(
+    runId: string,
+    fileResults: Array<{
+      file: FileRecord
+      chunks: Record<string, ChunkRecord>
+      symbols: Record<string, SymbolRecord>
+    }>,
+  ): Promise<void>
+}
 const createIndexer = (input: TestCreateIndexerInput) =>
   createScannerIndexer({
     ...input,
@@ -41,7 +51,225 @@ function readActiveRunId(cacheDir: string) {
   }
 }
 
+async function testFingerprint(filePath: string) {
+  const bytes = new Uint8Array(await Bun.file(filePath).arrayBuffer())
+  const hash = new Bun.CryptoHasher("sha256")
+  hash.update(bytes)
+  return hash.digest("hex")
+}
+
+function createMemoryStore(initial?: CastIndex): CreateIndexerInput["store"] {
+  let index =
+    initial ??
+    createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "memory",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: DEFAULT_CHUNKING_OPTIONS,
+    })
+  return {
+    read: async () => index,
+    write: async (next) => {
+      index = next
+    },
+  }
+}
+
+function disableBatchFileResultWrites(store: ResumableStore) {
+  const storeWithoutBatch = store as Partial<BatchResumableStore>
+  storeWithoutBatch.writeFileResults = undefined
+}
+
 describe("createIndexer", () => {
+  test("batches embeddings across files", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      const batches: string[][] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          embeddingBatchSize: 2,
+        },
+        store: createMemoryStore(),
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => {
+          throw new Error("single embedding should not be called")
+        },
+        embedBatch: async (texts) => {
+          batches.push(texts)
+          return texts.map((_, index) => [index + 1, 0])
+        },
+      })
+
+      const index = await indexer.refresh()
+
+      expect(Object.keys(index.files).sort()).toEqual(["a.ts", "b.ts"])
+      expect(batches).toHaveLength(1)
+      expect(batches[0]).toHaveLength(2)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("processes independent files concurrently", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      let activeParses = 0
+      let maxActiveParses = 0
+      let releaseImmediately = false
+      const releaseParse: Array<() => void> = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          embeddingBatchSize: 2,
+        },
+        store: createMemoryStore(),
+        parse: async () => {
+          activeParses++
+          maxActiveParses = Math.max(maxActiveParses, activeParses)
+          if (!releaseImmediately) {
+            await new Promise<void>((resolve) => releaseParse.push(resolve))
+          }
+          activeParses--
+          return { language: "typescript", root: undefined }
+        },
+        embed: async () => [1, 0],
+        embedBatch: async (texts) => texts.map(() => [1, 0]),
+      })
+
+      const refresh = indexer.refresh()
+      await new Promise<void>((resolve) => {
+        const deadline = Date.now() + 1000
+        const check = () => {
+          if (releaseParse.length >= 2 || Date.now() >= deadline) {
+            resolve()
+            return
+          }
+          setTimeout(check, 1)
+        }
+        check()
+      })
+      releaseImmediately = true
+      for (const release of releaseParse.splice(0)) {
+        release()
+      }
+      await refresh
+
+      expect(maxActiveParses).toBeGreaterThan(1)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("waits for in-flight file workers before rejecting refresh", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Bun.write(path.join(dir, "a-slow.ts"), "export const slow = 1\n")
+      await Bun.write(path.join(dir, "b-fail.ts"), "export const fail = 2\n")
+      let releaseSlowParse: (() => void) | undefined
+      let writeFailureStarted: (() => void) | undefined
+      const writeFailure = new Promise<void>((resolve) => {
+        writeFailureStarted = resolve
+      })
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
+      disableBatchFileResultWrites(store)
+      const originalWriteFileResult = store.writeFileResult.bind(store)
+      store.writeFileResult = async (runId, fileResult) => {
+        if (fileResult.file.path === "b-fail.ts") {
+          writeFailureStarted?.()
+          throw new Error("simulated file write failure")
+        }
+        await originalWriteFileResult(runId, fileResult)
+      }
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store,
+        parse: async (filePath) => {
+          if (path.basename(filePath) === "a-slow.ts") {
+            await new Promise<void>((resolve) => {
+              releaseSlowParse = resolve
+            })
+          }
+          return { language: "typescript", root: undefined }
+        },
+        embed: async () => [1, 0],
+      })
+
+      const refresh = indexer.refresh()
+      await writeFailure
+
+      const settledBeforeSlowWorker = await Promise.race([
+        refresh.then(
+          () => true,
+          () => true,
+        ),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 10)),
+      ])
+      expect(settledBeforeSlowWorker).toBe(false)
+
+      releaseSlowParse?.()
+      await expect(refresh).rejects.toThrow("simulated file write failure")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("reads changed file contents once while fingerprinting and indexing", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const filePath = path.join(dir, "a.ts")
+      const fileText = "export const a = 1\n"
+      await Bun.write(filePath, fileText)
+      let parseSource = ""
+      const index = await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: createMemoryStore(),
+        parse: async (_filePath, source) => {
+          parseSource = source
+          return { language: "typescript", root: undefined }
+        },
+        embed: async () => [1, 0],
+      }).refresh()
+
+      expect(parseSource).toBe(fileText)
+      expect(index.files["a.ts"].fingerprint).toBe(await testFingerprint(filePath))
+      expect(Object.values(index.chunks)[0].text).toBe(fileText)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("resumes a first indexing run after completed files were persisted", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
@@ -51,6 +279,7 @@ describe("createIndexer", () => {
       let parseCalls = 0
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
+      disableBatchFileResultWrites(store)
       const originalWriteFileResult = store.writeFileResult.bind(store)
       let fileWrites = 0
       store.writeFileResult = async (runId, fileResult) => {
@@ -87,11 +316,259 @@ describe("createIndexer", () => {
       const index = await makeIndexer().refresh()
 
       expect(Object.keys(index.files).sort()).toEqual(["a.ts", "b.ts"])
-      expect(parseCalls).toBe(2)
-      expect(embedCalls).toBe(2)
+      expect(parseCalls).toBe(3)
+      expect(embedCalls).toBe(3)
       expect(
         (await createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }).read()).metadata.status,
       ).toBe("ready")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("prefers batched file-result writes when the run store supports them", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
+      const originalWriteFileResults = store.writeFileResults.bind(store)
+      let batchWrites = 0
+      let singleWrites = 0
+      store.writeFileResults = async (runId, fileResults) => {
+        batchWrites++
+        await originalWriteFileResults(runId, fileResults)
+      }
+      store.writeFileResult = async () => {
+        singleWrites++
+        throw new Error("single file writes should not be called")
+      }
+
+      const index = await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store,
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      }).refresh()
+
+      expect(Object.keys(index.files).sort()).toEqual(["a.ts", "b.ts"])
+      expect(batchWrites).toBeGreaterThan(0)
+      expect(singleWrites).toBe(0)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("flushes pending batched file results before rejecting after another worker fails", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      let aEmbedded: (() => void) | undefined
+      const aEmbeddedPromise = new Promise<void>((resolve) => {
+        aEmbedded = resolve
+      })
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
+      const originalGetCompletedFile = store.getCompletedFile.bind(store)
+      const originalWriteFileResults = store.writeFileResults.bind(store)
+      const batchWrites: string[][] = []
+      store.getCompletedFile = async (runId, filePath, fingerprint) => {
+        if (filePath === "b.ts") {
+          await aEmbeddedPromise
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          throw new Error("simulated completed-file lookup failure")
+        }
+        return originalGetCompletedFile(runId, filePath, fingerprint)
+      }
+      store.writeFileResults = async (runId, fileResults) => {
+        batchWrites.push(fileResults.map((fileResult) => fileResult.file.path))
+        await originalWriteFileResults(runId, fileResults)
+      }
+      store.writeFileResult = async () => {
+        throw new Error("single file writes should not be called")
+      }
+
+      await expect(
+        createIndexer({
+          worktree: dir,
+          options: {
+            maxChunkNonWhitespaceChars: 2000,
+            includeGlobs: ["**/*.ts"],
+            excludeGlobs: [],
+            topK: 5,
+            maxContextChars: 12_000,
+          },
+          store,
+          parse: async () => ({ language: "typescript", root: undefined }),
+          embed: async (text) => {
+            if (text.includes("path: a.ts")) {
+              aEmbedded?.()
+            }
+            return [1, 0]
+          },
+        }).refresh(),
+      ).rejects.toThrow("simulated completed-file lookup failure")
+
+      expect(batchWrites).toEqual([["a.ts"]])
+      const db = new Database(path.join(cacheDir, "key", "index.sqlite"))
+      try {
+        expect(db.query("select path from file_runs order by path").all()).toEqual([{ path: "a.ts" }])
+      } finally {
+        db.close()
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("preserves worker failure when error-path flush fails", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      let aEmbedded: (() => void) | undefined
+      const aEmbeddedPromise = new Promise<void>((resolve) => {
+        aEmbedded = resolve
+      })
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
+      const originalGetCompletedFile = store.getCompletedFile.bind(store)
+      store.getCompletedFile = async (runId, filePath, fingerprint) => {
+        if (filePath === "b.ts") {
+          await aEmbeddedPromise
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          throw new Error("simulated worker failure")
+        }
+        return originalGetCompletedFile(runId, filePath, fingerprint)
+      }
+      store.writeFileResults = async () => {
+        throw new Error("simulated flush failure")
+      }
+      store.writeFileResult = async () => {
+        throw new Error("single file writes should not be called")
+      }
+
+      let thrown: unknown
+      try {
+        await createIndexer({
+          worktree: dir,
+          options: {
+            maxChunkNonWhitespaceChars: 2000,
+            includeGlobs: ["**/*.ts"],
+            excludeGlobs: [],
+            topK: 5,
+            maxContextChars: 12_000,
+          },
+          store,
+          parse: async () => ({ language: "typescript", root: undefined }),
+          embed: async (text) => {
+            if (text.includes("path: a.ts")) {
+              aEmbedded?.()
+            }
+            return [1, 0]
+          },
+        }).refresh()
+      } catch (error) {
+        thrown = error
+      }
+
+      expect(thrown).toBeInstanceOf(AggregateError)
+      expect((thrown as AggregateError).errors).toHaveLength(2)
+      expect((thrown as AggregateError).errors.map(String)).toEqual([
+        "Error: simulated worker failure",
+        "Error: simulated flush failure",
+      ])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("falls back to single file-result writes when batch writes are unavailable", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
+      const originalWriteFileResult = store.writeFileResult.bind(store)
+      disableBatchFileResultWrites(store)
+      let singleWrites = 0
+      store.writeFileResult = async (runId, fileResult) => {
+        singleWrites++
+        await originalWriteFileResult(runId, fileResult)
+      }
+
+      const index = await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store,
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      }).refresh()
+
+      expect(Object.keys(index.files)).toEqual(["a.ts"])
+      expect(singleWrites).toBe(1)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("serializes legacy single file-result writes", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
+      const originalWriteFileResult = store.writeFileResult.bind(store)
+      disableBatchFileResultWrites(store)
+      let activeWrites = 0
+      let overlapped = false
+      store.writeFileResult = async (runId, fileResult) => {
+        activeWrites++
+        if (activeWrites > 1) {
+          overlapped = true
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        await originalWriteFileResult(runId, fileResult)
+        activeWrites--
+      }
+
+      const index = await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store,
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      }).refresh()
+
+      expect(Object.keys(index.files).sort()).toEqual(["a.ts", "b.ts"])
+      expect(overlapped).toBe(false)
     } finally {
       await rm(dir, { recursive: true, force: true })
       await rm(cacheDir, { recursive: true, force: true })
@@ -190,6 +667,7 @@ describe("createIndexer", () => {
       let parseCalls = 0
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
+      disableBatchFileResultWrites(store)
       const originalWriteFileResult = store.writeFileResult.bind(store)
       let fileWrites = 0
       store.writeFileResult = async (runId, fileResult) => {
@@ -253,6 +731,7 @@ describe("createIndexer", () => {
       let parseCalls = 0
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
+      disableBatchFileResultWrites(store)
       const originalWriteFileResult = store.writeFileResult.bind(store)
       let fileWrites = 0
       store.writeFileResult = async (runId, fileResult) => {
@@ -1480,6 +1959,97 @@ describe("createIndexer", () => {
         [1, 2],
         [2, 0],
         [2, 1],
+      ])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("records synchronous batch embedding failures without hanging workers", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "ab\n")
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 1,
+          maxFileBytes: 1024,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          embeddingBatchSize: 2,
+          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => {
+          throw new Error("single embedding should not be used")
+        },
+        embedBatch: () => {
+          throw new Error("batch embed failed synchronously")
+        },
+      })
+
+      const result = await Promise.race([
+        indexer.refresh().then(() => "settled" as const),
+        new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 100)),
+      ])
+
+      expect(result).toBe("settled")
+      expect(Object.values(index.chunks).map((chunk) => chunk.embeddingError)).toEqual([
+        "batch embed failed synchronously",
+        "batch embed failed synchronously",
+      ])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("records synchronous single embedding failures without hanging workers", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "ab\n")
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 1,
+          maxFileBytes: 1024,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          embeddingBatchSize: 2,
+          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: () => {
+          throw new Error("single embed failed synchronously")
+        },
+      })
+
+      const result = await Promise.race([
+        indexer.refresh().then(() => "settled" as const),
+        new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 100)),
+      ])
+
+      expect(result).toBe("settled")
+      expect(Object.values(index.chunks).map((chunk) => chunk.embeddingError)).toEqual([
+        "single embed failed synchronously",
+        "single embed failed synchronously",
       ])
     } finally {
       await rm(dir, { recursive: true, force: true })

@@ -16,6 +16,7 @@ export type Store = {
     }>;
     getCompletedFile?(runId: string, filePath: string, fingerprint: string): Promise<FileResult | undefined>;
     writeFileResult?(runId: string, fileResult: FileResult): Promise<void>;
+    writeFileResults?(runId: string, fileResults: FileResult[]): Promise<void>;
     activateRun?(runId: string, index: CastIndex): Promise<void>;
 };
 export declare function createIndexer(input: {

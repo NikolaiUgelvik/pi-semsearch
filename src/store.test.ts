@@ -39,6 +39,16 @@ type ResumableStore = ReturnType<typeof createIndexStore> & {
   ): Promise<void>
   activateRun(runId: string, index: CastIndex): Promise<void>
 }
+type BatchResumableStore = ResumableStore & {
+  writeFileResults(
+    runId: string,
+    fileResults: Array<{
+      file: FileRecord
+      chunks: Record<string, ChunkRecord>
+      symbols: Record<string, SymbolRecord>
+    }>,
+  ): Promise<void>
+}
 
 const MISSING_CHUNK_RECORD_COLUMN_PATTERN = /record_json|no such column/
 
@@ -413,6 +423,11 @@ describe("index store", () => {
         configHash: "same-config",
         metadata: { ...newIndex.metadata, status: "indexing" },
       })
+      await store.writeFileResult(runId, {
+        file: newIndex.files["new.ts"],
+        chunks: { new: newIndex.chunks.new },
+        symbols: {},
+      })
 
       await store.activateRun(runId, newIndex)
 
@@ -427,6 +442,158 @@ describe("index store", () => {
       } finally {
         db.close()
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("activates an indexing run without rewriting existing file and chunk rows", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
+      const index = createEmptyIndex({
+        projectId: "p",
+        worktree: "/repo",
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      index.metadata.status = "ready"
+      index.metadata.embeddingDimensions = 2
+      const symbol: SymbolRecord = {
+        id: "sym-a",
+        name: "a",
+        kind: "function",
+        filePath: "src/a.ts",
+        range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+        childSymbolIds: [],
+      }
+      index.files["src/a.ts"] = {
+        path: "src/a.ts",
+        language: "typescript",
+        fingerprint: "fresh",
+        chunkIds: ["a"],
+        diagnostics: [],
+      }
+      index.chunks.a = { ...chunk("a", "src/a.ts", [1, 0]), symbolIds: [symbol.id] }
+      index.symbols[symbol.id] = symbol
+      const { runId } = await store.beginIndexRun({
+        configHash: "same-config",
+        metadata: { ...index.metadata, status: "indexing" },
+      })
+      await store.writeFileResult(runId, {
+        file: index.files["src/a.ts"],
+        chunks: { a: index.chunks.a },
+        symbols: { [symbol.id]: symbol },
+      })
+      const dbPath = path.join(dir, "project", "index.sqlite")
+      const db = new Database(dbPath)
+      let expectedVectorRow: { vectorRowid: number; embeddingJson: string }
+      try {
+        loadSqliteVec(db)
+        const chunkRow = db
+          .query("select record_json as recordJson from chunks where run_id = ? and id = ?")
+          .get(runId, "a") as {
+          recordJson: string
+        }
+        db.run("update chunks set record_json = ? where run_id = ? and id = ?", [
+          JSON.stringify({ ...JSON.parse(chunkRow.recordJson), activationMarker: true }),
+          runId,
+          "a",
+        ])
+        const symbolRow = db
+          .query("select record_json as recordJson from symbols where run_id = ? and id = ?")
+          .get(runId, symbol.id) as {
+          recordJson: string
+        }
+        db.run("update symbols set record_json = ? where run_id = ? and id = ?", [
+          JSON.stringify({ ...JSON.parse(symbolRow.recordJson), activationMarker: true }),
+          runId,
+          symbol.id,
+        ])
+        db.run("update file_runs set diagnostics_json = ? where run_id = ? and path = ?", [
+          JSON.stringify(["activation-marker"]),
+          runId,
+          "src/a.ts",
+        ])
+        expectedVectorRow = db
+          .query(
+            `select chunk_rowids.rowid as vectorRowid,
+                    vec_to_json(chunk_vectors.embedding) as embeddingJson
+             from chunk_rowids
+             inner join chunk_vectors on chunk_vectors.rowid = chunk_rowids.rowid
+             where chunk_rowids.run_id = ? and chunk_rowids.chunk_id = ?`,
+          )
+          .get(runId, "a") as { vectorRowid: number; embeddingJson: string }
+      } finally {
+        db.close()
+      }
+
+      await store.activateRun(runId, index)
+
+      const reopened = new Database(dbPath)
+      try {
+        loadSqliteVec(reopened)
+        const row = reopened
+          .query(
+            `select chunks.record_json as chunkJson,
+                    file_runs.diagnostics_json as diagnosticsJson,
+                    symbols.record_json as symbolJson,
+                    chunk_rowids.rowid as vectorRowid,
+                    vec_to_json(chunk_vectors.embedding) as embeddingJson
+             from chunks
+             inner join file_runs on file_runs.run_id = chunks.run_id and file_runs.path = chunks.file_path
+             inner join symbols on symbols.run_id = chunks.run_id and symbols.id = ?
+             inner join chunk_rowids on chunk_rowids.run_id = chunks.run_id and chunk_rowids.chunk_id = chunks.id
+             inner join chunk_vectors on chunk_vectors.rowid = chunk_rowids.rowid
+             where chunks.run_id = ? and chunks.id = ?`,
+          )
+          .get(symbol.id, runId, "a") as {
+          chunkJson: string
+          diagnosticsJson: string
+          symbolJson: string
+          vectorRowid: number
+          embeddingJson: string
+        }
+        expect(JSON.parse(row.chunkJson).activationMarker).toBe(true)
+        expect(JSON.parse(row.diagnosticsJson)).toEqual(["activation-marker"])
+        expect(JSON.parse(row.symbolJson).activationMarker).toBe(true)
+        expect(row.vectorRowid).toBe(expectedVectorRow.vectorRowid)
+        expect(row.embeddingJson).toBe(expectedVectorRow.embeddingJson)
+      } finally {
+        reopened.close()
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("does not activate an incomplete indexing run", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
+      const index = createEmptyIndex({
+        projectId: "p",
+        worktree: "/repo",
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      index.metadata.status = "ready"
+      index.metadata.embeddingDimensions = 2
+      index.files["src/a.ts"] = {
+        path: "src/a.ts",
+        language: "typescript",
+        fingerprint: "fresh",
+        chunkIds: ["a"],
+        diagnostics: [],
+      }
+      index.chunks.a = chunk("a", "src/a.ts", [1, 0])
+      const { runId } = await store.beginIndexRun({
+        configHash: "same-config",
+        metadata: { ...index.metadata, status: "indexing" },
+      })
+
+      await expect(store.activateRun(runId, index)).rejects.toThrow("incomplete indexing run")
+      expect((await store.read()).metadata.status).toBe("empty")
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -464,6 +631,61 @@ describe("index store", () => {
       expect(completed?.file).toEqual(file)
       expect(completed?.chunks.a.embedding).toEqual([1, 0])
       expect(stale).toBeUndefined()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("writes multiple completed file results in one indexing run batch", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const worktree = path.join(dir, "worktree")
+      const aPath = path.join(worktree, "src/a.ts")
+      const bPath = path.join(worktree, "src/b.ts")
+      await mkdir(path.dirname(aPath), { recursive: true })
+      await Bun.write(aPath, "function a() {}\n")
+      await Bun.write(bPath, "function b() {}\n")
+      const store = createIndexStore({
+        cacheDir: dir,
+        cacheKey: "project",
+        embeddingDimensions: 2,
+      }) as BatchResumableStore
+      const index = createEmptyIndex({
+        projectId: "p",
+        worktree,
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      index.metadata.status = "indexing"
+      index.metadata.embeddingDimensions = 2
+      const { runId } = await store.beginIndexRun({ configHash: "same", metadata: index.metadata })
+      const aFile = {
+        path: "src/a.ts",
+        language: "typescript",
+        fingerprint: await testFingerprint(aPath),
+        chunkIds: ["a"],
+        diagnostics: [],
+      }
+      const bFile = {
+        path: "src/b.ts",
+        language: "typescript",
+        fingerprint: await testFingerprint(bPath),
+        chunkIds: ["b"],
+        diagnostics: [],
+      }
+
+      await store.writeFileResults(runId, [
+        { file: aFile, chunks: { a: chunk("a", "src/a.ts", [1, 0]) }, symbols: {} },
+        { file: bFile, chunks: { b: chunk("b", "src/b.ts", [0, 1]) }, symbols: {} },
+      ])
+
+      const completedA = await store.getCompletedFile(runId, "src/a.ts", aFile.fingerprint)
+      const completedB = await store.getCompletedFile(runId, "src/b.ts", bFile.fingerprint)
+
+      expect(completedA?.file).toEqual(aFile)
+      expect(completedA?.chunks.a.embedding).toEqual([1, 0])
+      expect(completedB?.file).toEqual(bFile)
+      expect(completedB?.chunks.b.embedding).toEqual([0, 1])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

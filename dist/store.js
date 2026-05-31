@@ -143,6 +143,15 @@ function createSqliteIndexStore(cacheDir, cacheKey, embeddingDimensions) {
                 db.close();
             }
         },
+        async writeFileResults(runId, fileResults) {
+            const db = await openSqliteIndex(file, embeddingDimensions ?? inferFileResultsEmbeddingDimensions(fileResults));
+            try {
+                writeSqliteFileResults(db, runId, fileResults);
+            }
+            finally {
+                db.close();
+            }
+        },
         async activateRun(runId, index) {
             const db = await openSqliteIndex(file, embeddingDimensions ?? inferEmbeddingDimensions(index));
             try {
@@ -626,26 +635,28 @@ function getCompletedSqliteFile(db, runId, filePath, fingerprint) {
     };
 }
 function writeSqliteFileResult(db, runId, fileResult) {
-    const write = db.transaction((result) => {
-        deleteRunFile(db, runId, result.file.path);
-        insertFile(db, runId, result.file, false);
-        insertChunks(db, runId, Object.values(result.chunks));
-        for (const symbol of Object.values(result.symbols)) {
-            insertSymbol(db, runId, symbol);
+    writeSqliteFileResults(db, runId, [fileResult]);
+}
+function writeSqliteFileResults(db, runId, fileResults) {
+    const write = db.transaction((results) => {
+        for (const result of results) {
+            deleteRunFile(db, runId, result.file.path);
+            insertFile(db, runId, result.file, false);
+            insertChunks(db, runId, Object.values(result.chunks));
+            for (const symbol of Object.values(result.symbols)) {
+                insertSymbol(db, runId, symbol);
+            }
         }
     });
-    write(fileResult);
+    write(fileResults);
 }
 function activateSqliteRun(db, runId, index) {
     const activate = db.transaction((castIndex) => {
-        deleteRunRecords(db, runId);
+        validateCompletedRunRows(db, runId, castIndex);
         for (const file of Object.values(castIndex.files)) {
-            insertFile(db, runId, file);
+            upsertGlobalFile(db, file);
         }
-        insertChunks(db, runId, Object.values(castIndex.chunks));
-        for (const symbol of Object.values(castIndex.symbols)) {
-            insertSymbol(db, runId, symbol);
-        }
+        db.run("delete from lexical where run_id = ?", [runId]);
         if (castIndex.lexical) {
             insertLexical(db, runId, castIndex.lexical);
         }
@@ -658,6 +669,18 @@ function activateSqliteRun(db, runId, index) {
         pruneSupersededRuns(db, runId);
     });
     activate(index);
+}
+function validateCompletedRunRows(db, runId, index) {
+    const run = db.query("select status from runs where id = ?").get(runId);
+    const expected = Object.keys(index.files).sort();
+    const rows = db.query("select path from file_runs where run_id = ? order by path").all(runId);
+    const actual = rows.map((row) => row.path);
+    if (run?.status !== "indexing" || !sameStringArray(actual, expected)) {
+        throw new Error("incomplete indexing run cannot be activated");
+    }
+}
+function sameStringArray(left, right) {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 function searchSqliteVectorCandidates(db, queryEmbedding, topK, paths) {
     const activeRunId = readActiveRunId(db);
@@ -856,12 +879,7 @@ function insertRun(db, runId, index) {
 }
 function insertFile(db, runId, file, updateGlobalFile = true) {
     if (updateGlobalFile) {
-        db.run("insert or replace into files (path, language, fingerprint, diagnostics_json) values (?, ?, ?, ?)", [
-            file.path,
-            file.language,
-            file.fingerprint,
-            JSON.stringify(file.diagnostics),
-        ]);
+        upsertGlobalFile(db, file);
     }
     db.run("insert or replace into file_runs (run_id, path, language, fingerprint, diagnostics_json, chunk_ids_json) values (?, ?, ?, ?, ?, ?)", [
         runId,
@@ -870,6 +888,14 @@ function insertFile(db, runId, file, updateGlobalFile = true) {
         file.fingerprint,
         JSON.stringify(file.diagnostics),
         JSON.stringify(file.chunkIds),
+    ]);
+}
+function upsertGlobalFile(db, file) {
+    db.run("insert or replace into files (path, language, fingerprint, diagnostics_json) values (?, ?, ?, ?)", [
+        file.path,
+        file.language,
+        file.fingerprint,
+        JSON.stringify(file.diagnostics),
     ]);
 }
 function insertChunks(db, runId, chunks) {
@@ -976,6 +1002,9 @@ function inferEmbeddingDimensions(index) {
 }
 function inferFileResultEmbeddingDimensions(fileResult) {
     return Object.values(fileResult.chunks).find((chunk) => chunk.embedding)?.embedding?.length;
+}
+function inferFileResultsEmbeddingDimensions(fileResults) {
+    return fileResults.map(inferFileResultEmbeddingDimensions).find((dimensions) => dimensions !== undefined);
 }
 function addColumnIfMissing(db, table, column, definition) {
     const columns = db.query(`pragma table_info(${table})`).all();
