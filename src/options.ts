@@ -10,6 +10,9 @@ const ApiConfig = z.object({
   model: z.string().optional(),
   dimensions: z.number().int().positive().optional(),
 })
+const EmbeddingConfig = ApiConfig.extend({
+  batchSize: z.number().int().positive().optional(),
+})
 const RerankConfig = ApiConfig.omit({ dimensions: true }).extend({
   candidateMultiplier: z.number().int().positive().optional(),
 })
@@ -35,7 +38,7 @@ const ChunkingOptionsSchema = z.object({
 })
 
 const OptionsSchema = z.object({
-  embedding: ApiConfig.optional(),
+  embedding: EmbeddingConfig.optional(),
   hyde: ApiConfig.extend({
     enabled: z.boolean().optional(),
     threshold: z.number().min(-1).max(1).optional(),
@@ -55,6 +58,7 @@ const OptionsRecord = z.record(z.string(), z.unknown())
 
 const OptionFields = OptionsSchema.shape
 const ApiFields = ApiConfig.shape
+const EmbeddingFields = OptionFields.embedding.unwrap().shape
 const HydeFields = OptionFields.hyde.unwrap().shape
 const RerankFields = OptionFields.rerank.unwrap().shape
 const HybridFields = RetrievalOptions.shape.hybrid.unwrap().shape
@@ -81,6 +85,7 @@ const DEFAULT_MAX_CHUNK_NON_WHITESPACE_CHARS = 2000
 const DEFAULT_MAX_FILE_BYTES = Number("2") * MIB
 const DEFAULT_MAX_CONTEXT_CHARS = 12_000
 const DEFAULT_TOP_K = 5
+const DEFAULT_EMBEDDING_BATCH_SIZE = 16
 const DEFAULT_EXCLUDE_GLOBS = [
   "**/*.{png,jpg,jpeg,gif,webp,ico,pdf,zip,gz,tgz,tar,7z,mp4,mov,mp3,woff,woff2,ttf,eot}",
   "**/bun.lock",
@@ -149,7 +154,7 @@ function diagnosticMessage(key: string, issue: z.ZodIssue) {
 
 function rawOptions(data: Record<string, unknown>, parsed: ReturnType<typeof parseOptionFields>) {
   return {
-    embedding: parsedValue(parsed.embedding) ?? parseApiConfig(data.embedding),
+    embedding: parsedValue(parsed.embedding) ?? parseEmbeddingConfig(data.embedding),
     hyde: parsedValue(parsed.hyde) ?? parseHydeConfig(data.hyde),
     rerank: parsedValue(parsed.rerank) ?? parseRerankConfig(data.rerank),
     retrieval: parsedValue(parsed.retrieval) ?? parseRetrievalOptions(data.retrieval),
@@ -238,7 +243,13 @@ function cacheBaseDir(env: Record<string, string | undefined>) {
 
 function embeddingOptions(raw: ReturnType<typeof rawOptions>["embedding"], apiKey: string | undefined) {
   return raw?.baseURL && raw.model
-    ? { baseURL: raw.baseURL, apiKey, model: raw.model, dimensions: raw.dimensions }
+    ? {
+        baseURL: raw.baseURL,
+        apiKey,
+        model: raw.model,
+        dimensions: raw.dimensions,
+        batchSize: raw.batchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE,
+      }
     : undefined
 }
 
@@ -313,6 +324,19 @@ function parseApiConfig(input: unknown) {
     apiKeyEnv: safeField(ApiFields.apiKeyEnv, inputRecord.data.apiKeyEnv),
     model: safeField(ApiFields.model, inputRecord.data.model),
     dimensions: safeField(ApiFields.dimensions, inputRecord.data.dimensions),
+  }
+}
+
+function parseEmbeddingConfig(input: unknown) {
+  const inputRecord = OptionsRecord.safeParse(input ?? {})
+  if (!inputRecord.success) {
+    return
+  }
+
+  const api = parseApiConfig(input)
+  return {
+    ...api,
+    batchSize: safeField(EmbeddingFields.batchSize, inputRecord.data.batchSize),
   }
 }
 

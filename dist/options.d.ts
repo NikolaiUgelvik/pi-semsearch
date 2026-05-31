@@ -13,6 +13,7 @@ export declare function parseOptions(input: unknown, env?: Record<string, string
         apiKey: string | undefined;
         model: string;
         dimensions: number | undefined;
+        batchSize: number;
     } | undefined;
     hyde: HydeOptions;
     rerank: {

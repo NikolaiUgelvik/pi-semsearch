@@ -4,6 +4,7 @@ export function createOpenAIClient(options = {}) {
     const request = options.fetch ?? fetch;
     return {
         embed: (input) => embed(request, input),
+        embedBatch: (input) => embedBatch(request, input),
         generateHyde: (input) => generateHyde(request, input),
         rerank: (input) => rerank(request, input),
     };
@@ -19,6 +20,18 @@ async function embed(request, input) {
         }),
     }, "Embedding");
     return embeddingFromBody(body);
+}
+async function embedBatch(request, input) {
+    const body = await requestJson(request, `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`, {
+        method: "POST",
+        headers: buildHeaders(input.apiKey),
+        body: JSON.stringify({
+            model: input.model,
+            input: input.input,
+            ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
+        }),
+    }, "Embedding");
+    return embeddingsFromBody(body, input.input.length);
 }
 async function generateHyde(request, input) {
     const body = await requestJson(request, `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/chat/completions`, {
@@ -63,6 +76,19 @@ function embeddingFromBody(body) {
         return embedding;
     }
     throw new Error("Embedding response did not include data[0].embedding");
+}
+function embeddingsFromBody(body, expectedCount) {
+    const data = arrayProperty(body, "data");
+    if (data?.length !== expectedCount) {
+        throw new Error("Embedding response did not include one embedding per input");
+    }
+    return data.map((item) => {
+        const embedding = isRecord(item) ? item.embedding : undefined;
+        if (isNumberArray(embedding) && embedding.length > 0) {
+            return embedding;
+        }
+        throw new Error("Embedding response did not include one embedding per input");
+    });
 }
 function hydeContentFromBody(body) {
     const content = arrayProperty(body, "choices")?.[0]?.message?.content;

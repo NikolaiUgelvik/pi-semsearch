@@ -28,6 +28,7 @@ export declare function createIndexer(input: {
         topK: number;
         maxContextChars: number;
         chunking: ChunkingOptions;
+        embeddingBatchSize?: number;
     };
     store: Store;
     parse(filePath: string, source: string): Promise<{
@@ -35,6 +36,7 @@ export declare function createIndexer(input: {
         root?: SyntaxNode;
     }>;
     embed(text: string): Promise<number[]>;
+    embedBatch?(texts: string[]): Promise<number[][]>;
 }): {
     refresh(): Promise<CastIndex>;
 };

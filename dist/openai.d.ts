@@ -9,6 +9,13 @@ export declare function createOpenAIClient(options?: {
         dimensions?: number;
         input: string;
     }) => Promise<number[]>;
+    embedBatch: (input: {
+        baseURL: string;
+        apiKey?: string;
+        model: string;
+        dimensions?: number;
+        input: string[];
+    }) => Promise<number[][]>;
     generateHyde: (input: {
         baseURL: string;
         apiKey?: string;

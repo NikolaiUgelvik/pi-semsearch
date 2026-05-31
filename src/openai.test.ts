@@ -53,6 +53,26 @@ describe("createOpenAIClient", () => {
     expect(bodies).toEqual([{ model: "embed", input: "hello", dimensions: 1 }])
   })
 
+  test("embeds batches with OpenAI-compatible request shape", async () => {
+    const bodies: unknown[] = []
+    const client = createOpenAIClient({
+      fetch: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        return Response.json({ data: [{ embedding: [1] }, { embedding: [2] }] })
+      },
+    })
+
+    const embeddings = await client.embedBatch({
+      baseURL: "https://example.test/v1",
+      apiKey: "key",
+      model: "embed",
+      input: ["first", "second"],
+    })
+
+    expect(embeddings).toEqual([[1], [2]])
+    expect(bodies).toEqual([{ model: "embed", input: ["first", "second"] }])
+  })
+
   test("generates HyDE text with chat completions", async () => {
     const calls: unknown[] = []
     const client = createOpenAIClient({

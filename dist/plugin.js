@@ -94,10 +94,12 @@ export function createCastPluginForTest(dependencies = {}) {
                         topK: options.topK,
                         maxContextChars: options.maxContextChars,
                         chunking: options.chunking,
+                        embeddingBatchSize: embedding.batchSize,
                     },
                     store: indexingStore,
                     parse: parseSource,
                     embed: (text) => client.embed({ ...embedding, input: text }),
+                    embedBatch: (texts) => client.embedBatch({ ...embedding, input: texts }),
                 }).refresh();
             })
                 .catch((error) => {

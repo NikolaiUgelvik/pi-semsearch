@@ -16,6 +16,7 @@ const BYTE_FORM_FEED = 12;
 const BYTE_CARRIAGE_RETURN = 13;
 const CONTROL_BYTE_LIMIT = 32;
 const BINARY_CONTROL_RATIO = 0.3;
+const DEFAULT_EMBEDDING_BATCH_SIZE = 16;
 export function createIndexer(input) {
     return {
         async refresh() {
@@ -208,6 +209,9 @@ async function indexFile(input) {
     }
 }
 async function embedChunks(input) {
+    if (input.input.embedBatch) {
+        return embedChunkBatches(input);
+    }
     const fileChunks = {};
     for (const chunk of input.chunks) {
         const embedded = await input.input
@@ -218,6 +222,26 @@ async function embedChunks(input) {
             input.fileDiagnostics.push(`embedding failed: ${embedded.embeddingError}`);
         }
         fileChunks[chunk.id] = { ...chunk, ...embedded };
+    }
+    return fileChunks;
+}
+async function embedChunkBatches(input) {
+    const fileChunks = {};
+    const batchSize = input.input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE;
+    for (let start = 0; start < input.chunks.length; start += batchSize) {
+        const chunks = input.chunks.slice(start, start + batchSize);
+        const texts = chunks.map((chunk) => embeddingText(input.relativePath, input.parsed.language, chunk, input.symbolsById, input.input.options.chunking.expansion));
+        const embedded = await input.input
+            .embedBatch?.(texts)
+            .then((embeddings) => embeddings.map((embedding) => ({ embedding })))
+            .catch((error) => chunks.map(() => ({ embeddingError: error instanceof Error ? error.message : String(error) })));
+        for (const [index, chunk] of chunks.entries()) {
+            const result = embedded?.[index] ?? { embeddingError: "embedding batch response omitted this input" };
+            if ("embeddingError" in result) {
+                input.fileDiagnostics.push(`embedding failed: ${result.embeddingError}`);
+            }
+            fileChunks[chunk.id] = { ...chunk, ...result };
+        }
     }
     return fileChunks;
 }

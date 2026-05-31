@@ -43,6 +43,7 @@ const BYTE_FORM_FEED = 12
 const BYTE_CARRIAGE_RETURN = 13
 const CONTROL_BYTE_LIMIT = 32
 const BINARY_CONTROL_RATIO = 0.3
+const DEFAULT_EMBEDDING_BATCH_SIZE = 16
 
 export function createIndexer(input: {
   worktree: string
@@ -54,10 +55,12 @@ export function createIndexer(input: {
     topK: number
     maxContextChars: number
     chunking: ChunkingOptions
+    embeddingBatchSize?: number
   }
   store: Store
   parse(filePath: string, source: string): Promise<{ language: string; root?: SyntaxNode }>
   embed(text: string): Promise<number[]>
+  embedBatch?(texts: string[]): Promise<number[][]>
 }) {
   return {
     async refresh() {
@@ -325,6 +328,9 @@ async function embedChunks(input: {
   symbolsById: Record<string, SymbolRecord>
   fileDiagnostics: string[]
 }) {
+  if (input.input.embedBatch) {
+    return embedChunkBatches(input)
+  }
   const fileChunks: CastIndex["chunks"] = {}
   for (const chunk of input.chunks) {
     const embedded = await input.input
@@ -343,6 +349,43 @@ async function embedChunks(input: {
       input.fileDiagnostics.push(`embedding failed: ${embedded.embeddingError}`)
     }
     fileChunks[chunk.id] = { ...chunk, ...embedded }
+  }
+  return fileChunks
+}
+
+async function embedChunkBatches(input: {
+  input: CreateIndexerInput
+  relativePath: string
+  parsed: { language: string }
+  chunks: ChunkRecord[]
+  symbolsById: Record<string, SymbolRecord>
+  fileDiagnostics: string[]
+}) {
+  const fileChunks: CastIndex["chunks"] = {}
+  const batchSize = input.input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE
+  for (let start = 0; start < input.chunks.length; start += batchSize) {
+    const chunks = input.chunks.slice(start, start + batchSize)
+    const texts = chunks.map((chunk) =>
+      embeddingText(
+        input.relativePath,
+        input.parsed.language,
+        chunk,
+        input.symbolsById,
+        input.input.options.chunking.expansion,
+      ),
+    )
+    const embedded = await input.input
+      .embedBatch?.(texts)
+      .then((embeddings) => embeddings.map((embedding) => ({ embedding })))
+      .catch((error) => chunks.map(() => ({ embeddingError: error instanceof Error ? error.message : String(error) })))
+
+    for (const [index, chunk] of chunks.entries()) {
+      const result = embedded?.[index] ?? { embeddingError: "embedding batch response omitted this input" }
+      if ("embeddingError" in result) {
+        input.fileDiagnostics.push(`embedding failed: ${result.embeddingError}`)
+      }
+      fileChunks[chunk.id] = { ...chunk, ...result }
+    }
   }
   return fileChunks
 }

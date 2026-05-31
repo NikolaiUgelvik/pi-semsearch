@@ -1437,6 +1437,55 @@ describe("createIndexer", () => {
     }
   })
 
+  test("embeds changed chunks in configured batches and flushes partial batches", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "abcde\n")
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 })
+      const batches: string[][] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 1,
+          maxFileBytes: 1024,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          embeddingBatchSize: 3,
+          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => {
+          throw new Error("single embedding should not be used")
+        },
+        embedBatch: async (texts) => {
+          batches.push(texts)
+          return texts.map((_, batchIndex) => [batches.length, batchIndex])
+        },
+      })
+
+      await indexer.refresh()
+
+      expect(batches.map((batch) => batch.length)).toEqual([3, 2])
+      expect(Object.values(index.chunks).map((chunk) => chunk.embedding)).toEqual([
+        [1, 0],
+        [1, 1],
+        [1, 2],
+        [2, 0],
+        [2, 1],
+      ])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("persists lexical stats from chunk text and code metadata despite embedding failures", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {

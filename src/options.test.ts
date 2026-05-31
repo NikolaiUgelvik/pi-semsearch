@@ -23,6 +23,7 @@ describe("parseOptions", () => {
       apiKey: "secret",
       model: "text-embedding-3-small",
       dimensions: undefined,
+      batchSize: 16,
     })
     expect(options.hyde).toEqual({
       mode: "opencode",
@@ -52,6 +53,22 @@ describe("parseOptions", () => {
       vectorWeight: 1,
       bm25Weight: 1,
     })
+  })
+
+  test("parses configured embedding batch size", () => {
+    const options = parseOptions(
+      {
+        embedding: {
+          baseURL: "https://example.test/v1",
+          apiKey: "literal",
+          model: "text-embedding-3-small",
+          batchSize: 4,
+        },
+      },
+      {},
+    )
+
+    expect(options.embedding?.batchSize).toBe(4)
   })
 
   test("parses configured hybrid retrieval options", () => {
@@ -161,6 +178,7 @@ describe("parseOptions", () => {
       apiKey: "embedding-key",
       model: "text-embedding-3-small",
       dimensions: undefined,
+      batchSize: 16,
     })
     expect(options.rerank).toBeUndefined()
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("rerank.baseURL:"))).toBe(true)
@@ -456,6 +474,7 @@ describe("parseOptions", () => {
       apiKey: "literal",
       model: "text-embedding-3-small",
       dimensions: undefined,
+      batchSize: 16,
     })
     expect(options.topK).toBe(5)
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("topK:"))).toBe(true)
@@ -516,6 +535,7 @@ describe("parseOptions", () => {
       apiKey: "literal",
       model: "text-embedding-3-small",
       dimensions: undefined,
+      batchSize: 16,
     })
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("embedding.dimensions:"))).toBe(true)
     expect(options.diagnostics).not.toContain("embedding.baseURL is required")

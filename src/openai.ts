@@ -11,6 +11,9 @@ export function createOpenAIClient(options: { fetch?: FetchLike } = {}) {
     embed: (input: { baseURL: string; apiKey?: string; model: string; dimensions?: number; input: string }) =>
       embed(request, input),
 
+    embedBatch: (input: { baseURL: string; apiKey?: string; model: string; dimensions?: number; input: string[] }) =>
+      embedBatch(request, input),
+
     generateHyde: (input: { baseURL: string; apiKey?: string; model: string; query: string }) =>
       generateHyde(request, input),
 
@@ -38,6 +41,27 @@ async function embed(
     "Embedding",
   )
   return embeddingFromBody(body)
+}
+
+async function embedBatch(
+  request: FetchLike,
+  input: { baseURL: string; apiKey?: string; model: string; dimensions?: number; input: string[] },
+) {
+  const body = await requestJson(
+    request,
+    `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`,
+    {
+      method: "POST",
+      headers: buildHeaders(input.apiKey),
+      body: JSON.stringify({
+        model: input.model,
+        input: input.input,
+        ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
+      }),
+    },
+    "Embedding",
+  )
+  return embeddingsFromBody(body, input.input.length)
 }
 
 async function generateHyde(
@@ -102,6 +126,20 @@ function embeddingFromBody(body: unknown) {
     return embedding
   }
   throw new Error("Embedding response did not include data[0].embedding")
+}
+
+function embeddingsFromBody(body: unknown, expectedCount: number) {
+  const data = arrayProperty(body, "data")
+  if (data?.length !== expectedCount) {
+    throw new Error("Embedding response did not include one embedding per input")
+  }
+  return data.map((item) => {
+    const embedding = isRecord(item) ? item.embedding : undefined
+    if (isNumberArray(embedding) && embedding.length > 0) {
+      return embedding
+    }
+    throw new Error("Embedding response did not include one embedding per input")
+  })
 }
 
 function hydeContentFromBody(body: unknown) {

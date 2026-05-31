@@ -797,15 +797,12 @@ describe("cast plugin", () => {
           if (url.endsWith("/chat/completions")) {
             return Response.json({ choices: [{ message: { content: "session function" } }] })
           }
+          const inputs = (Array.isArray(body.input) ? body.input : [body.input]) as string[]
           return Response.json({
-            data: [
-              {
-                embedding:
-                  body.input === "session function" || String(body.input).includes("export function session")
-                    ? [0, 1]
-                    : [1, 0],
-              },
-            ],
+            data: inputs.map((text) => ({
+              embedding:
+                text === "session function" || String(text).includes("export function session") ? [0, 1] : [1, 0],
+            })),
           })
         },
       })
@@ -837,7 +834,9 @@ describe("cast plugin", () => {
         fetchCalls.some(
           (call) =>
             call.url.endsWith("/embeddings") &&
-            (call.body as { input: string }).input.includes("export function session"),
+            [call.body as { input: string | string[] }].some(({ input }) =>
+              (Array.isArray(input) ? input : [input]).some((text) => text.includes("export function session")),
+            ),
         ),
       ).toBe(true)
       expect(
@@ -1216,6 +1215,7 @@ describe("cast plugin", () => {
       topK: 5,
       maxContextChars: 12_000,
       chunking: { overlap: 2, expansion: true, minSemanticNonWhitespaceChars: 16 },
+      embeddingBatchSize: 16,
     })
     expect(Object.keys(semanticSearchTool(hooks).args)).not.toContain("chunking")
   })

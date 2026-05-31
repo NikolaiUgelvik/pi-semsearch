@@ -48,7 +48,7 @@ Restart opencode after changing plugin configuration. Plugins are loaded when op
 }
 ```
 
-`dimensions` is optional and is forwarded to providers that support embedding dimension selection.
+`dimensions` is optional and is forwarded to providers that support embedding dimension selection. Indexing sends embeddings in batches; set `embedding.batchSize` to tune the number of chunks per request. The default is `16`.
 
 ## OpenRouter HyDE Example
 
