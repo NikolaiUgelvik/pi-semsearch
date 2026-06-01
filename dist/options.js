@@ -111,13 +111,18 @@ const DEFAULT_EXCLUDE_GLOBS = [
     "**/vendor/bundle/**",
     "**/vendor/**",
 ];
-const DEFAULT_RESULT_OPTIONS = {
-    maxChunkNonWhitespaceChars: DEFAULT_MAX_CHUNK_NON_WHITESPACE_CHARS,
+const DEFAULT_SCANNER_OPTIONS = {
     maxFileBytes: DEFAULT_MAX_FILE_BYTES,
-    maxContextChars: DEFAULT_MAX_CONTEXT_CHARS,
-    topK: DEFAULT_TOP_K,
     includeGlobs: ["**/*"],
     excludeGlobs: DEFAULT_EXCLUDE_GLOBS,
+};
+const DEFAULT_RESULT_OPTIONS = {
+    maxChunkNonWhitespaceChars: DEFAULT_MAX_CHUNK_NON_WHITESPACE_CHARS,
+    maxFileBytes: DEFAULT_SCANNER_OPTIONS.maxFileBytes,
+    maxContextChars: DEFAULT_MAX_CONTEXT_CHARS,
+    topK: DEFAULT_TOP_K,
+    includeGlobs: DEFAULT_SCANNER_OPTIONS.includeGlobs,
+    excludeGlobs: DEFAULT_SCANNER_OPTIONS.excludeGlobs,
 };
 export function parseOptions(input, env = process.env) {
     const inputRecord = parseInputRecord(input);

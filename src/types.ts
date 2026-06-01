@@ -40,6 +40,22 @@ export type ChunkingOptions = {
   minSemanticNonWhitespaceChars: number
 }
 
+export type DiagnosticCode =
+  | "index.skipped_file"
+  | "source.read_failed"
+  | "source.mismatch"
+  | "hyde.failed"
+  | "retrieval.knn_capped"
+  | "output.compacted"
+  | "diagnostic.unknown"
+
+export type DiagnosticRecord = {
+  code: DiagnosticCode
+  message: string
+  filePath?: string
+  chunkId?: string
+}
+
 export type LexicalIndex = {
   documentCount: number
   averageDocumentLength: number
@@ -76,6 +92,7 @@ export type HydratedChunkSet = {
   symbols: Record<string, SymbolRecord>
   lexical?: LexicalIndex
   diagnostics: string[]
+  diagnosticDetails?: DiagnosticRecord[]
 }
 
 export type ChunkRecord = {
@@ -122,11 +139,15 @@ export type IndexMetadata = {
   cacheKey: string
   embeddingModel?: string
   embeddingDimensions?: number
+  maxFileBytes?: number
+  includeGlobs?: string[]
+  excludeGlobs?: string[]
   maxChunkNonWhitespaceChars: number
   chunking: ChunkingOptions
   updatedAt: number
   status: "empty" | "indexing" | "ready" | "stale" | "error"
   diagnostics: string[]
+  diagnosticDetails?: DiagnosticRecord[]
 }
 
 export type CastIndex = {
@@ -200,6 +221,7 @@ export type ChunkLookupOutput = {
     }
   }
   diagnostics: string[]
+  diagnosticDetails?: DiagnosticRecord[]
 }
 
 export type ChunkLookupRelatedChunk = {
@@ -235,4 +257,5 @@ export type SearchOutput = {
   }
   results: SearchResult[]
   diagnostics: string[]
+  diagnosticDetails?: DiagnosticRecord[]
 }

@@ -1,6 +1,7 @@
 import { chunkBreadcrumbs, chunkMatchesSource, expandWithParentContext, summarizeChunk, summarizeTopology, } from "./topology.js";
 async function getChunkById(input) {
     const diagnostics = [...input.index.metadata.diagnostics];
+    const diagnosticDetails = [...(input.index.metadata.diagnosticDetails ?? [])];
     const sourceCache = new Map();
     const getSource = (filePath) => readSourceCached(filePath, input.readSource, sourceCache);
     const chunk = input.index.chunks[input.input.id];
@@ -9,17 +10,20 @@ async function getChunkById(input) {
             return {
                 status: input.index.metadata,
                 diagnostics: [...diagnostics, `index unavailable: ${input.index.metadata.status}`],
+                diagnosticDetails,
             };
         }
         return {
             status: input.index.metadata,
             diagnostics: [...diagnostics, `chunk not found: ${input.input.id}`],
+            diagnosticDetails,
         };
     }
     const source = await getSource(chunk.filePath);
     const maxContextChars = input.input.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
     const context = parentContext({
         chunk,
+        diagnosticDetails,
         diagnostics,
         includeParents: input.input.includeParents,
         index: input.index,
@@ -31,6 +35,7 @@ async function getChunkById(input) {
         childrenLimit: input.input.childrenLimit,
         childrenOffset: input.input.childrenOffset,
         chunks: input.index.chunks,
+        diagnosticDetails,
         diagnostics,
         getSource,
         includeChildren: input.input.includeChildren,
@@ -39,25 +44,29 @@ async function getChunkById(input) {
         maxContextChars,
         symbols: input.index.symbols,
     });
-    return {
-        status: input.index.metadata,
-        chunk: {
-            filePath: chunk.filePath,
-            language: chunk.language,
-            range: chunk.range,
-            kind: chunk.kind,
-            breadcrumbs: context.breadcrumbs,
-            text: primaryChunkText(input.input, validatedChunkText(chunk, source, diagnostics, "chunk text omitted")),
-            parentText: context.parentText,
-            parentRange: context.parentRange,
-            topology: summarizeTopology(chunk, input.index.chunks, input.index.symbols),
-            related,
-        },
-        diagnostics,
-    };
+    return chunkLookupOutput({ input, chunk, context, related, source, diagnostics, diagnosticDetails });
 }
 const DEFAULT_CHILDREN_LIMIT = 20;
 const DEFAULT_MAX_CONTEXT_CHARS = 12_000;
+function chunkLookupOutput(input) {
+    return {
+        status: input.input.index.metadata,
+        chunk: {
+            filePath: input.chunk.filePath,
+            language: input.chunk.language,
+            range: input.chunk.range,
+            kind: input.chunk.kind,
+            breadcrumbs: input.context.breadcrumbs,
+            text: primaryChunkText(input.input.input, validatedChunkText({ ...input, omittedReason: "chunk text omitted" })),
+            parentText: input.context.parentText,
+            parentRange: input.context.parentRange,
+            topology: summarizeTopology(input.chunk, input.input.index.chunks, input.input.index.symbols),
+            related: input.related,
+        },
+        diagnostics: input.diagnostics,
+        diagnosticDetails: input.diagnosticDetails,
+    };
+}
 function primaryChunkText(input, text) {
     return input.maxContextChars === undefined ? text.slice(0, DEFAULT_MAX_CONTEXT_CHARS) : text;
 }
@@ -74,10 +83,10 @@ function parentContext(input) {
         });
     }
     if (input.source.ok) {
-        input.diagnostics.push(`source mismatch for ${input.chunk.filePath}:${input.chunk.id}; parent context omitted`);
+        addSourceDiagnostic(input, "source.mismatch", `source mismatch for ${input.chunk.filePath}:${input.chunk.id}; parent context omitted`);
     }
     else {
-        input.diagnostics.push(`source read failed for ${input.chunk.filePath}; parent context omitted`);
+        addSourceDiagnostic(input, "source.read_failed", `source read failed for ${input.chunk.filePath}; parent context omitted`);
     }
     return { breadcrumbs: chunkBreadcrumbs(input.chunk, input.index.symbols) };
 }
@@ -88,42 +97,7 @@ async function relatedChunks(input) {
         limit: input.childrenLimit,
         offset: input.childrenOffset,
     });
-    const [parent, previousSibling, nextSibling, children] = await Promise.all([
-        input.includeParents === false
-            ? undefined
-            : relatedChunk({
-                chunk: input.chunks[input.chunk.parentChunkId ?? ""],
-                symbols: input.symbols,
-                maxContextChars: input.maxContextChars,
-                diagnostics: input.diagnostics,
-                getSource: input.getSource,
-            }),
-        input.includeSiblings === false
-            ? undefined
-            : relatedChunk({
-                chunk: input.chunks[input.chunk.previousSiblingChunkId ?? ""],
-                symbols: input.symbols,
-                maxContextChars: input.maxContextChars,
-                diagnostics: input.diagnostics,
-                getSource: input.getSource,
-            }),
-        input.includeSiblings === false
-            ? undefined
-            : relatedChunk({
-                chunk: input.chunks[input.chunk.nextSiblingChunkId ?? ""],
-                symbols: input.symbols,
-                maxContextChars: input.maxContextChars,
-                diagnostics: input.diagnostics,
-                getSource: input.getSource,
-            }),
-        Promise.all(childrenPage.childIds.map((id) => relatedChunk({
-            chunk: input.chunks[id],
-            symbols: input.symbols,
-            maxContextChars: input.maxContextChars,
-            diagnostics: input.diagnostics,
-            getSource: input.getSource,
-        }))),
-    ]);
+    const [parent, previousSibling, nextSibling, children] = await relatedChunkGroup(input, childrenPage.childIds);
     return {
         parent,
         previousSibling,
@@ -131,6 +105,22 @@ async function relatedChunks(input) {
         children: children.flatMap((child) => (child ? [child] : [])),
         childrenPage: childrenPage.page,
     };
+}
+function relatedChunkGroup(input, childIds) {
+    const relatedInput = (chunk) => relatedChunk({
+        chunk,
+        diagnosticDetails: input.diagnosticDetails,
+        symbols: input.symbols,
+        maxContextChars: input.maxContextChars,
+        diagnostics: input.diagnostics,
+        getSource: input.getSource,
+    });
+    return Promise.all([
+        input.includeParents === false ? undefined : relatedInput(input.chunks[input.chunk.parentChunkId ?? ""]),
+        input.includeSiblings === false ? undefined : relatedInput(input.chunks[input.chunk.previousSiblingChunkId ?? ""]),
+        input.includeSiblings === false ? undefined : relatedInput(input.chunks[input.chunk.nextSiblingChunkId ?? ""]),
+        Promise.all(childIds.map((id) => relatedInput(input.chunks[id]))),
+    ]);
 }
 function childPage(input) {
     const total = input.childChunkIds.length;
@@ -149,22 +139,32 @@ async function relatedChunk(input) {
         return;
     }
     const source = await input.getSource(input.chunk.filePath);
-    const text = validatedChunkText(input.chunk, source, input.diagnostics, "related chunk text omitted");
+    const text = validatedChunkText({
+        chunk: input.chunk,
+        source,
+        diagnostics: input.diagnostics,
+        diagnosticDetails: input.diagnosticDetails,
+        omittedReason: "related chunk text omitted",
+    });
     return {
         ...summarizeChunk(input.chunk, input.symbols),
         text: text.slice(0, input.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS),
     };
 }
-function validatedChunkText(chunk, source, diagnostics, omittedReason) {
-    if (!source.ok) {
-        diagnostics.push(`source read failed for ${chunk.filePath}:${chunk.id}; ${omittedReason}`);
+function validatedChunkText(input) {
+    if (!input.source.ok) {
+        addSourceDiagnostic(input, "source.read_failed", `source read failed for ${input.chunk.filePath}:${input.chunk.id}; ${input.omittedReason}`);
         return "";
     }
-    if (!chunkMatchesSource(source.text, chunk)) {
-        diagnostics.push(`source mismatch for ${chunk.filePath}:${chunk.id}; ${omittedReason}`);
+    if (!chunkMatchesSource(input.source.text, input.chunk)) {
+        addSourceDiagnostic(input, "source.mismatch", `source mismatch for ${input.chunk.filePath}:${input.chunk.id}; ${input.omittedReason}`);
         return "";
     }
-    return chunk.text;
+    return input.chunk.text;
+}
+function addSourceDiagnostic(input, code, message) {
+    input.diagnostics.push(message);
+    input.diagnosticDetails.push({ code, message, filePath: input.chunk.filePath, chunkId: input.chunk.id });
 }
 function readSourceCached(filePath, readSource, sourceCache) {
     const cached = sourceCache.get(filePath);

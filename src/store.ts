@@ -10,6 +10,7 @@ import type {
   CastIndex,
   ChunkingOptions,
   ChunkRecord,
+  DiagnosticRecord,
   FileRecord,
   HydratedChunkSet,
   LexicalChunkCandidate,
@@ -20,8 +21,9 @@ import type {
 const INDEX_SCHEMA_VERSION = 1
 const SQLITE_SCHEMA_VERSION = 4
 const RUN_ID_RANDOM_RADIX = 36
+const SQLITE_VECTOR_MAX_K = 4096
 const SQLITE_VECTOR_PATH_FILTER_INITIAL_K = 100
-const SQLITE_VECTOR_PATH_FILTER_MAX_K = 10_000
+const SQLITE_VECTOR_PATH_FILTER_MAX_K = SQLITE_VECTOR_MAX_K
 const SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER = 10
 const SQLITE_LEXICAL_PATH_FILTER_MAX_K = 1000
 const SQLITE_LEXICAL_FALLBACK_QUERY_TERMS = 16
@@ -55,6 +57,7 @@ interface SourceHydrationContext {
   worktree: string
   files: Record<string, FileRecord>
   diagnostics: string[]
+  diagnosticDetails: DiagnosticRecord[]
   filePaths?: Set<string>
 }
 
@@ -216,37 +219,52 @@ function readSqliteIndex(db: Database, cacheKey: string, embeddingDimensions?: n
   }
 
   try {
-    const metadata = readRunMetadata(db, activeRunId)
-    if (!metadata) {
-      return createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"])
-    }
-
-    const files = readFiles(db, activeRunId)
-    const diagnostics = [...metadata.diagnostics]
-    const index: CastIndex = {
-      metadata: { ...metadata, diagnostics },
-      files,
-      chunks: readChunks(db, activeRunId, readVectors(db, activeRunId), {
-        worktree: metadata.worktree,
-        files,
-        diagnostics,
-      }),
-      symbols: readSymbols(db, activeRunId),
-    }
-    const lexical = readLexical(db, activeRunId)
-    if (lexical) {
-      index.lexical = lexical
-    }
-
-    return isCastIndex(index)
-      ? index
-      : createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"])
+    return readActiveSqliteIndex(db, activeRunId, cacheKey, embeddingDimensions)
   } catch (error) {
     if (!(error instanceof CorruptIndexError)) {
       throw error
     }
     return createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"])
   }
+}
+
+function readActiveSqliteIndex(
+  db: Database,
+  activeRunId: string,
+  cacheKey: string,
+  embeddingDimensions: number | undefined,
+) {
+  const metadata = readRunMetadata(db, activeRunId)
+  if (!metadata) {
+    return createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"])
+  }
+
+  const index = buildSqliteIndex(db, activeRunId, metadata)
+  return isCastIndex(index)
+    ? index
+    : createEmptySqliteIndex(cacheKey, embeddingDimensions, ["rebuilding corrupt index"])
+}
+
+function buildSqliteIndex(db: Database, activeRunId: string, metadata: CastIndex["metadata"]) {
+  const files = readFiles(db, activeRunId)
+  const diagnostics = [...metadata.diagnostics]
+  const diagnosticDetails = [...(metadata.diagnosticDetails ?? [])]
+  const index: CastIndex = {
+    metadata: { ...metadata, diagnostics, diagnosticDetails },
+    files,
+    chunks: readChunks(db, activeRunId, readVectors(db, activeRunId), {
+      worktree: metadata.worktree,
+      files,
+      diagnostics,
+      diagnosticDetails,
+    }),
+    symbols: readSymbols(db, activeRunId),
+  }
+  const lexical = readLexical(db, activeRunId)
+  if (lexical) {
+    index.lexical = lexical
+  }
+  return index
 }
 
 function readSqliteMetadata(db: Database, cacheKey: string, embeddingDimensions?: number) {
@@ -286,41 +304,88 @@ function hydrateSqliteChunks(
     return { metadata, files: {}, chunks: {}, symbols: {}, diagnostics: [] }
   }
 
+  return hydrateActiveSqliteChunks(db, activeRunId, metadata, chunkIds)
+}
+
+function hydrateActiveSqliteChunks(
+  db: Database,
+  activeRunId: string,
+  metadata: CastIndex["metadata"],
+  chunkIds: string[],
+): HydratedChunkSet {
   const ids = chunkIdsWithTopology(db, activeRunId, chunkIds)
+  const orderedStoredChunks = orderedStoredChunksByIds(db, activeRunId, ids)
+  const files = readFilesByPaths(db, activeRunId, filePathsForChunks(orderedStoredChunks))
+  const diagnostics = [...metadata.diagnostics]
+  const diagnosticDetails = [...(metadata.diagnosticDetails ?? [])]
+  const sourceContext: SourceHydrationContext = { worktree: metadata.worktree, files, diagnostics, diagnosticDetails }
+  const chunks = hydrateStoredChunks({ db, activeRunId, ids, orderedStoredChunks, sourceContext })
+  const hydrated = hydratedChunkSet({ db, activeRunId, metadata, files, chunks, diagnostics, diagnosticDetails })
+  const lexical = readLexical(db, activeRunId)
+  if (lexical) {
+    hydrated.lexical = lexical
+  }
+  return hydrated
+}
+
+function orderedStoredChunksByIds(db: Database, activeRunId: string, ids: string[]) {
   const storedChunks = readStoredChunksByIds(db, activeRunId, ids)
-  const orderedStoredChunks = ids.flatMap((chunkId) => {
+  return ids.flatMap((chunkId) => {
     const chunk = storedChunks.get(chunkId)
     return chunk ? [chunk] : []
   })
-  const filePaths = [...new Set(orderedStoredChunks.map((chunk) => chunk.filePath))]
-  const files = readFilesByPaths(db, activeRunId, filePaths)
-  const diagnostics = [...metadata.diagnostics]
-  const sourceContext: SourceHydrationContext = { worktree: metadata.worktree, files, diagnostics }
+}
+
+function filePathsForChunks(chunks: StoredChunkRecord[]) {
+  return [...new Set(chunks.map((chunk) => chunk.filePath))]
+}
+
+function hydrateStoredChunks(input: {
+  db: Database
+  activeRunId: string
+  ids: string[]
+  orderedStoredChunks: StoredChunkRecord[]
+  sourceContext: SourceHydrationContext
+}) {
   const sourceCache = new Map<string, SourceReadResult>()
-  const vectors = readVectorsForChunkIds(db, activeRunId, ids)
+  const vectors = readVectorsForChunkIds(input.db, input.activeRunId, input.ids)
   const chunks: Record<string, ChunkRecord> = {}
 
-  for (const storedChunk of orderedStoredChunks) {
-    const chunk: ChunkRecord = { ...storedChunk, text: readChunkText(sourceContext, sourceCache, storedChunk) }
+  for (const storedChunk of input.orderedStoredChunks) {
+    const chunk: ChunkRecord = { ...storedChunk, text: readChunkText(input.sourceContext, sourceCache, storedChunk) }
     const embedding = vectors.get(chunk.id)
     if (embedding) {
       chunk.embedding = embedding
     }
     chunks[chunk.id] = chunk
   }
+  return chunks
+}
 
-  const lexical = readLexical(db, activeRunId)
+function hydratedChunkSet(input: {
+  db: Database
+  activeRunId: string
+  metadata: CastIndex["metadata"]
+  files: Record<string, FileRecord>
+  chunks: Record<string, ChunkRecord>
+  diagnostics: string[]
+  diagnosticDetails: DiagnosticRecord[]
+}) {
   const hydrated: HydratedChunkSet = {
-    metadata: { ...metadata, diagnostics },
-    files,
-    chunks,
-    symbols: readSymbolsByIds(db, activeRunId, [...new Set(Object.values(chunks).flatMap((chunk) => chunk.symbolIds))]),
-    diagnostics,
+    metadata: { ...input.metadata, diagnostics: input.diagnostics, diagnosticDetails: input.diagnosticDetails },
+    files: input.files,
+    chunks: input.chunks,
+    symbols: readSymbolsByIds(input.db, input.activeRunId, symbolIdsForChunks(input.chunks)),
+    diagnostics: input.diagnostics,
   }
-  if (lexical) {
-    hydrated.lexical = lexical
+  if (input.diagnosticDetails.length > 0) {
+    hydrated.diagnosticDetails = input.diagnosticDetails
   }
   return hydrated
+}
+
+function symbolIdsForChunks(chunks: Record<string, ChunkRecord>) {
+  return [...new Set(Object.values(chunks).flatMap((chunk) => chunk.symbolIds))]
 }
 
 function emptyHydratedChunkSet(
@@ -598,7 +663,12 @@ function readChunkText(
     chunk.range.byteEnd < chunk.range.byteStart ||
     chunk.range.byteEnd > source.bytes.length
   ) {
-    sourceContext.diagnostics.push(`source range invalid for ${chunk.filePath}:${chunk.id}; chunk text unavailable`)
+    addSourceHydrationDiagnostic(sourceContext, {
+      code: "source.mismatch",
+      filePath: chunk.filePath,
+      chunkId: chunk.id,
+      message: `source range invalid for ${chunk.filePath}:${chunk.id}; chunk text unavailable`,
+    })
     return ""
   }
   return source.bytes.subarray(chunk.range.byteStart, chunk.range.byteEnd).toString()
@@ -622,14 +692,27 @@ function readSourceUncached(sourceContext: SourceHydrationContext, filePath: str
   try {
     const bytes = readFileSync(path.join(sourceContext.worktree, filePath))
     if (fingerprint(bytes) !== sourceContext.files[filePath]?.fingerprint) {
-      sourceContext.diagnostics.push(`source fingerprint mismatch for ${filePath}; chunk text unavailable`)
+      addSourceHydrationDiagnostic(sourceContext, {
+        code: "source.mismatch",
+        filePath,
+        message: `source fingerprint mismatch for ${filePath}; chunk text unavailable`,
+      })
       return { ok: false }
     }
     return { ok: true, bytes }
   } catch {
-    sourceContext.diagnostics.push(`source read failed for ${filePath}; chunk text unavailable`)
+    addSourceHydrationDiagnostic(sourceContext, {
+      code: "source.read_failed",
+      filePath,
+      message: `source read failed for ${filePath}; chunk text unavailable`,
+    })
     return { ok: false }
   }
+}
+
+function addSourceHydrationDiagnostic(sourceContext: SourceHydrationContext, detail: DiagnosticRecord) {
+  sourceContext.diagnostics.push(detail.message)
+  sourceContext.diagnosticDetails.push(detail)
 }
 
 function fingerprint(bytes: Uint8Array) {
@@ -782,6 +865,7 @@ function getCompletedSqliteFile(
     return
   }
   const diagnostics: string[] = []
+  const diagnosticDetails: DiagnosticRecord[] = []
   const chunks = readFileChunks({
     db,
     runId,
@@ -791,6 +875,7 @@ function getCompletedSqliteFile(
       worktree: metadata.worktree,
       files: { [record.path]: record },
       diagnostics,
+      diagnosticDetails,
       filePaths: new Set([record.path]),
     },
   })
@@ -924,7 +1009,12 @@ function sqliteVectorSearchInput(db: Database, queryEmbedding: number[], topK: n
   }
   const vectorCount = readActiveVectorCount(db, activeRunId)
   return vectorCount > 0
-    ? { activeRunId, target, vectorCount, hasPathFilters: paths !== undefined && paths.length > 0 }
+    ? {
+        activeRunId,
+        target,
+        vectorCount,
+        hasPathFilters: paths !== undefined && paths.length > 0,
+      }
     : null
 }
 
@@ -1128,10 +1218,13 @@ function appendMatchingSqliteVectorCandidates(
 }
 
 function sqliteVectorLimits(vectorCount: number, topK: number, hasPathFilters: boolean) {
+  const boundedVectorCount = Math.min(vectorCount, SQLITE_VECTOR_MAX_K)
   const max = hasPathFilters
-    ? Math.min(vectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_MAX_K))
-    : Math.min(vectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_INITIAL_K))
-  const initial = hasPathFilters ? Math.min(vectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_INITIAL_K)) : max
+    ? Math.min(boundedVectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_MAX_K))
+    : Math.min(boundedVectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_INITIAL_K))
+  const initial = hasPathFilters
+    ? Math.min(boundedVectorCount, Math.max(topK, SQLITE_VECTOR_PATH_FILTER_INITIAL_K))
+    : max
   return { initial, max }
 }
 
@@ -1140,14 +1233,14 @@ function readActiveVectorCount(db: Database, runId: string) {
     .query(
       `select count(*) as count
        from chunk_rowids
-       inner join chunk_vectors on chunk_vectors.rowid = chunk_rowids.rowid
-       where chunk_rowids.run_id = ?`,
+       where run_id = ?`,
     )
     .get(runId) as { count: number }
   return row.count
 }
 
 interface SqliteVectorCandidateRow {
+  rowid: number
   id: string
   filePath: string
   embedding: string
@@ -1155,19 +1248,42 @@ interface SqliteVectorCandidateRow {
 }
 
 function querySqliteVectorCandidates(db: Database, runId: string, queryEmbedding: number[], topK: number) {
+  const vectorRows = db
+    .query(
+      `select rowid,
+              vec_to_json(embedding) as embedding
+       from chunk_vectors
+       where rowid in (select rowid from chunk_rowids where run_id = ?) and embedding match ? and k = ?
+       order by distance`,
+    )
+    .all(runId, JSON.stringify(queryEmbedding), topK) as Array<{ rowid: number; embedding: string }>
+  const rowMetadata = readSqliteVectorRowMetadata(
+    db,
+    runId,
+    vectorRows.map((row) => row.rowid),
+  )
+  return vectorRows.flatMap((row) => {
+    const metadata = rowMetadata.get(row.rowid)
+    return metadata ? [{ ...row, ...metadata, queryEmbedding }] : []
+  })
+}
+
+function readSqliteVectorRowMetadata(db: Database, runId: string, rowids: number[]) {
+  if (rowids.length === 0) {
+    return new Map<number, { id: string; filePath: string }>()
+  }
+  const placeholders = rowids.map(() => "?").join(", ")
   const rows = db
     .query(
-      `select chunk_rowids.chunk_id as id,
-              chunks.file_path as filePath,
-              vec_to_json(chunk_vectors.embedding) as embedding
-       from chunk_vectors
-       inner join chunk_rowids on chunk_rowids.rowid = chunk_vectors.rowid
+      `select chunk_rowids.rowid as rowid,
+              chunk_rowids.chunk_id as id,
+              chunks.file_path as filePath
+       from chunk_rowids
        inner join chunks on chunks.run_id = chunk_rowids.run_id and chunks.id = chunk_rowids.chunk_id
-       where chunk_rowids.run_id = ? and chunk_vectors.embedding match ? and k = ?
-      order by chunk_vectors.distance, chunk_rowids.chunk_id`,
+       where chunk_rowids.run_id = ? and chunk_rowids.rowid in (${placeholders})`,
     )
-    .all(runId, JSON.stringify(queryEmbedding), topK) as Omit<SqliteVectorCandidateRow, "queryEmbedding">[]
-  return rows.map((row) => ({ ...row, queryEmbedding }))
+    .all(runId, ...rowids) as Array<{ rowid: number; id: string; filePath: string }>
+  return new Map(rows.map((row) => [row.rowid, { id: row.id, filePath: row.filePath }]))
 }
 
 function bScoreThenId(left: { id: string; score: number }, right: { id: string; score: number }) {

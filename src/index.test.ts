@@ -105,7 +105,117 @@ describe("cast plugin", () => {
     const output = JSON.parse(result.output)
     expect(output.results[0].parentText).toBeUndefined()
     expect(output.results[0].parentRange).toBeUndefined()
-    expect(output.diagnostics).toContain(diagnostic)
+    if (output.diagnostics) {
+      expect(output.diagnostics).toContain(diagnostic)
+    }
+  })
+
+  test("semantic_search_code summarizes diagnostics when results are present", async () => {
+    const diagnostics = [
+      ...Array.from({ length: 80 }, (_, index) => `binary asset omitted ${index}: ${"x".repeat(80)}`),
+      "HyDE failed: upstream timeout",
+      "could not open source for source.ts:c1; chunk text omitted",
+    ]
+    const diagnosticDetails = [
+      ...diagnostics.slice(0, 80).map((message, index) => ({
+        code: "index.skipped_file" as const,
+        message,
+        filePath: `asset-${index}.png`,
+      })),
+      { code: "hyde.failed" as const, message: "HyDE failed: upstream timeout" },
+      {
+        code: "source.read_failed" as const,
+        message: "could not open source for source.ts:c1; chunk text omitted",
+        filePath: "source.ts",
+        chunkId: "c1",
+      },
+    ]
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => ({
+        status: { ...searchStatus(), diagnostics, diagnosticDetails },
+        results: [
+          {
+            filePath: "source.ts",
+            language: "typescript",
+            range: { byteStart: 0, byteEnd: 100, lineStart: 1, lineEnd: 5 },
+            score: 0.9,
+            finalScore: 0.95,
+            kind: "function",
+            breadcrumbs: ["function useful"],
+            text: "function useful() {}",
+            topology: {
+              chunk: { id: "c1", label: "function useful", range: "source.ts:1-5" },
+              children: [],
+              symbols: ["function useful"],
+            },
+            retrieval: { mode: "hybrid", vectorRank: 1, bm25Rank: 1 },
+          },
+        ],
+        diagnostics,
+        diagnosticDetails,
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+    hooks.config?.({ tool_output: { max_lines: 200, max_bytes: 12_000 } } as never)
+
+    const result = await semanticSearchTool(hooks).execute({ query: "useful" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(Buffer.byteLength(result.output, "utf8")).toBeLessThanOrEqual(12_000)
+    const output = JSON.parse(result.output)
+    expect(output.results).toHaveLength(1)
+    expect(output.results[0].topology?.chunk?.id ?? output.results[0].id).toBe("c1")
+    expect(output.status.diagnostics).toEqual([
+      "80 index diagnostics suppressed",
+      "HyDE failed: upstream timeout",
+      "1 source-read issue while hydrating chunks (sample: could not open source for source.ts:c1; chunk text omitted)",
+    ])
+    expect(output.diagnostics).toEqual(output.status.diagnostics)
+  })
+
+  test("semantic_search_code strips typed diagnostics when no results are present", async () => {
+    const diagnostics = ["binary asset omitted: assets/logo.png"]
+    const diagnosticDetails = [
+      { code: "index.skipped_file" as const, message: diagnostics[0], filePath: "assets/logo.png" },
+    ]
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => ({
+        status: { ...searchStatus(), diagnostics, diagnosticDetails },
+        results: [],
+        diagnostics,
+        diagnosticDetails,
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const result = await semanticSearchTool(hooks).execute({ query: "missing" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    const output = JSON.parse(result.output)
+    expect(Object.hasOwn(output, "diagnosticDetails")).toBe(false)
+    expect(Object.hasOwn(output.status, "diagnosticDetails")).toBe(false)
+    expect(output.status.diagnostics).toEqual(["1 index diagnostic suppressed"])
+    expect(output.diagnostics).toEqual(output.status.diagnostics)
   })
 
   test("semantic_get_chunk compacts output to configured opencode tool_output limits", async () => {
@@ -116,6 +226,7 @@ describe("cast plugin", () => {
       const source = `${"a".repeat(1200)}\n${"b".repeat(1200)}\n${"c".repeat(1200)}\n`
       await Bun.write(path.join(dir, "source.ts"), source)
       const index = emptyReadyIndex()
+      index.metadata.diagnostics = ["assets/logo.png: skipped binary file"]
       index.metadata.worktree = dir
       index.files["source.ts"] = {
         path: "source.ts",
@@ -202,7 +313,20 @@ describe("cast plugin", () => {
     const calls: string[] = []
     try {
       await Bun.write(path.join(dir, "alpha.ts"), "function alpha() {}\n")
-      const metadata = { ...emptyReadyIndex().metadata, worktree: dir }
+      const diagnostics = [
+        "binary asset omitted: assets/logo.png",
+        "could not open source for alpha.ts:related; related chunk text omitted",
+      ]
+      const diagnosticDetails = [
+        { code: "index.skipped_file" as const, message: diagnostics[0], filePath: "assets/logo.png" },
+        {
+          code: "source.read_failed" as const,
+          message: diagnostics[1],
+          filePath: "alpha.ts",
+          chunkId: "related",
+        },
+      ]
+      const metadata = { ...emptyReadyIndex().metadata, worktree: dir, diagnostics, diagnosticDetails }
       const plugin = createCastPluginForTest({
         createStore: () => ({
           read: async () => {
@@ -238,7 +362,8 @@ describe("cast plugin", () => {
                 },
               },
               symbols: {},
-              diagnostics: [],
+              diagnostics,
+              diagnosticDetails,
             }
           },
         }),
@@ -257,11 +382,49 @@ describe("cast plugin", () => {
       if (typeof result === "string") {
         throw new Error("expected object tool result")
       }
-      expect(JSON.parse(result.output).chunk.filePath).toBe("alpha.ts")
+      const output = JSON.parse(result.output)
+      expect(output.chunk.filePath).toBe("alpha.ts")
+      expect(output.status.diagnostics).toEqual([
+        "1 index diagnostic suppressed",
+        "1 source-read issue while hydrating chunks (sample: could not open source for alpha.ts:related; related chunk text omitted)",
+      ])
+      expect(output.diagnostics).toEqual(output.status.diagnostics)
       expect(calls).toEqual(["hydrateChunks:alpha"])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  test("semantic_get_chunk strips typed diagnostics when chunk is not found", async () => {
+    const diagnostics = ["binary asset omitted: assets/logo.png"]
+    const diagnosticDetails = [
+      { code: "index.skipped_file" as const, message: diagnostics[0], filePath: "assets/logo.png" },
+    ]
+    const index = emptyReadyIndex()
+    index.metadata.diagnostics = diagnostics
+    index.metadata.diagnosticDetails = diagnosticDetails
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({ refresh: async () => index }),
+      createStore: () => ({ read: async () => index, write: async () => undefined }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const result = await semanticGetChunkTool(hooks).execute({ id: "missing" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    const output = JSON.parse(result.output)
+    expect(Object.hasOwn(output, "diagnosticDetails")).toBe(false)
+    expect(Object.hasOwn(output.status, "diagnosticDetails")).toBe(false)
+    expect(output.status.diagnostics).toEqual(["1 index diagnostic suppressed", "chunk not found: missing"])
+    expect(output.diagnostics).toEqual(output.status.diagnostics)
   })
 
   test("semantic_search_code hard-caps diagnostics fallback output", async () => {
@@ -972,7 +1135,10 @@ describe("cast plugin", () => {
       }
       expect(result.title).toBe("Semantic chunk lookup: c1")
       expect(result.metadata).toEqual({ found: true })
-      expect(JSON.parse(result.output).chunk.topology.chunk.id).toBe("c1")
+      const output = JSON.parse(result.output)
+      expect(output.chunk.topology.chunk.id).toBe("c1")
+      expect(output.status.diagnostics).toEqual([])
+      expect(output.diagnostics).toEqual([])
       await hooks.dispose?.()
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -1160,7 +1326,7 @@ describe("cast plugin", () => {
         throw new Error("expected object tool result")
       }
       expect(JSON.parse(result.output).results[0].filePath).toBe("alpha.ts")
-      expect(calls).toEqual(["readMetadata", "searchVectorCandidates", "hydrateChunks:alpha"])
+      expect(calls).toEqual(["readMetadata", "readMetadata", "searchVectorCandidates", "hydrateChunks:alpha"])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -1254,6 +1420,7 @@ describe("cast plugin", () => {
       expect(output.results[0].retrieval.bm25Rank).toBe(1)
       expect(calls).toEqual([
         "readMetadata",
+        "readMetadata",
         "searchVectorCandidates",
         "searchLexicalCandidates:lexicalneedle:8:",
         "hydrateChunks:lexical",
@@ -1289,6 +1456,112 @@ describe("cast plugin", () => {
     } as never)
 
     expect(refreshes).toHaveLength(2)
+  })
+
+  test("ready metadata skips startup refresh before normal search", async () => {
+    let refreshes = 0
+    const ready = emptyReadyIndex()
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          return ready
+        },
+      }),
+      createStore: () => ({
+        readMetadata: async () => ready.metadata,
+        read: async () => {
+          throw new Error("full index read should not be needed at startup")
+        },
+        write: async () => undefined,
+      }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: [],
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const result = await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    expect(refreshes).toBe(0)
+  })
+
+  test("ready metadata with mismatched scanner options skips startup refresh", async () => {
+    let refreshes = 0
+    const ready = emptyReadyIndex()
+    ready.metadata.includeGlobs = ["src/**/*.ts"]
+    ready.metadata.excludeGlobs = ["generated/**"]
+    ready.metadata.maxFileBytes = 1024
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          return emptyReadyIndex()
+        },
+      }),
+      createStore: () => ({
+        readMetadata: async () => ready.metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: [],
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(refreshes).toBe(0)
+  })
+
+  test("legacy ready metadata skips startup refresh when current scanner options are customized", async () => {
+    let refreshes = 0
+    const ready = emptyReadyIndex()
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          return emptyReadyIndex()
+        },
+      }),
+      createStore: () => ({
+        readMetadata: async () => ready.metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: [],
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      excludeGlobs: ["custom/**"],
+    })
+
+    await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(refreshes).toBe(0)
   })
 
   test("refresh true waits for startup refresh before forcing another refresh", async () => {

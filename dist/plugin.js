@@ -21,6 +21,7 @@ const HYDE_PROMPT_RETRY_DELAYS_MS = [HYDE_PROMPT_FIRST_RETRY_DELAY_MS, HYDE_PROM
 const OMITTED_TEXT_LENGTH = 0;
 const MANY_COMPACT_CHILDREN = 5;
 const SINGLE_COMPACT_CHILD = 1;
+const MAX_DIAGNOSTIC_SAMPLES = 5;
 const NO_COMPACT_CHILDREN = 0;
 const SEARCH_COMPACT_TEXT_LENGTHS = [
     LONG_COMPACT_TEXT_LENGTH,
@@ -251,7 +252,7 @@ export function createCastPluginForTest(dependencies = {}) {
             }
             return wrapped;
         };
-        queueInitialRefresh(options, queueRefresh);
+        await queueInitialRefresh({ options, worktree: input.worktree, store, queueRefresh });
         const semanticSearchUnavailable = () => {
             if (!options.embedding) {
                 return {
@@ -391,10 +392,11 @@ Use this after semantic_search_code when you need the exact cached chunk, expand
                             }
                             return unavailableToolResult("Semantic chunk lookup index unavailable", storeError);
                         }
+                        const toolOutput = chunkLookupOutputForTool(output);
                         return {
                             title: `Semantic chunk lookup: ${args.id}`,
                             output: serializeToolOutput({
-                                output,
+                                output: toolOutput,
                                 limits: outputLimits,
                                 compact: compactChunkLookupOutput,
                                 minimal: minimalChunkLookupOutput,
@@ -466,10 +468,11 @@ function unavailableToolResult(title, message) {
     };
 }
 function searchToolResult(query, output, limits) {
+    const toolOutput = searchOutputForTool(output);
     return {
         title: `Semantic code search: ${query}`,
         output: serializeToolOutput({
-            output,
+            output: toolOutput,
             limits,
             compact: compactSearchOutput,
             minimal: minimalSearchOutput,
@@ -484,10 +487,101 @@ function searchToolResult(query, output, limits) {
         },
     };
 }
-function queueInitialRefresh(options, queueRefresh) {
-    if (options.embedding) {
-        queueRefresh({ background: true });
+function searchOutputForTool(output) {
+    const { diagnosticDetails: _outputDetails, ...visibleOutput } = output;
+    const { diagnosticDetails: _statusDetails, ...visibleStatus } = output.status;
+    const diagnostics = summarizeDiagnostics({
+        diagnostics: [...output.status.diagnostics, ...output.diagnostics],
+        details: [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])],
+    });
+    return {
+        ...visibleOutput,
+        status: { ...visibleStatus, diagnostics },
+        diagnostics,
+    };
+}
+function chunkLookupOutputForTool(output) {
+    const { diagnosticDetails: _outputDetails, ...visibleOutput } = output;
+    const { diagnosticDetails: _statusDetails, ...visibleStatus } = output.status;
+    const diagnostics = summarizeDiagnostics({
+        diagnostics: [...output.status.diagnostics, ...output.diagnostics],
+        details: [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])],
+    });
+    return {
+        ...visibleOutput,
+        status: { ...visibleStatus, diagnostics },
+        diagnostics,
+    };
+}
+function summarizeDiagnostics(input) {
+    const details = uniqueDiagnosticDetails(input.details);
+    const detailMessages = new Set(details.map((detail) => detail.message));
+    const indexDiagnostics = details.filter((detail) => detail.code === "index.skipped_file");
+    const sourceReadDiagnostics = details.filter((detail) => detail.code === "source.read_failed");
+    const sourceMismatchDiagnostics = details.filter((detail) => detail.code === "source.mismatch");
+    const grouped = new Set([...indexDiagnostics, ...sourceReadDiagnostics, ...sourceMismatchDiagnostics]);
+    const detailDiagnostics = details.filter((detail) => !grouped.has(detail)).map((detail) => detail.message);
+    const legacyDiagnostics = [...new Set(input.diagnostics.filter((diagnostic) => !detailMessages.has(diagnostic)))];
+    const otherDiagnostics = [...detailDiagnostics, ...legacyDiagnostics];
+    const summarized = [];
+    if (indexDiagnostics.length > 0) {
+        summarized.push(`${indexDiagnostics.length} index ${plural(indexDiagnostics.length, "diagnostic")} suppressed`);
     }
+    summarized.push(...otherDiagnostics.slice(0, MAX_DIAGNOSTIC_SAMPLES));
+    if (otherDiagnostics.length > MAX_DIAGNOSTIC_SAMPLES) {
+        const suppressedCount = otherDiagnostics.length - MAX_DIAGNOSTIC_SAMPLES;
+        summarized.push(`${suppressedCount} additional ${plural(suppressedCount, "diagnostic")} suppressed`);
+    }
+    if (sourceReadDiagnostics.length > 0) {
+        summarized.push(`${sourceReadDiagnostics.length} source-read ${plural(sourceReadDiagnostics.length, "issue")} while hydrating chunks (sample: ${sourceReadDiagnostics[0]?.message})`);
+    }
+    if (sourceMismatchDiagnostics.length > 0) {
+        summarized.push(`${sourceMismatchDiagnostics.length} source-mismatch ${plural(sourceMismatchDiagnostics.length, "issue")} while hydrating chunks (sample: ${sourceMismatchDiagnostics[0]?.message})`);
+    }
+    return summarized;
+}
+function uniqueDiagnosticDetails(details) {
+    const seen = new Set();
+    return details.filter((detail) => {
+        const key = `${detail.code}\0${detail.message}\0${detail.filePath ?? ""}\0${detail.chunkId ?? ""}`;
+        if (seen.has(key)) {
+            return false;
+        }
+        seen.add(key);
+        return true;
+    });
+}
+function plural(count, word) {
+    return count === 1 ? word : `${word}s`;
+}
+async function queueInitialRefresh(input) {
+    if (!input.options.embedding) {
+        return;
+    }
+    if (!hasReadMetadataStore(input.store)) {
+        input.queueRefresh({ background: true });
+        return;
+    }
+    try {
+        const metadata = await input.store.readMetadata();
+        if (!canUseReadyIndexForStartup(metadata, input.worktree, input.options)) {
+            input.queueRefresh({ background: true });
+        }
+    }
+    catch {
+        input.queueRefresh({ background: true });
+    }
+}
+function canUseReadyIndexForStartup(metadata, worktree, options) {
+    return (metadata.status === "ready" &&
+        metadata.worktree === worktree &&
+        metadata.maxChunkNonWhitespaceChars === options.maxChunkNonWhitespaceChars &&
+        sameStartupChunking(metadata.chunking, options.chunking));
+}
+function sameStartupChunking(left, right) {
+    return (left.overlap === right.overlap &&
+        left.expansion === right.expansion &&
+        left.minSemanticNonWhitespaceChars === right.minSemanticNonWhitespaceChars);
 }
 async function ensureSearchIndexReady(shouldRefresh, queueRefresh, currentRefresh, currentStoreError) {
     if (shouldRefresh) {
@@ -685,7 +779,7 @@ function minimalSearchOutput(output) {
             finalScore: result.finalScore,
             retrieval: result.retrieval,
         })),
-        diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+        ...(output.results.length === 0 ? { diagnostics: diagnosticsWithSearchCompaction(output.diagnostics) } : {}),
     };
 }
 function diagnosticsFocusedSearchOutput(output) {

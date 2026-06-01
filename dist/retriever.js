@@ -18,14 +18,23 @@ export async function retrieveFromStore(input) {
     const candidateIds = ranked.results.map((result) => result.id);
     const hydrated = await input.indexStore.hydrateChunks(candidateIds);
     const hydratedStatusDiagnostics = uniqueDiagnostics([...hydrated.metadata.diagnostics, ...hydrated.diagnostics]);
+    const hydratedStatusDiagnosticDetails = uniqueDiagnosticDetails([
+        ...(hydrated.metadata.diagnosticDetails ?? []),
+        ...(hydrated.diagnosticDetails ?? []),
+    ]);
     const index = {
-        metadata: { ...hydrated.metadata, diagnostics: hydratedStatusDiagnostics },
+        metadata: {
+            ...hydrated.metadata,
+            diagnostics: hydratedStatusDiagnostics,
+            diagnosticDetails: hydratedStatusDiagnosticDetails,
+        },
         files: hydrated.files,
         chunks: hydrated.chunks,
         symbols: hydrated.symbols,
         lexical: hydrated.lexical,
     };
     const diagnostics = hydratedDiagnostics(input, hydrated, candidates.diagnostics);
+    const diagnosticDetails = hydratedDiagnosticDetails(hydrated, candidates.diagnosticDetails);
     const reranked = await maybeRerank({
         input: { ...input, index },
         rerank: input.options.rerank,
@@ -41,6 +50,7 @@ export async function retrieveFromStore(input) {
         results: filteredRankedResults,
         chunksById: hydrated.chunks,
         diagnostics,
+        diagnosticDetails,
         initialScores: Object.fromEntries(candidates.vectorCandidates.map((result) => [result.id, result.score])),
         maxContextChars: settings.maxContextChars,
         retrieval: reranked.ranked.retrieval,
@@ -49,6 +59,7 @@ export async function retrieveFromStore(input) {
         status: {
             ...hydrated.metadata,
             diagnostics: hydratedStatusDiagnostics,
+            diagnosticDetails: hydratedStatusDiagnosticDetails,
             hydeUsed: candidates.hydeUsed,
             bestScore: candidates.vectorCandidates[0]?.score,
             rerankUsed: reranked.used,
@@ -58,6 +69,7 @@ export async function retrieveFromStore(input) {
         },
         results,
         diagnostics,
+        diagnosticDetails,
     };
 }
 async function collectStoreCandidates(input, rankingTopK, candidateCount) {
@@ -70,6 +82,7 @@ async function collectStoreCandidates(input, rankingTopK, candidateCount) {
         lexicalCandidates,
         rankedVectorCandidates: hyde.rankedVectorCandidates,
         diagnostics: hyde.diagnostics,
+        diagnosticDetails: hyde.diagnosticDetails,
         hydeUsed: hyde.used,
     };
 }
@@ -86,7 +99,7 @@ function storeLexicalCandidates(input, rankingTopK) {
 }
 async function storeHydeCandidates(input, vectorCandidates, candidateCount) {
     if (!shouldUseHyde(input, vectorCandidates)) {
-        return { rankedVectorCandidates: vectorCandidates, diagnostics: [], used: false };
+        return { rankedVectorCandidates: vectorCandidates, diagnostics: [], diagnosticDetails: [], used: false };
     }
     try {
         const hydeText = await input.generateHyde(input.input.query);
@@ -95,6 +108,7 @@ async function storeHydeCandidates(input, vectorCandidates, candidateCount) {
         return {
             rankedVectorCandidates: mergeRankedCandidates(vectorCandidates, hydeCandidates),
             diagnostics: [],
+            diagnosticDetails: [],
             used: true,
         };
     }
@@ -102,9 +116,11 @@ async function storeHydeCandidates(input, vectorCandidates, candidateCount) {
         if (isIndexUnavailableError(error)) {
             throw error;
         }
+        const message = `HyDE failed: ${error instanceof Error ? error.message : String(error)}`;
         return {
             rankedVectorCandidates: vectorCandidates,
-            diagnostics: [`HyDE failed: ${error instanceof Error ? error.message : String(error)}`],
+            diagnostics: [message],
+            diagnosticDetails: [{ code: "hyde.failed", message }],
             used: false,
         };
     }
@@ -121,6 +137,24 @@ function hydratedDiagnostics(input, hydrated, candidateDiagnostics) {
             .flatMap((file) => file.diagnostics.map((diagnostic) => `${file.path}: ${diagnostic}`)),
         ...hydrated.diagnostics,
     ]);
+}
+function hydratedDiagnosticDetails(hydrated, candidateDiagnostics) {
+    return uniqueDiagnosticDetails([
+        ...(hydrated.metadata.diagnosticDetails ?? []),
+        ...candidateDiagnostics,
+        ...(hydrated.diagnosticDetails ?? []),
+    ]);
+}
+function uniqueDiagnosticDetails(details) {
+    const seen = new Set();
+    return details.filter((detail) => {
+        const key = `${detail.code}\0${detail.message}\0${detail.filePath ?? ""}\0${detail.chunkId ?? ""}`;
+        if (seen.has(key)) {
+            return false;
+        }
+        seen.add(key);
+        return true;
+    });
 }
 function uniqueDiagnostics(diagnostics) {
     return [...new Set(diagnostics)];
@@ -219,10 +253,14 @@ async function outputResult(input, result) {
     if (!chunk) {
         return [];
     }
-    const source = await sourceForChunk(input.input, chunk, input.diagnostics);
+    const source = await sourceForChunk(input.input, chunk, input.diagnostics, input.diagnosticDetails);
     const sourceMatches = source.ok && chunkMatchesSource(source.text, chunk);
     if (source.ok && !sourceMatches) {
-        input.diagnostics.push(`source mismatch for ${chunk.filePath}:${chunk.id}; parent context omitted`);
+        addSourceDiagnostic(input.diagnostics, input.diagnosticDetails, {
+            chunk,
+            code: "source.mismatch",
+            message: `source mismatch for ${chunk.filePath}:${chunk.id}; parent context omitted`,
+        });
     }
     const context = parentContext({
         chunk,
@@ -248,13 +286,26 @@ async function outputResult(input, result) {
         },
     ];
 }
-function sourceForChunk(input, chunk, diagnostics) {
+function sourceForChunk(input, chunk, diagnostics, diagnosticDetails) {
     return input
         .readSource(chunk.filePath)
         .then((text) => ({ text, ok: true }))
         .catch(() => {
-        diagnostics.push(`source read failed for ${chunk.filePath}; parent context omitted`);
+        addSourceDiagnostic(diagnostics, diagnosticDetails, {
+            chunk,
+            code: "source.read_failed",
+            message: `source read failed for ${chunk.filePath}; parent context omitted`,
+        });
         return { text: "", ok: false };
+    });
+}
+function addSourceDiagnostic(diagnostics, diagnosticDetails, detail) {
+    diagnostics.push(detail.message);
+    diagnosticDetails.push({
+        code: detail.code,
+        message: detail.message,
+        filePath: detail.chunk.filePath,
+        chunkId: detail.chunk.id,
     });
 }
 function omitDuplicateParentRanges(results) {

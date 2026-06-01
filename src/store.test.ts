@@ -1032,9 +1032,32 @@ describe("index store", () => {
   test("sqlite vector candidates do not use the full vector JSON scan path", async () => {
     const source = await readFile(new URL("./store.ts", import.meta.url), "utf8")
 
-    expect(source).toContain("chunk_vectors.embedding match")
+    expect(source).toContain("embedding match ?")
     expect(source).not.toContain("readSqliteVectorRows")
     expect(source).not.toContain("scoreSqliteVectorRows")
+  })
+
+  test("sqlite vector candidate query keeps vec KNN isolated from normal table joins", async () => {
+    const source = await readFile(new URL("./store.ts", import.meta.url), "utf8")
+
+    expect(source).toContain("rowid in (select rowid from chunk_rowids where run_id = ?)")
+    expect(source).toContain("embedding match ? and k = ?")
+    expect(source).not.toContain("from chunk_vectors\n       inner join chunk_rowids")
+  })
+
+  test("active vector count does not join the sqlite-vec virtual table", async () => {
+    const source = await readFile(new URL("./store.ts", import.meta.url), "utf8")
+
+    expect(source).toContain("select count(*) as count\n       from chunk_rowids\n       where run_id = ?")
+    expect(source).not.toContain("select count(*) as count\n       from chunk_rowids\n       inner join chunk_vectors")
+  })
+
+  test("path-filtered sqlite vector expansion stays within sqlite-vec k limits", async () => {
+    const source = await readFile(new URL("./store.ts", import.meta.url), "utf8")
+
+    expect(source).toContain("const SQLITE_VECTOR_MAX_K = 4096")
+    expect(source).toContain("Math.min(vectorCount, SQLITE_VECTOR_MAX_K")
+    expect(source).not.toContain("const SQLITE_VECTOR_PATH_FILTER_MAX_K = 10_000")
   })
 
   test("returns cosine scores for orthogonal sqlite-vec candidates", async () => {

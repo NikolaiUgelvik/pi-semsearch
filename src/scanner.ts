@@ -7,7 +7,7 @@ import { castChunks, type SyntaxNode } from "./cast.js"
 import { fallbackChunks } from "./fallback.js"
 import { buildLexicalIndex } from "./lexical.js"
 import { assignSymbolsToChunks, attachTopology, extractSymbols } from "./topology.js"
-import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, SymbolRecord } from "./types.js"
+import type { CastIndex, ChunkingOptions, ChunkRecord, DiagnosticRecord, FileRecord, SymbolRecord } from "./types.js"
 
 export type FileResult = {
   file: FileRecord
@@ -32,6 +32,7 @@ type RefreshState = {
   nextChunks: CastIndex["chunks"]
   nextSymbols: CastIndex["symbols"]
   metadataDiagnostics: string[]
+  metadataDiagnosticDetails: DiagnosticRecord[]
   reusedFileResults: FileResult[]
   canReuseExistingRecords: boolean
   changed: boolean
@@ -94,6 +95,7 @@ export function createIndexer(input: {
       const nextChunks: CastIndex["chunks"] = {}
       const nextSymbols: CastIndex["symbols"] = {}
       const metadataDiagnostics: string[] = []
+      const metadataDiagnosticDetails: DiagnosticRecord[] = []
       const embeddingBatcher = createEmbeddingBatcher(input)
       const fileResultWriter = createFileResultWriter({ runStore, run: () => run })
       let changed = false
@@ -102,6 +104,7 @@ export function createIndexer(input: {
         nextChunks,
         nextSymbols,
         metadataDiagnostics,
+        metadataDiagnosticDetails,
         reusedFileResults: [],
         canReuseExistingRecords,
         changed,
@@ -112,6 +115,9 @@ export function createIndexer(input: {
       const markIndexing = () => {
         index.metadata.status = "indexing"
         index.metadata.worktree = input.worktree
+        index.metadata.maxFileBytes = input.options.maxFileBytes
+        index.metadata.includeGlobs = input.options.includeGlobs
+        index.metadata.excludeGlobs = input.options.excludeGlobs
         index.metadata.maxChunkNonWhitespaceChars = input.options.maxChunkNonWhitespaceChars
         index.metadata.chunking = input.options.chunking
       }
@@ -149,8 +155,17 @@ export function createIndexer(input: {
       const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols)
       const hasFileSetChange = !sameStringArray(Object.keys(index.files).sort(), Object.keys(nextFiles).sort())
       const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, metadataDiagnostics)
+      const hasDiagnosticDetailsChange =
+        stableStringify(index.metadata.diagnosticDetails ?? []) !== stableStringify(metadataDiagnosticDetails)
       if (
-        canSkipRefresh(index, input.worktree, changed, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange)
+        canSkipRefresh(
+          index,
+          input.worktree,
+          changed,
+          canReuseExistingRecords,
+          hasFileSetChange,
+          hasDiagnosticsChange || hasDiagnosticDetailsChange,
+        )
       ) {
         return index
       }
@@ -160,9 +175,13 @@ export function createIndexer(input: {
       index.symbols = nextSymbols
       index.lexical = lexicalIndex.lexical
       index.metadata.worktree = input.worktree
+      index.metadata.maxFileBytes = input.options.maxFileBytes
+      index.metadata.includeGlobs = input.options.includeGlobs
+      index.metadata.excludeGlobs = input.options.excludeGlobs
       index.metadata.maxChunkNonWhitespaceChars = input.options.maxChunkNonWhitespaceChars
       index.metadata.chunking = input.options.chunking
       index.metadata.diagnostics = metadataDiagnostics
+      index.metadata.diagnosticDetails = metadataDiagnosticDetails
       index.metadata.status = "ready"
       index.metadata.updatedAt = Date.now()
       await persistRefreshedIndex({ index, store, runStore, run: () => run, ensureRun })
@@ -265,7 +284,8 @@ async function processScannedFile(input: {
   const file = Bun.file(absolutePath)
   const skipDiagnostic = await skipFileDiagnostic(input.relativePath, file, input.input.options.maxFileBytes)
   if (skipDiagnostic) {
-    input.state.metadataDiagnostics.push(skipDiagnostic)
+    input.state.metadataDiagnostics.push(skipDiagnostic.message)
+    input.state.metadataDiagnosticDetails.push(skipDiagnostic)
     return input.state.changed
   }
   const loaded = await loadTextFileForIndexing(absolutePath)
@@ -640,13 +660,17 @@ async function skipFileDiagnostic(
   relativePath: string,
   file: { size: number; slice(start?: number, end?: number): Blob },
   maxFileBytes: number,
-) {
+): Promise<DiagnosticRecord | undefined> {
   if (file.size > maxFileBytes) {
-    return `${relativePath}: skipped file over maxFileBytes (${file.size} > ${maxFileBytes})`
+    return {
+      code: "index.skipped_file",
+      message: `${relativePath}: skipped file over maxFileBytes (${file.size} > ${maxFileBytes})`,
+      filePath: relativePath,
+    }
   }
   const sample = new Uint8Array(await file.slice(0, Math.min(file.size, BINARY_SAMPLE_BYTES)).arrayBuffer())
   if (isProbablyBinary(sample)) {
-    return `${relativePath}: skipped binary file`
+    return { code: "index.skipped_file", message: `${relativePath}: skipped binary file`, filePath: relativePath }
   }
 }
 
