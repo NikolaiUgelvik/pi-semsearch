@@ -1,8 +1,11 @@
+import { type SourceIndex } from "./range.js";
 export declare function fallbackChunks(input: {
     filePath: string;
     language: string;
     text: string;
     maxNonWhitespaceChars: number;
+    sourceIndex?: SourceIndex;
+    byteOffset?: number;
 }): {
     previousSiblingChunkId: string;
     nextSiblingChunkId: string;

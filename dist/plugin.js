@@ -76,16 +76,22 @@ export function createCastPluginForTest(dependencies = {}) {
         const client = createOpenAIClient(dependencies.fetch ? { fetch: dependencies.fetch } : {});
         const sessionModels = new Map();
         let outputLimits = {};
+        const lifecycle = new AbortController();
         let refresh;
+        let forcedRefresh;
         let refreshTail = Promise.resolve();
         const queueRefresh = (refreshInput = {}) => {
             const embedding = options.embedding;
             if (!(embedding && store) || storeError) {
                 return Promise.resolve();
             }
+            if (refreshInput.forced && forcedRefresh) {
+                return forcedRefresh;
+            }
             const indexStore = store;
             const nextRefresh = refreshTail
                 .then(() => {
+                lifecycle.signal.throwIfAborted();
                 if (storeError) {
                     return;
                 }
@@ -105,9 +111,9 @@ export function createCastPluginForTest(dependencies = {}) {
                     },
                     store: indexingStore,
                     parse: parseSource,
-                    embed: (text) => client.embed({ ...embedding, input: text }),
-                    embedBatch: (texts) => client.embedBatch({ ...embedding, input: texts }),
-                }).refresh();
+                    embed: (text, signal) => client.embed({ ...embedding, input: text, signal }),
+                    embedBatch: (texts, signal) => client.embedBatch({ ...embedding, input: texts, signal }),
+                }).refresh(lifecycle.signal);
             })
                 .catch((error) => {
                 if (error instanceof IndexUnavailableError) {
@@ -120,13 +126,22 @@ export function createCastPluginForTest(dependencies = {}) {
                 return;
             });
             refresh = nextRefresh;
+            if (refreshInput.forced) {
+                forcedRefresh = nextRefresh;
+            }
             nextRefresh.then(() => {
                 if (refresh === nextRefresh) {
                     refresh = undefined;
                 }
+                if (forcedRefresh === nextRefresh) {
+                    forcedRefresh = undefined;
+                }
             }, () => {
                 if (refresh === nextRefresh) {
                     refresh = undefined;
+                }
+                if (forcedRefresh === nextRefresh) {
+                    forcedRefresh = undefined;
                 }
             });
             refreshTail = nextRefresh.then(() => undefined, () => undefined);
@@ -275,10 +290,23 @@ export function createCastPluginForTest(dependencies = {}) {
             try {
                 const output = await (dependencies.retrieve ?? retrieveFromStore)({
                     input: args,
-                    options: { ...options, hybrid: options.retrieval.hybrid, rerank: options.rerank },
-                    embed: (text) => client.embed({ ...embedding, input: text }),
-                    generateHyde: (query) => generateHydeText({ query, context, hyde: options.hyde, client, generateOpenCodeHyde }),
-                    rerank: (query, documents) => rerankDocuments(query, documents, options.rerank, client),
+                    options: {
+                        ...options,
+                        hybrid: options.retrieval.hybrid,
+                        rerank: options.rerank,
+                        maxVectorCandidates: options.retrieval.maxVectorCandidates,
+                        maxRerankCandidates: options.retrieval.maxRerankCandidates,
+                    },
+                    embed: (text) => client.embed({ ...embedding, input: text, signal: lifecycle.signal }),
+                    generateHyde: (query) => generateHydeText({
+                        query,
+                        context,
+                        hyde: options.hyde,
+                        client,
+                        generateOpenCodeHyde,
+                        signal: lifecycle.signal,
+                    }),
+                    rerank: (query, documents) => rerankDocuments({ query, documents, rerank: options.rerank, client, signal: lifecycle.signal }),
                     readSource: async (filePath) => Bun.file(await resolveWorktreePath(input.worktree, filePath)).text(),
                     indexStore: retrievalIndexStore(),
                 });
@@ -414,8 +442,11 @@ Use this after semantic_search_code when you need the exact cached chunk, expand
                 }),
             },
             async dispose() {
+                lifecycle.abort();
                 sessionModels.clear();
+                outputLimits = {};
                 refresh = undefined;
+                forcedRefresh = undefined;
                 refreshTail = Promise.resolve();
             },
         };
@@ -600,7 +631,7 @@ function sameStartupChunking(left, right) {
 }
 async function ensureSearchIndexReady(shouldRefresh, queueRefresh, currentRefresh, currentStoreError) {
     if (shouldRefresh) {
-        await queueRefresh();
+        await queueRefresh({ forced: true });
     }
     const refreshInProgress = currentRefresh() !== undefined;
     if (shouldRefresh) {
@@ -626,22 +657,28 @@ function diagnosticsWithAppendedMessage(diagnostics, diagnostic) {
     return diagnostics.includes(diagnostic) ? diagnostics : [...diagnostics, diagnostic];
 }
 function generateHydeText(input) {
+    input.signal?.throwIfAborted();
     const openAiHyde = openAiHydeInput(input.query, input.hyde);
-    return openAiHyde ? input.client.generateHyde(openAiHyde) : input.generateOpenCodeHyde(input.query, input.context);
+    return openAiHyde
+        ? input.client.generateHyde({ ...openAiHyde, signal: input.signal })
+        : input.generateOpenCodeHyde(input.query, input.context);
 }
 function openAiHydeInput(query, hyde) {
     return hyde.mode === "openai-compatible" && hyde.baseURL && hyde.model
-        ? { baseURL: hyde.baseURL, apiKey: hyde.apiKey, model: hyde.model, query }
+        ? { baseURL: hyde.baseURL, apiKey: hyde.apiKey, model: hyde.model, query, timeoutMs: hyde.timeoutMs }
         : undefined;
 }
-function rerankDocuments(query, documents, rerank, client) {
-    return rerank
-        ? client.rerank({
-            baseURL: rerank.baseURL,
-            apiKey: rerank.apiKey,
-            model: rerank.model,
-            query,
-            documents,
+function rerankDocuments(input) {
+    input.signal?.throwIfAborted();
+    return input.rerank
+        ? input.client.rerank({
+            baseURL: input.rerank.baseURL,
+            apiKey: input.rerank.apiKey,
+            model: input.rerank.model,
+            timeoutMs: input.rerank.timeoutMs,
+            query: input.query,
+            documents: input.documents,
+            signal: input.signal,
         })
         : Promise.reject(new Error("Rerank is not configured"));
 }

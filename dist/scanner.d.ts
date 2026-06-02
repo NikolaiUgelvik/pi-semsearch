@@ -37,8 +37,8 @@ export declare function createIndexer(input: {
         language: string;
         root?: SyntaxNode;
     }>;
-    embed(text: string): Promise<number[]>;
-    embedBatch?(texts: string[]): Promise<number[][]>;
+    embed(text: string, signal?: AbortSignal): Promise<number[]>;
+    embedBatch?(texts: string[], signal?: AbortSignal): Promise<number[][]>;
 }): {
-    refresh(): Promise<CastIndex>;
+    refresh(signal?: AbortSignal): Promise<CastIndex>;
 };

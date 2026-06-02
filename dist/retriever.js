@@ -3,11 +3,16 @@ import { matchesPaths } from "./path-filter.js";
 import { chunkBreadcrumbs, chunkMatchesSource, expandWithParentContext, summarizeTopology } from "./topology.js";
 const CANDIDATE_MULTIPLIER = 3;
 const DEFAULT_MIN_FINAL_SCORE = 0.01;
+const DEFAULT_MAX_VECTOR_CANDIDATES = 512;
+const DEFAULT_MAX_RERANK_CANDIDATES = 64;
+const PATH_FILTER_CAP_DIAGNOSTIC = "path-filtered vector search hit the candidate cap; results may be incomplete";
 export async function retrieveFromStore(input) {
     await input.indexStore.readMetadata();
     const settings = retrievalSettings(input);
-    const rankingTopK = rankingLimit(settings.topK, input.options.rerank);
-    const candidateCount = storeVectorCandidateCount(rankingTopK, input.options.hybrid);
+    const maxVectorCandidates = input.options.maxVectorCandidates ?? DEFAULT_MAX_VECTOR_CANDIDATES;
+    const maxRerankCandidates = input.options.maxRerankCandidates ?? DEFAULT_MAX_RERANK_CANDIDATES;
+    const rankingTopK = rankingLimit(settings.topK, input.options.rerank, maxRerankCandidates);
+    const candidateCount = storeVectorCandidateCount(rankingTopK, input.options.hybrid, maxVectorCandidates);
     const candidates = await collectStoreCandidates(input, rankingTopK, candidateCount);
     const ranked = storeBackedRanking({
         vectorCandidates: candidates.rankedVectorCandidates,
@@ -74,16 +79,27 @@ export async function retrieveFromStore(input) {
 }
 async function collectStoreCandidates(input, rankingTopK, candidateCount) {
     const queryVector = await input.embed(input.input.query);
-    const vectorCandidates = await input.indexStore.searchVectorCandidates(queryVector, candidateCount, input.input.paths);
+    const vectorSearch = await input.indexStore.searchVectorCandidates(queryVector, candidateCount, input.input.paths);
+    const vectorCandidates = vectorSearch.slice(0, candidateCount);
     const lexicalCandidates = await storeLexicalCandidates(input, rankingTopK);
     const hyde = await storeHydeCandidates(input, vectorCandidates, candidateCount);
+    const cappedDiagnostics = cappedPathFilterDiagnostics(input, vectorSearch.incomplete === true || hyde.incomplete);
     return {
         vectorCandidates,
         lexicalCandidates,
-        rankedVectorCandidates: hyde.rankedVectorCandidates,
-        diagnostics: hyde.diagnostics,
-        diagnosticDetails: hyde.diagnosticDetails,
+        rankedVectorCandidates: hyde.rankedVectorCandidates.slice(0, candidateCount),
+        diagnostics: [...hyde.diagnostics, ...cappedDiagnostics.diagnostics],
+        diagnosticDetails: [...hyde.diagnosticDetails, ...cappedDiagnostics.diagnosticDetails],
         hydeUsed: hyde.used,
+    };
+}
+function cappedPathFilterDiagnostics(input, incomplete) {
+    if (!input.input.paths || input.input.paths.length === 0 || !incomplete) {
+        return { diagnostics: [], diagnosticDetails: [] };
+    }
+    return {
+        diagnostics: [PATH_FILTER_CAP_DIAGNOSTIC],
+        diagnosticDetails: [{ code: "retrieval.knn_capped", message: PATH_FILTER_CAP_DIAGNOSTIC }],
     };
 }
 function storeLexicalCandidates(input, rankingTopK) {
@@ -99,7 +115,13 @@ function storeLexicalCandidates(input, rankingTopK) {
 }
 async function storeHydeCandidates(input, vectorCandidates, candidateCount) {
     if (!shouldUseHyde(input, vectorCandidates)) {
-        return { rankedVectorCandidates: vectorCandidates, diagnostics: [], diagnosticDetails: [], used: false };
+        return {
+            rankedVectorCandidates: vectorCandidates,
+            diagnostics: [],
+            diagnosticDetails: [],
+            used: false,
+            incomplete: false,
+        };
     }
     try {
         const hydeText = await input.generateHyde(input.input.query);
@@ -110,6 +132,7 @@ async function storeHydeCandidates(input, vectorCandidates, candidateCount) {
             diagnostics: [],
             diagnosticDetails: [],
             used: true,
+            incomplete: hydeCandidates.incomplete === true,
         };
     }
     catch (error) {
@@ -122,6 +145,7 @@ async function storeHydeCandidates(input, vectorCandidates, candidateCount) {
             diagnostics: [message],
             diagnosticDetails: [{ code: "hyde.failed", message }],
             used: false,
+            incomplete: false,
         };
     }
 }
@@ -159,9 +183,9 @@ function uniqueDiagnosticDetails(details) {
 function uniqueDiagnostics(diagnostics) {
     return [...new Set(diagnostics)];
 }
-function storeVectorCandidateCount(rankingTopK, hybrid) {
+function storeVectorCandidateCount(rankingTopK, hybrid, maxVectorCandidates) {
     const multiplier = hybrid?.enabled ? hybrid.vectorCandidateMultiplier : CANDIDATE_MULTIPLIER;
-    return Math.max(rankingTopK * multiplier, rankingTopK);
+    return Math.max(rankingTopK, Math.min(rankingTopK * multiplier, maxVectorCandidates));
 }
 function retrievalSettings(input) {
     return {
@@ -170,8 +194,11 @@ function retrievalSettings(input) {
         minFinalScore: Math.max(0, input.input.minFinalScore ?? DEFAULT_MIN_FINAL_SCORE),
     };
 }
-function rankingLimit(topK, rerank) {
-    return rerank ? Math.max(topK * rerank.candidateMultiplier, topK) : topK;
+function rankingLimit(topK, rerank, maxRerankCandidates) {
+    if (!rerank) {
+        return topK;
+    }
+    return Math.max(topK, Math.min(topK * rerank.candidateMultiplier, maxRerankCandidates));
 }
 function vectorRanking(vectorCandidates, rankingTopK) {
     return {
@@ -255,6 +282,22 @@ async function outputResult(input, result, sourceCache, sourceReadFailures) {
     if (!chunk) {
         return [];
     }
+    if (input.input.input.includeParents !== true) {
+        return [
+            {
+                filePath: chunk.filePath,
+                language: chunk.language,
+                range: chunk.range,
+                score: input.initialScores[result.id] ?? result.score,
+                finalScore: result.score,
+                kind: chunk.kind,
+                breadcrumbs: chunkBreadcrumbs(chunk, input.input.index.symbols),
+                text: chunk.text,
+                topology: summarizeTopology(chunk, input.chunksById, input.input.index.symbols),
+                retrieval: input.retrieval.get(result.id),
+            },
+        ];
+    }
     const source = await sourceForChunk({
         input: input.input,
         chunk,
@@ -273,7 +316,7 @@ async function outputResult(input, result, sourceCache, sourceReadFailures) {
     }
     const context = parentContext({
         chunk,
-        includeParents: input.input.input.includeParents === true,
+        includeParents: true,
         maxContextChars: input.maxContextChars,
         source,
         symbols: input.input.index.symbols,

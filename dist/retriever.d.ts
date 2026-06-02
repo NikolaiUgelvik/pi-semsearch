@@ -1,7 +1,7 @@
-import type { CastIndex, HybridRetrievalOptions, HydratedChunkSet, LexicalChunkCandidate, RankedChunkCandidate, RerankOptions, SearchInput, SearchOutput } from "./types.js";
+import type { CastIndex, HybridRetrievalOptions, HydratedChunkSet, LexicalChunkCandidate, RerankOptions, SearchInput, SearchOutput, VectorCandidateSearchResult } from "./types.js";
 export interface RetrievalIndexStore {
     readMetadata(): Promise<CastIndex["metadata"]>;
-    searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<RankedChunkCandidate[]>;
+    searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<VectorCandidateSearchResult>;
     searchLexicalCandidates?(query: string, topK: number, paths?: string[]): Promise<LexicalChunkCandidate[]>;
     hydrateChunks(chunkIds: string[]): Promise<HydratedChunkSet>;
 }
@@ -16,6 +16,8 @@ export interface RetrieveFromStoreInput {
         };
         hybrid?: HybridRetrievalOptions;
         rerank?: RerankOptions;
+        maxVectorCandidates?: number;
+        maxRerankCandidates?: number;
     };
     embed(text: string): Promise<number[]>;
     generateHyde(query: string): Promise<string>;

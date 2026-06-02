@@ -1,4 +1,10 @@
-import { nonWhitespaceLength, rangeForSlice, stableChunkId } from "./range.js"
+import {
+  createSourceIndex,
+  nonWhitespaceLengthForIndexedSlice,
+  rangeForIndexedSlice,
+  type SourceIndex,
+  stableChunkId,
+} from "./range.js"
 import type { ChunkRecord } from "./types.js"
 
 const encoder = new TextEncoder()
@@ -10,29 +16,36 @@ export function fallbackChunks(input: {
   language: string
   text: string
   maxNonWhitespaceChars: number
+  sourceIndex?: SourceIndex
+  byteOffset?: number
 }) {
+  const sourceIndex = input.sourceIndex ?? createSourceIndex(input.text)
+  const byteOffset = input.byteOffset ?? 0
   const chunks: ChunkRecord[] = []
-  let byteStart = 0
+  let byteStart = byteOffset
   let pending = ""
-  let pendingStart = 0
+  let pendingStart = byteOffset
+  let pendingNonWhitespaceChars = 0
 
   for (const line of input.text.matchAll(LINE_PATTERN)) {
     if (!line[0]) {
       continue
     }
     for (const part of splitByNonWhitespaceBudget(line[0], input.maxNonWhitespaceChars)) {
-      if (pending && nonWhitespaceLength(pending + part) > input.maxNonWhitespaceChars) {
-        chunks.push(makeFallbackChunk(input.filePath, input.language, input.text, pendingStart, byteStart, pending))
+      if (pending && pendingNonWhitespaceChars + part.nonWhitespaceChars > input.maxNonWhitespaceChars) {
+        chunks.push(makeFallbackChunk(input.filePath, input.language, sourceIndex, pendingStart, byteStart, pending))
         pending = ""
         pendingStart = byteStart
+        pendingNonWhitespaceChars = 0
       }
-      pending += part
-      byteStart += encoder.encode(part).length
+      pending += part.text
+      pendingNonWhitespaceChars += part.nonWhitespaceChars
+      byteStart += part.byteLength
     }
   }
 
   if (pending) {
-    chunks.push(makeFallbackChunk(input.filePath, input.language, input.text, pendingStart, byteStart, pending))
+    chunks.push(makeFallbackChunk(input.filePath, input.language, sourceIndex, pendingStart, byteStart, pending))
   }
 
   return chunks.map((chunk, index) => ({
@@ -45,7 +58,7 @@ export function fallbackChunks(input: {
 function makeFallbackChunk(
   filePath: string,
   language: string,
-  source: string,
+  sourceIndex: SourceIndex,
   byteStart: number,
   byteEnd: number,
   text: string,
@@ -55,9 +68,9 @@ function makeFallbackChunk(
     filePath,
     language,
     kind: "fallback",
-    range: rangeForSlice(source, byteStart, byteEnd),
+    range: rangeForIndexedSlice(sourceIndex, byteStart, byteEnd),
     text,
-    nonWhitespaceChars: nonWhitespaceLength(text),
+    nonWhitespaceChars: nonWhitespaceLengthForIndexedSlice(sourceIndex, byteStart, byteEnd),
     nodeTypes: [],
     symbolIds: [],
     childChunkIds: [],
@@ -65,24 +78,27 @@ function makeFallbackChunk(
 }
 
 function splitByNonWhitespaceBudget(text: string, maxNonWhitespaceChars: number) {
-  const parts: string[] = []
+  const parts: Array<{ text: string; nonWhitespaceChars: number; byteLength: number }> = []
   let pending = ""
   let nonWhitespaceChars = 0
+  let byteLength = 0
 
   for (const character of text) {
     if (pending && !WHITESPACE_PATTERN.test(character) && nonWhitespaceChars >= maxNonWhitespaceChars) {
-      parts.push(pending)
+      parts.push({ text: pending, nonWhitespaceChars, byteLength })
       pending = ""
       nonWhitespaceChars = 0
+      byteLength = 0
     }
     pending += character
+    byteLength += encoder.encode(character).length
     if (!WHITESPACE_PATTERN.test(character)) {
       nonWhitespaceChars++
     }
   }
 
   if (pending) {
-    parts.push(pending)
+    parts.push({ text: pending, nonWhitespaceChars, byteLength })
   }
 
   return parts

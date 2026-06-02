@@ -1,5 +1,5 @@
 import type { SyntaxNode } from "./cast.js"
-import { rangeForSlice, textForByteSlice } from "./range.js"
+import { createSourceIndex, rangeForIndexedSlice, type SourceIndex, textForIndexedByteSlice } from "./range.js"
 import type { SymbolRecord } from "./types.js"
 
 const CLASS_NAME_PATTERN = /class\s+([\p{L}_$][\p{L}\p{N}_$]*)/u
@@ -23,44 +23,65 @@ const NAME_PATTERN_BY_KIND = {
   module: METHOD_NAME_PATTERN,
 } satisfies Record<Exclude<SymbolRecord["kind"], "function">, RegExp>
 
-function extractSymbolRecords(input: { filePath: string; source: string; nodes: SyntaxNode[] }) {
-  const symbols = input.nodes.flatMap((node) => extractNodeSymbols(input, node, undefined))
-  const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]))
+function extractSymbolRecords(input: {
+  filePath: string
+  source: string
+  sourceIndex?: SourceIndex
+  nodes: SyntaxNode[]
+}) {
+  const indexedInput = { ...input, sourceIndex: input.sourceIndex ?? createSourceIndex(input.source) }
+  const symbols: SymbolRecord[] = []
+  const childrenByParentId: Record<string, string[]> = {}
+  const stack = input.nodes
+    .slice()
+    .reverse()
+    .map((node) => ({ node, parentSymbolId: undefined as string | undefined }))
 
-  return symbols.map((symbol) => ({
-    ...symbol,
-    childSymbolIds: symbols
-      .filter((child) => child.parentSymbolId === symbol.id && symbolsById[child.id])
-      .map((child) => child.id),
-  }))
+  while (stack.length > 0) {
+    const { node, parentSymbolId } = stack.pop() as { node: SyntaxNode; parentSymbolId: string | undefined }
+    const symbol = symbolForNode(indexedInput, node, parentSymbolId)
+    if (symbol) {
+      symbols.push(symbol)
+      if (parentSymbolId) {
+        const children = childrenByParentId[parentSymbolId] ?? []
+        children.push(symbol.id)
+        childrenByParentId[parentSymbolId] = children
+      }
+    }
+
+    const childParentSymbolId = symbol?.id ?? parentSymbolId
+    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+      stack.push({ node: node.children[index], parentSymbolId: childParentSymbolId })
+    }
+  }
+
+  return symbols.map((symbol) => ({ ...symbol, childSymbolIds: childrenByParentId[symbol.id] ?? [] }))
 }
 
-function extractNodeSymbols(
-  input: { filePath: string; source: string },
+function symbolForNode(
+  input: { filePath: string; sourceIndex: SourceIndex },
   node: SyntaxNode,
   parentSymbolId: string | undefined,
-): SymbolRecord[] {
-  const kind = symbolKindFor(input.source, node)
-  const symbol = kind
-    ? ({
-        id: `${input.filePath}:${kind}:${nameFor(input.source, node, kind)}:${node.startIndex}:${node.endIndex}`,
-        name: nameFor(input.source, node, kind),
-        kind,
-        filePath: input.filePath,
-        range: rangeForSlice(input.source, node.startIndex, node.endIndex),
-        parentSymbolId,
-        childSymbolIds: [],
-      } satisfies SymbolRecord)
-    : undefined
+) {
+  const kind = symbolKindFor(input.sourceIndex, node)
+  if (!kind) {
+    return
+  }
 
-  return [
-    ...(symbol ? [symbol] : []),
-    ...node.children.flatMap((child) => extractNodeSymbols(input, child, symbol?.id ?? parentSymbolId)),
-  ]
+  const name = nameFor(input.sourceIndex, node, kind)
+  return {
+    id: `${input.filePath}:${kind}:${name}:${node.startIndex}:${node.endIndex}`,
+    name,
+    kind,
+    filePath: input.filePath,
+    range: rangeForIndexedSlice(input.sourceIndex, node.startIndex, node.endIndex),
+    parentSymbolId,
+    childSymbolIds: [],
+  } satisfies SymbolRecord
 }
 
-function symbolKindFor(source: string, node: SyntaxNode): SymbolRecord["kind"] | undefined {
-  const text = () => textForByteSlice(source, node.startIndex, node.endIndex)
+function symbolKindFor(sourceIndex: SourceIndex, node: SyntaxNode): SymbolRecord["kind"] | undefined {
+  const text = () => textForIndexedByteSlice(sourceIndex, node.startIndex, node.endIndex)
   if (objectPropertyIsFunction(node.type, text) || callIsTestFunction(node.type, text)) {
     return "function"
   }
@@ -79,8 +100,8 @@ function symbolKindForNodeType(type: string): SymbolRecord["kind"] | undefined {
   return SYMBOL_KIND_BY_NODE_TYPE.find(([nodeType]) => type.includes(nodeType))?.[1]
 }
 
-function nameFor(source: string, node: SyntaxNode, kind: SymbolRecord["kind"]) {
-  const text = textForByteSlice(source, node.startIndex, node.endIndex)
+function nameFor(sourceIndex: SourceIndex, node: SyntaxNode, kind: SymbolRecord["kind"]) {
+  const text = textForIndexedByteSlice(sourceIndex, node.startIndex, node.endIndex)
   return nameForKind(text, kind) ?? "anonymous"
 }
 

@@ -1,8 +1,11 @@
-import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, HydratedChunkSet, LexicalChunkCandidate, SymbolRecord } from "./types.js";
+import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, HydratedChunkSet, LexicalChunkCandidate, SymbolRecord, VectorCandidateSearchResult } from "./types.js";
 interface FileResult {
     file: FileRecord;
     chunks: Record<string, ChunkRecord>;
     symbols: Record<string, SymbolRecord>;
+}
+interface HydrateChunksOptions {
+    includeLexical?: boolean;
 }
 export declare function createEmptyIndex(input: {
     projectId: string;
@@ -20,11 +23,8 @@ export declare function createIndexStore(input: {
     read(): Promise<CastIndex>;
     write(index: CastIndex): Promise<void>;
     readMetadata(): Promise<import("./types.js").IndexMetadata>;
-    hydrateChunks(chunkIds: string[]): Promise<HydratedChunkSet>;
-    searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<{
-        id: string;
-        score: number;
-    }[]>;
+    hydrateChunks(chunkIds: string[], options?: HydrateChunksOptions): Promise<HydratedChunkSet>;
+    searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<VectorCandidateSearchResult>;
     searchLexicalCandidates(query: string, topK: number, paths?: string[]): Promise<LexicalChunkCandidate[]>;
     beginIndexRun(input: {
         configHash: string;

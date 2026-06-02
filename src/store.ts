@@ -5,7 +5,7 @@ import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { load as loadSqliteVec } from "sqlite-vec"
 import { tokenizeCodeText } from "./lexical.js"
-import { matchesPaths } from "./path-filter.js"
+import { type CompiledPathFilters, compilePathFilters } from "./path-filter.js"
 import type {
   CastIndex,
   ChunkingOptions,
@@ -15,7 +15,9 @@ import type {
   HydratedChunkSet,
   LexicalChunkCandidate,
   LexicalIndex,
+  RankedChunkCandidate,
   SymbolRecord,
+  VectorCandidateSearchResult,
 } from "./types.js"
 
 const INDEX_SCHEMA_VERSION = 1
@@ -30,7 +32,6 @@ const SQLITE_LEXICAL_FALLBACK_QUERY_TERMS = 16
 const INDEX_STATUSES: readonly unknown[] = ["empty", "indexing", "ready", "stale", "error"]
 const CHUNK_KINDS: readonly unknown[] = ["file", "class", "function", "method", "block", "fallback"]
 const SYMBOL_KINDS: readonly unknown[] = ["module", "class", "function", "method", "interface"]
-const PATH_FILTER_GLOB_SYNTAX_PATTERN = /[*?[{]|[!+@]\(/
 
 const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = {
   overlap: 0,
@@ -49,6 +50,18 @@ interface FileResult {
   file: FileRecord
   chunks: Record<string, ChunkRecord>
   symbols: Record<string, SymbolRecord>
+}
+
+interface HydrateChunksOptions {
+  includeLexical?: boolean
+}
+
+interface HydrateSqliteChunksInput {
+  db: Database
+  cacheKey: string
+  embeddingDimensions?: number
+  chunkIds: string[]
+  options?: HydrateChunksOptions
 }
 
 type StoredChunkRecord = Omit<ChunkRecord, "text" | "embedding"> & { text?: never; embedding?: never }
@@ -126,10 +139,10 @@ function createSqliteIndexStore(cacheDir: string, cacheKey: string, embeddingDim
         db.close()
       }
     },
-    async hydrateChunks(chunkIds: string[]) {
+    async hydrateChunks(chunkIds: string[], options?: HydrateChunksOptions) {
       const db = await openSqliteIndex(file, embeddingDimensions)
       try {
-        return hydrateSqliteChunks(db, cacheKey, embeddingDimensions, chunkIds)
+        return hydrateSqliteChunks({ db, cacheKey, embeddingDimensions, chunkIds, options })
       } finally {
         db.close()
       }
@@ -286,12 +299,8 @@ function readSqliteMetadata(db: Database, cacheKey: string, embeddingDimensions?
   }
 }
 
-function hydrateSqliteChunks(
-  db: Database,
-  cacheKey: string,
-  embeddingDimensions: number | undefined,
-  chunkIds: string[],
-): HydratedChunkSet {
+function hydrateSqliteChunks(input: HydrateSqliteChunksInput): HydratedChunkSet {
+  const { db, cacheKey, embeddingDimensions, chunkIds, options } = input
   const activeRunId = readActiveRunId(db)
   if (!activeRunId) {
     return emptyHydratedChunkSet(cacheKey, embeddingDimensions)
@@ -301,18 +310,27 @@ function hydrateSqliteChunks(
     return emptyHydratedChunkSet(cacheKey, embeddingDimensions, ["rebuilding corrupt index"])
   }
   if (chunkIds.length === 0) {
-    return { metadata, files: {}, chunks: {}, symbols: {}, diagnostics: [] }
+    const hydrated: HydratedChunkSet = { metadata, files: {}, chunks: {}, symbols: {}, diagnostics: [] }
+    if (options?.includeLexical) {
+      const lexical = readLexical(db, activeRunId)
+      if (lexical) {
+        hydrated.lexical = lexical
+      }
+    }
+    return hydrated
   }
 
-  return hydrateActiveSqliteChunks(db, activeRunId, metadata, chunkIds)
+  return hydrateActiveSqliteChunks({ db, activeRunId, metadata, chunkIds, options })
 }
 
-function hydrateActiveSqliteChunks(
-  db: Database,
-  activeRunId: string,
-  metadata: CastIndex["metadata"],
-  chunkIds: string[],
-): HydratedChunkSet {
+function hydrateActiveSqliteChunks(input: {
+  db: Database
+  activeRunId: string
+  metadata: CastIndex["metadata"]
+  chunkIds: string[]
+  options?: HydrateChunksOptions
+}): HydratedChunkSet {
+  const { db, activeRunId, metadata, chunkIds, options } = input
   const ids = chunkIdsWithTopology(db, activeRunId, chunkIds)
   const orderedStoredChunks = orderedStoredChunksByIds(db, activeRunId, ids)
   const files = readFilesByPaths(db, activeRunId, filePathsForChunks(orderedStoredChunks))
@@ -321,9 +339,11 @@ function hydrateActiveSqliteChunks(
   const sourceContext: SourceHydrationContext = { worktree: metadata.worktree, files, diagnostics, diagnosticDetails }
   const chunks = hydrateStoredChunks({ db, activeRunId, ids, orderedStoredChunks, sourceContext })
   const hydrated = hydratedChunkSet({ db, activeRunId, metadata, files, chunks, diagnostics, diagnosticDetails })
-  const lexical = readLexical(db, activeRunId)
-  if (lexical) {
-    hydrated.lexical = lexical
+  if (options?.includeLexical) {
+    const lexical = readLexical(db, activeRunId)
+    if (lexical) {
+      hydrated.lexical = lexical
+    }
   }
   return hydrated
 }
@@ -474,6 +494,9 @@ function readFiles(db: Database, runId: string) {
         `select file_runs.path,
                 coalesce(file_runs.language, files.language) as language,
                 coalesce(file_runs.fingerprint, files.fingerprint) as fingerprint,
+                coalesce(file_runs.size_bytes, files.size_bytes) as sizeBytes,
+                coalesce(file_runs.mtime_ms, files.mtime_ms) as mtimeMs,
+                coalesce(file_runs.ctime_ms, files.ctime_ms) as ctimeMs,
                 coalesce(file_runs.diagnostics_json, files.diagnostics_json) as diagnosticsJson,
                 file_runs.chunk_ids_json as chunkIdsJson
          from file_runs
@@ -495,6 +518,9 @@ function readFilesByPaths(db: Database, runId: string, filePaths: string[]) {
         `select file_runs.path,
                 coalesce(file_runs.language, files.language) as language,
                 coalesce(file_runs.fingerprint, files.fingerprint) as fingerprint,
+                coalesce(file_runs.size_bytes, files.size_bytes) as sizeBytes,
+                coalesce(file_runs.mtime_ms, files.mtime_ms) as mtimeMs,
+                coalesce(file_runs.ctime_ms, files.ctime_ms) as ctimeMs,
                 coalesce(file_runs.diagnostics_json, files.diagnostics_json) as diagnosticsJson,
                 file_runs.chunk_ids_json as chunkIdsJson
          from file_runs
@@ -509,6 +535,9 @@ interface FileRow {
   path: string
   language: string
   fingerprint: string
+  sizeBytes: number | null
+  mtimeMs: number | null
+  ctimeMs: number | null
   diagnosticsJson: string
   chunkIdsJson: string
 }
@@ -516,13 +545,23 @@ interface FileRow {
 function fileRecordsFromRows(files: FileRow[]) {
   const records: Record<string, FileRecord> = {}
   for (const file of files) {
-    records[file.path] = {
+    const record: FileRecord = {
       path: file.path,
       language: file.language,
       fingerprint: file.fingerprint,
       chunkIds: parsePersistedJson(file.chunkIdsJson),
       diagnostics: parsePersistedJson(file.diagnosticsJson),
     }
+    if (file.sizeBytes !== null) {
+      record.sizeBytes = file.sizeBytes
+    }
+    if (file.mtimeMs !== null) {
+      record.mtimeMs = file.mtimeMs
+    }
+    if (file.ctimeMs !== null) {
+      record.ctimeMs = file.ctimeMs
+    }
+    records[file.path] = record
   }
   return records
 }
@@ -838,7 +877,7 @@ function getCompletedSqliteFile(
 ): FileResult | undefined {
   const file = db
     .query(
-      `select path, language, fingerprint, diagnostics_json as diagnosticsJson, chunk_ids_json as chunkIdsJson
+      `select path, language, fingerprint, size_bytes as sizeBytes, mtime_ms as mtimeMs, ctime_ms as ctimeMs, diagnostics_json as diagnosticsJson, chunk_ids_json as chunkIdsJson
        from file_runs
        where run_id = ? and path = ? and fingerprint = ?`,
     )
@@ -846,6 +885,9 @@ function getCompletedSqliteFile(
     path: string
     language: string
     fingerprint: string
+    sizeBytes: number | null
+    mtimeMs: number | null
+    ctimeMs: number | null
     diagnosticsJson: string
     chunkIdsJson: string
   } | null
@@ -857,6 +899,9 @@ function getCompletedSqliteFile(
     path: file.path,
     language: file.language,
     fingerprint: file.fingerprint,
+    sizeBytes: file.sizeBytes ?? undefined,
+    mtimeMs: file.mtimeMs ?? undefined,
+    ctimeMs: file.ctimeMs ?? undefined,
     chunkIds: JSON.parse(file.chunkIdsJson),
     diagnostics: JSON.parse(file.diagnosticsJson),
   }
@@ -930,14 +975,13 @@ function activateSqliteRun(db: Database, runId: string, index: CastIndex) {
 }
 
 function updateRunChunkLexicalStats(db: Database, runId: string, chunks: CastIndex["chunks"]) {
+  const select = db.query("select record_json as recordJson from chunks where run_id = ? and id = ?")
   const update = db.query("update chunks set record_json = ? where run_id = ? and id = ?")
   for (const chunk of Object.values(chunks)) {
     if (!chunk.lexical) {
       continue
     }
-    const row = db
-      .query("select record_json as recordJson from chunks where run_id = ? and id = ?")
-      .get(runId, chunk.id) as {
+    const row = select.get(runId, chunk.id) as {
       recordJson: string
     } | null
     if (!row) {
@@ -968,7 +1012,8 @@ function sameStringArray(left: string[], right: string[]) {
 }
 
 function searchSqliteVectorCandidates(db: Database, queryEmbedding: number[], topK: number, paths?: string[]) {
-  const search = sqliteVectorSearchInput(db, queryEmbedding, topK, paths)
+  const pathFilters = compilePathFilters(paths)
+  const search = sqliteVectorSearchInput(db, queryEmbedding, topK, pathFilters)
   if (!search) {
     return []
   }
@@ -977,25 +1022,50 @@ function searchSqliteVectorCandidates(db: Database, queryEmbedding: number[], to
   let currentK = limits.initial
   const candidates: Array<{ id: string; score: number }> = []
   const seen = new Set<string>()
+  let incomplete = false
 
   while (true) {
-    appendMatchingSqliteVectorCandidates(
-      candidates,
-      seen,
-      safeQuerySqliteVectorCandidates(db, search.activeRunId, queryEmbedding, currentK),
-      paths,
-    )
+    const rows = safeQuerySqliteVectorCandidates({
+      db,
+      runId: search.activeRunId,
+      queryEmbedding,
+      topK: currentK,
+      pathFilter: search.pathFilter,
+    })
+    appendMatchingSqliteVectorCandidates(candidates, seen, rows, pathFilters)
 
     if (candidates.length >= search.target || currentK >= limits.max) {
+      incomplete =
+        search.hasPathFilters &&
+        candidates.length < search.target &&
+        rows.length >= currentK &&
+        currentK < search.vectorCount
       break
     }
     currentK = Math.min(limits.max, currentK * 2)
   }
 
-  return candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, search.target)
+  return vectorCandidateSearchResult(
+    candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, search.target),
+    {
+      incomplete,
+    },
+  )
 }
 
-function sqliteVectorSearchInput(db: Database, queryEmbedding: number[], topK: number, paths?: string[]) {
+function vectorCandidateSearchResult(
+  candidates: RankedChunkCandidate[],
+  metadata: { incomplete: boolean },
+): VectorCandidateSearchResult {
+  return Object.assign(candidates, metadata.incomplete ? { incomplete: true } : {})
+}
+
+function sqliteVectorSearchInput(
+  db: Database,
+  queryEmbedding: number[],
+  topK: number,
+  pathFilters: CompiledPathFilters,
+) {
   const activeRunId = readActiveRunId(db)
   const target = Math.max(0, Math.floor(topK))
   if (!activeRunId) {
@@ -1013,7 +1083,8 @@ function sqliteVectorSearchInput(db: Database, queryEmbedding: number[], topK: n
         activeRunId,
         target,
         vectorCount,
-        hasPathFilters: paths !== undefined && paths.length > 0,
+        hasPathFilters: pathFilters.prefixes.length > 0 || pathFilters.hasGlob,
+        pathFilter: sqlPrefixPathFilter(pathFilters),
       }
     : null
 }
@@ -1029,9 +1100,15 @@ function embeddingDimensionsMatch(db: Database, runId: string, queryEmbedding: n
   return dimensions === undefined || queryEmbedding.length === dimensions
 }
 
-function safeQuerySqliteVectorCandidates(db: Database, runId: string, queryEmbedding: number[], topK: number) {
+function safeQuerySqliteVectorCandidates(input: {
+  db: Database
+  runId: string
+  queryEmbedding: number[]
+  topK: number
+  pathFilter: ReturnType<typeof sqlPrefixPathFilter>
+}) {
   try {
-    return querySqliteVectorCandidates(db, runId, queryEmbedding, topK)
+    return querySqliteVectorCandidates(input)
   } catch (error) {
     if (isSqliteVecQueryEmbeddingError(error)) {
       return []
@@ -1052,17 +1129,26 @@ function searchSqliteLexicalCandidates(
     return []
   }
 
-  const pathFilter = sqlPrefixPathFilter(paths)
+  const pathFilters = compilePathFilters(paths)
+  const pathFilter = sqlPrefixPathFilter(pathFilters)
   const queryLimit = lexicalCandidateLimit(target, paths)
   try {
     return lexicalRowsToCandidates(
       querySqliteLexicalRows({ db, query, activeRunId, pathFilter, queryLimit }),
       target,
-      paths,
+      pathFilters,
     )
   } catch (error) {
     if (isFtsQuerySyntaxError(error)) {
-      return searchTokenizedSqliteLexicalCandidates({ db, query, activeRunId, pathFilter, queryLimit, target, paths })
+      return searchTokenizedSqliteLexicalCandidates({
+        db,
+        query,
+        activeRunId,
+        pathFilter,
+        queryLimit,
+        target,
+        pathFilters,
+      })
     }
     throw error
   }
@@ -1098,7 +1184,7 @@ function searchTokenizedSqliteLexicalCandidates(input: {
   pathFilter: ReturnType<typeof sqlPrefixPathFilter>
   queryLimit: number
   target: number
-  paths?: string[]
+  pathFilters: CompiledPathFilters
 }) {
   const fallbackQuery = tokenizedFtsQuery(input.query)
   if (!fallbackQuery) {
@@ -1108,7 +1194,7 @@ function searchTokenizedSqliteLexicalCandidates(input: {
     return lexicalRowsToCandidates(
       querySqliteLexicalRows({ ...input, query: fallbackQuery }),
       input.target,
-      input.paths,
+      input.pathFilters,
     )
   } catch (error) {
     if (isFtsQuerySyntaxError(error)) {
@@ -1121,10 +1207,10 @@ function searchTokenizedSqliteLexicalCandidates(input: {
 function lexicalRowsToCandidates(
   rows: Array<{ id: string; filePath: string; rank: number }>,
   target: number,
-  paths?: string[],
+  pathFilters: CompiledPathFilters,
 ) {
   return rows
-    .filter((row) => matchesPaths(row.filePath, paths))
+    .filter((row) => pathFilters.matches(row.filePath))
     .map((row) => ({ id: row.id, score: row.rank * -1, bm25Score: row.rank * -1 }))
     .slice(0, target)
 }
@@ -1157,14 +1243,15 @@ function lexicalCandidateLimit(topK: number, paths?: string[]) {
   return Math.max(topK, Math.min(SQLITE_LEXICAL_PATH_FILTER_MAX_K, topK * SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER))
 }
 
-function sqlPrefixPathFilter(paths?: string[]) {
-  if (!paths || paths.length === 0 || paths.some(hasPathFilterGlobSyntax)) {
+function sqlPrefixPathFilter(pathFilters: CompiledPathFilters) {
+  const prefixes = sqlPathPrefixes(pathFilters)
+  if (prefixes.length === 0) {
     return { sql: "", args: [] as string[] }
   }
 
   const clauses: string[] = []
   const args: string[] = []
-  for (const filter of paths) {
+  for (const filter of prefixes) {
     const prefix = filter.endsWith("/") ? filter : `${filter}/`
     clauses.push("(chunks.file_path = ? or chunks.file_path like ? escape '\\')")
     args.push(filter, `${escapeSqlLike(prefix)}%`)
@@ -1173,8 +1260,8 @@ function sqlPrefixPathFilter(paths?: string[]) {
   return { sql: ` and (${clauses.join(" or ")})`, args }
 }
 
-function hasPathFilterGlobSyntax(filter: string) {
-  return PATH_FILTER_GLOB_SYNTAX_PATTERN.test(filter)
+function sqlPathPrefixes(pathFilters: CompiledPathFilters) {
+  return [...new Set(pathFilters.sqlPrefixes.filter((prefix) => prefix.length > 0))]
 }
 
 function escapeSqlLike(value: string) {
@@ -1201,14 +1288,14 @@ function appendMatchingSqliteVectorCandidates(
   candidates: Array<{ id: string; score: number }>,
   seen: Set<string>,
   rows: SqliteVectorCandidateRow[],
-  paths?: string[],
+  pathFilters: CompiledPathFilters,
 ) {
   for (const row of rows) {
     if (seen.has(row.id)) {
       continue
     }
     seen.add(row.id)
-    if (matchesPaths(row.filePath, paths)) {
+    if (pathFilters.matches(row.filePath)) {
       candidates.push({
         id: row.id,
         score: cosineSimilarity(row.queryEmbedding, parsePersistedJson<number[]>(row.embedding)),
@@ -1247,8 +1334,17 @@ interface SqliteVectorCandidateRow {
   queryEmbedding: number[]
 }
 
-function querySqliteVectorCandidates(db: Database, runId: string, queryEmbedding: number[], topK: number) {
-  const vectorRows = db
+function querySqliteVectorCandidates(input: {
+  db: Database
+  runId: string
+  queryEmbedding: number[]
+  topK: number
+  pathFilter: ReturnType<typeof sqlPrefixPathFilter>
+}) {
+  if (input.pathFilter.sql) {
+    return queryPathFilteredSqliteVectorCandidates(input)
+  }
+  const vectorRows = input.db
     .query(
       `select rowid,
               vec_to_json(embedding) as embedding
@@ -1256,15 +1352,50 @@ function querySqliteVectorCandidates(db: Database, runId: string, queryEmbedding
        where rowid in (select rowid from chunk_rowids where run_id = ?) and embedding match ? and k = ?
        order by distance`,
     )
-    .all(runId, JSON.stringify(queryEmbedding), topK) as Array<{ rowid: number; embedding: string }>
+    .all(input.runId, JSON.stringify(input.queryEmbedding), input.topK) as Array<{ rowid: number; embedding: string }>
   const rowMetadata = readSqliteVectorRowMetadata(
-    db,
-    runId,
+    input.db,
+    input.runId,
     vectorRows.map((row) => row.rowid),
   )
   return vectorRows.flatMap((row) => {
     const metadata = rowMetadata.get(row.rowid)
-    return metadata ? [{ ...row, ...metadata, queryEmbedding }] : []
+    return metadata ? [{ ...row, ...metadata, queryEmbedding: input.queryEmbedding }] : []
+  })
+}
+
+function queryPathFilteredSqliteVectorCandidates(input: {
+  db: Database
+  runId: string
+  queryEmbedding: number[]
+  topK: number
+  pathFilter: ReturnType<typeof sqlPrefixPathFilter>
+}) {
+  const vectorRows = input.db
+    .query(
+      `select rowid,
+              vec_to_json(embedding) as embedding
+       from chunk_vectors
+       where rowid in (
+         select chunk_rowids.rowid
+         from chunk_rowids
+         inner join chunks on chunks.run_id = chunk_rowids.run_id and chunks.id = chunk_rowids.chunk_id
+          where chunk_rowids.run_id = ?${input.pathFilter.sql}
+       ) and embedding match ? and k = ?
+       order by distance`,
+    )
+    .all(input.runId, ...input.pathFilter.args, JSON.stringify(input.queryEmbedding), input.topK) as Array<{
+    rowid: number
+    embedding: string
+  }>
+  const rowMetadata = readSqliteVectorRowMetadata(
+    input.db,
+    input.runId,
+    vectorRows.map((row) => row.rowid),
+  )
+  return vectorRows.flatMap((row) => {
+    const metadata = rowMetadata.get(row.rowid)
+    return metadata ? [{ ...row, ...metadata, queryEmbedding: input.queryEmbedding }] : []
   })
 }
 
@@ -1330,12 +1461,15 @@ function insertFile(db: Database, runId: string, file: FileRecord, updateGlobalF
     upsertGlobalFile(db, file)
   }
   db.run(
-    "insert or replace into file_runs (run_id, path, language, fingerprint, diagnostics_json, chunk_ids_json) values (?, ?, ?, ?, ?, ?)",
+    "insert or replace into file_runs (run_id, path, language, fingerprint, size_bytes, mtime_ms, ctime_ms, diagnostics_json, chunk_ids_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
       runId,
       file.path,
       file.language,
       file.fingerprint,
+      file.sizeBytes ?? null,
+      file.mtimeMs ?? null,
+      file.ctimeMs ?? null,
       JSON.stringify(file.diagnostics),
       JSON.stringify(file.chunkIds),
     ],
@@ -1343,12 +1477,18 @@ function insertFile(db: Database, runId: string, file: FileRecord, updateGlobalF
 }
 
 function upsertGlobalFile(db: Database, file: FileRecord) {
-  db.run("insert or replace into files (path, language, fingerprint, diagnostics_json) values (?, ?, ?, ?)", [
-    file.path,
-    file.language,
-    file.fingerprint,
-    JSON.stringify(file.diagnostics),
-  ])
+  db.run(
+    "insert or replace into files (path, language, fingerprint, size_bytes, mtime_ms, ctime_ms, diagnostics_json) values (?, ?, ?, ?, ?, ?, ?)",
+    [
+      file.path,
+      file.language,
+      file.fingerprint,
+      file.sizeBytes ?? null,
+      file.mtimeMs ?? null,
+      file.ctimeMs ?? null,
+      JSON.stringify(file.diagnostics),
+    ],
+  )
 }
 
 function insertChunks(db: Database, runId: string, chunks: ChunkRecord[]) {
@@ -1453,22 +1593,31 @@ function initializeSchema(db: Database, embeddingDimensions?: number) {
   db.run(
     "create table if not exists files (path text primary key, language text not null, fingerprint text not null, diagnostics_json text not null)",
   )
+  addColumnIfMissing(db, "files", "size_bytes", "integer")
+  addColumnIfMissing(db, "files", "mtime_ms", "real")
+  addColumnIfMissing(db, "files", "ctime_ms", "real")
   db.run(
     "create table if not exists file_runs (run_id text not null, path text not null, chunk_ids_json text not null, primary key (run_id, path))",
   )
   addColumnIfMissing(db, "file_runs", "language", "text")
   addColumnIfMissing(db, "file_runs", "fingerprint", "text")
+  addColumnIfMissing(db, "file_runs", "size_bytes", "integer")
+  addColumnIfMissing(db, "file_runs", "mtime_ms", "real")
+  addColumnIfMissing(db, "file_runs", "ctime_ms", "real")
   addColumnIfMissing(db, "file_runs", "diagnostics_json", "text")
   db.run(
     "create table if not exists chunks (run_id text not null, id text not null, file_path text not null, kind text not null, record_json text not null, primary key (run_id, id))",
   )
+  db.run("create index if not exists chunks_run_file_path_idx on chunks (run_id, file_path)")
   db.run(
     "create table if not exists symbols (run_id text not null, id text not null, file_path text not null, kind text not null, record_json text not null, primary key (run_id, id))",
   )
+  db.run("create index if not exists symbols_run_file_path_idx on symbols (run_id, file_path)")
   db.run("create table if not exists lexical (run_id text primary key, metadata_json text not null)")
   db.run(
     "create table if not exists chunk_rowids (run_id text not null, chunk_id text not null, rowid integer not null, primary key (run_id, chunk_id))",
   )
+  db.run("create index if not exists chunk_rowids_run_rowid_idx on chunk_rowids (run_id, rowid)")
   if (embeddingDimensions !== undefined) {
     db.run(`create virtual table if not exists chunk_vectors using vec0(embedding float[${embeddingDimensions}])`)
   }
@@ -1563,6 +1712,9 @@ function isFileRecord(value: unknown) {
     typeof value.path === "string" &&
     typeof value.language === "string" &&
     typeof value.fingerprint === "string" &&
+    isOptionalNonnegativeNumber(value.sizeBytes) &&
+    isOptionalNonnegativeNumber(value.mtimeMs) &&
+    isOptionalNonnegativeNumber(value.ctimeMs) &&
     isStringArray(value.chunkIds) &&
     isStringArray(value.diagnostics)
   )
@@ -1652,6 +1804,10 @@ function isOptionalNumberArray(value: unknown) {
 
 function isNonnegativeNumber(value: unknown) {
   return typeof value === "number" && value >= 0
+}
+
+function isOptionalNonnegativeNumber(value: unknown) {
+  return value === undefined || isNonnegativeNumber(value)
 }
 
 function isOptionalString(value: unknown) {

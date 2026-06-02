@@ -1,34 +1,39 @@
 import { HYDE_SYSTEM_PROMPT } from "./hyde.js";
 const TRAILING_SLASHES_PATTERN = /\/+$/;
 const EMBEDDING_RETRIES = 2;
+const NON_EMBEDDING_RETRIES = 1;
 const EMBEDDING_RETRY_DELAY_MS = 10;
+const MS_PER_SECOND = 1000;
 const HTTP_REQUEST_TIMEOUT = 408;
 const HTTP_TOO_MANY_REQUESTS = 429;
 const HTTP_SERVER_ERROR_MIN = 500;
 export function createOpenAIClient(options = {}) {
     const request = options.fetch ?? fetch;
+    const sleep = options.sleep ?? delay;
+    const random = options.random ?? Math.random;
     return {
-        embed: (input) => embed(request, input),
-        embedBatch: (input) => embedBatch(request, input),
-        generateHyde: (input) => generateHyde(request, input),
-        rerank: (input) => rerank(request, input),
+        embed: (input) => embed({ request, sleep, random }, input),
+        embedBatch: (input) => embedBatch({ request, sleep, random }, input),
+        generateHyde: (input) => generateHyde({ request, sleep, random }, input),
+        rerank: (input) => rerank({ request, sleep, random }, input),
     };
 }
-async function embed(request, input) {
-    const body = await requestEmbeddings(request, input);
+async function embed(context, input) {
+    const body = await requestEmbeddings(context, input);
     return embeddingFromBody(body);
 }
-async function embedBatch(request, input) {
-    const body = await requestEmbeddings(request, input);
+async function embedBatch(context, input) {
+    const body = await requestEmbeddings(context, input);
     return embeddingsFromBody(body, input.input.length);
 }
-async function requestEmbeddings(request, input) {
+async function requestEmbeddings(context, input) {
     const body = await requestJsonWithRetries({
-        request,
+        ...context,
         url: `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`,
         init: {
             method: "POST",
             headers: buildHeaders(input.apiKey),
+            signal: input.signal,
             body: JSON.stringify({
                 model: input.model,
                 input: input.input,
@@ -37,65 +42,128 @@ async function requestEmbeddings(request, input) {
         },
         label: "Embedding",
         retries: EMBEDDING_RETRIES,
+        timeoutMs: input.timeoutMs,
     });
     return body;
 }
-async function generateHyde(request, input) {
-    const body = await requestJson(request, `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/chat/completions`, {
-        method: "POST",
-        headers: buildHeaders(input.apiKey),
-        body: JSON.stringify({
-            model: input.model,
-            messages: [
-                {
-                    role: "system",
-                    content: HYDE_SYSTEM_PROMPT,
-                },
-                { role: "user", content: input.query },
-            ],
-            temperature: 0,
-        }),
-    }, "HyDE");
+async function generateHyde(context, input) {
+    const body = await requestJsonWithRetries({
+        ...context,
+        url: `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/chat/completions`,
+        init: {
+            method: "POST",
+            headers: buildHeaders(input.apiKey),
+            signal: input.signal,
+            body: JSON.stringify({
+                model: input.model,
+                messages: [
+                    {
+                        role: "system",
+                        content: HYDE_SYSTEM_PROMPT,
+                    },
+                    { role: "user", content: input.query },
+                ],
+                temperature: 0,
+            }),
+        },
+        label: "HyDE",
+        retries: NON_EMBEDDING_RETRIES,
+        timeoutMs: input.timeoutMs,
+    });
     return hydeContentFromBody(body);
 }
-async function rerank(request, input) {
-    const body = await requestJson(request, `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/rerank`, {
-        method: "POST",
-        headers: buildHeaders(input.apiKey),
-        body: JSON.stringify({
-            model: input.model,
-            query: input.query,
-            documents: input.documents,
-        }),
-    }, "Rerank");
+async function rerank(context, input) {
+    const body = await requestJsonWithRetries({
+        ...context,
+        url: `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/rerank`,
+        init: {
+            method: "POST",
+            headers: buildHeaders(input.apiKey),
+            signal: input.signal,
+            body: JSON.stringify({
+                model: input.model,
+                query: input.query,
+                documents: input.documents,
+            }),
+        },
+        label: "Rerank",
+        retries: NON_EMBEDDING_RETRIES,
+        timeoutMs: input.timeoutMs,
+    });
     return rerankResultsFromBody(body, input.documents.length);
-}
-async function requestJson(request, url, init, label) {
-    const response = await request(url, init);
-    if (!response.ok) {
-        throw new Error(`${label} request failed: ${response.status}`);
-    }
-    return response.json().catch(() => undefined);
 }
 function requestJsonWithRetries(input) {
     const attemptRequest = async (attempt) => {
-        const response = await input.request(input.url, input.init);
+        input.init.signal?.throwIfAborted();
+        const timeout = withTimeoutSignal(input.init, input.timeoutMs);
+        const response = await input.request(input.url, timeout.init).finally(timeout.cancel);
         if (response.ok) {
             return response.json().catch(() => undefined);
         }
-        if (attempt >= input.retries || !isTransientEmbeddingStatus(response.status)) {
+        if (attempt >= input.retries || !isTransientStatus(response.status)) {
             throw new Error(`${input.label} request failed: ${response.status}`);
         }
-        await delay(EMBEDDING_RETRY_DELAY_MS * (attempt + 1));
+        await input.sleep(retryDelayMs(response, attempt, input.random), input.init.signal);
         return attemptRequest(attempt + 1);
     };
     return attemptRequest(0);
 }
-function isTransientEmbeddingStatus(status) {
+function isTransientStatus(status) {
     return status === HTTP_REQUEST_TIMEOUT || status === HTTP_TOO_MANY_REQUESTS || status >= HTTP_SERVER_ERROR_MIN;
 }
-function delay(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function retryDelayMs(response, attempt, random) {
+    return retryAfterDelayMs(response.headers.get("retry-after")) ?? exponentialJitterDelayMs(attempt, random);
+}
+function retryAfterDelayMs(value) {
+    if (!value) {
+        return;
+    }
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return seconds * MS_PER_SECOND;
+    }
+    const dateMs = Date.parse(value);
+    return Number.isNaN(dateMs) ? undefined : Math.max(0, dateMs - Date.now());
+}
+function exponentialJitterDelayMs(attempt, random) {
+    return EMBEDDING_RETRY_DELAY_MS * 2 ** attempt * (1 + Math.min(1, Math.max(0, random())));
+}
+function withTimeoutSignal(init, timeoutMs) {
+    if (!timeoutMs) {
+        return { init, cancel: noop };
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs);
+    const abort = () => controller.abort(init.signal?.reason);
+    init.signal?.addEventListener("abort", abort, { once: true });
+    return {
+        init: { ...init, signal: controller.signal },
+        cancel: () => {
+            clearTimeout(timeout);
+            init.signal?.removeEventListener("abort", abort);
+        },
+    };
+}
+function noop() {
+    return;
+}
+function delay(ms, signal) {
+    signal?.throwIfAborted();
+    return new Promise((resolve, reject) => {
+        const cleanup = () => {
+            clearTimeout(timeout);
+            signal?.removeEventListener("abort", abort);
+        };
+        const abort = () => {
+            cleanup();
+            reject(signal?.reason);
+        };
+        const timeout = setTimeout(() => {
+            cleanup();
+            resolve();
+        }, ms);
+        signal?.addEventListener("abort", abort, { once: true });
+    });
 }
 function embeddingFromBody(body) {
     const embedding = arrayProperty(body, "data")?.[0]?.embedding;

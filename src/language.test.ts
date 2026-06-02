@@ -1,6 +1,21 @@
 import { describe, expect, test } from "bun:test"
 import { languageForPath, parseSource } from "./language.js"
 
+function syntaxTypes(node: { type: string; children: Array<{ type: string; children: unknown[] }> } | undefined) {
+  const types: string[] = []
+  const visit = (current: typeof node) => {
+    if (!current) {
+      return
+    }
+    types.push(current.type)
+    for (const child of current.children) {
+      visit(child as typeof node)
+    }
+  }
+  visit(node)
+  return types
+}
+
 describe("language registry", () => {
   test("matches curated parser entries by extension and filename", () => {
     expect(languageForPath("src/app.ts")?.id).toBe("typescript")
@@ -51,6 +66,19 @@ describe("language registry", () => {
     expect(parsed.root?.startIndex).toBe(0)
     expect(parsed.root?.endIndex).toBe(23)
     expect(parsed.root?.children.length).toBeGreaterThan(0)
+  })
+
+  test("parseSource returns named syntax structure for supported files", async () => {
+    const parsed = await parseSource("example.ts", "export function example() { return 1 }")
+    const types = syntaxTypes(parsed.root)
+
+    expect(parsed.language).toBe("typescript")
+    expect(parsed.root?.children.length).toBeGreaterThan(0)
+    expect(types).toContain("function_declaration")
+    expect(types).not.toContain("export")
+    expect(types).not.toContain("function")
+    expect(types).not.toContain("{")
+    expect(types).not.toContain("}")
   })
 
   test("parses PHP source into the shared syntax node shape", async () => {

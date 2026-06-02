@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import type { SyntaxNode } from "./cast.js"
 import {
   assignSymbolsToChunks,
   attachTopology,
@@ -48,6 +49,75 @@ describe("topology", () => {
     expect(withTopology.find((candidate) => candidate.id === "child")?.symbolIds).toEqual([symbol.id])
     expect(withTopology.find((candidate) => candidate.id === "child")?.parentChunkId).toBe("root")
     expect(withTopology.find((candidate) => candidate.id === "root")?.childChunkIds).toEqual(["child"])
+  })
+
+  test("links many deeply nested symbols and chunks without changing ordering", () => {
+    const symbolCount = 10_000
+    const starts: number[] = []
+    const ends: number[] = []
+    let source = ""
+    for (let index = 0; index < symbolCount; index += 1) {
+      starts.push(source.length)
+      source += `function s${index}() {\n`
+    }
+    for (let index = symbolCount - 1; index >= 0; index -= 1) {
+      source += "}\n"
+      ends[index] = source.length - 1
+    }
+
+    let child: SyntaxNode | undefined
+    for (let index = symbolCount - 1; index >= 0; index -= 1) {
+      child = {
+        type: "function_declaration",
+        startIndex: starts[index],
+        endIndex: ends[index],
+        children: child ? [child] : [],
+      }
+    }
+
+    const symbols = extractSymbols({ filePath: "src/deep.ts", source, nodes: child ? [child] : [] })
+    const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]))
+    const symbolId = (index: number) => `src/deep.ts:function:s${index}:${starts[index]}:${ends[index]}`
+    const chunkDepths = Array.from({ length: 25 }, (_, index) => index * 200)
+    const chunks = chunkDepths.map((depth) =>
+      chunk(`chunk:${depth}`, "src/deep.ts", starts[depth], starts[depth] + `function s${depth}() {`.length),
+    )
+
+    const linked = assignSymbolsToChunks(chunks, symbolsById)
+    const deepest = linked.at(-1)
+
+    expect(symbols).toHaveLength(symbolCount)
+    expect(symbols[0].childSymbolIds).toEqual([symbolId(1)])
+    expect(symbols[4999].childSymbolIds).toEqual([symbolId(5000)])
+    expect(deepest?.symbolIds).toHaveLength(4801)
+    expect(deepest?.symbolIds.slice(0, 3)).toEqual([symbolId(0), symbolId(1), symbolId(2)])
+    expect(deepest?.symbolIds.slice(-3)).toEqual([symbolId(4798), symbolId(4799), symbolId(4800)])
+  })
+
+  test("traverses deeply nested non-symbol nodes without overflowing the JS stack", () => {
+    let child: SyntaxNode | undefined
+    for (let index = 0; index < 50_000; index += 1) {
+      child = { type: "statement_block", startIndex: 0, endIndex: 0, children: child ? [child] : [] }
+    }
+
+    expect(extractSymbols({ filePath: "src/deep.ts", source: "", nodes: child ? [child] : [] })).toEqual([])
+  })
+
+  test("attaches topology for hundreds of nested chunks without recursive traversal", () => {
+    const chunkCount = 1000
+    const chunks = Array.from({ length: chunkCount }, (_, index) =>
+      chunk(`chunk:${index}`, "src/deep.ts", index, chunkCount * 2 - index),
+    )
+
+    const linked = attachTopology(chunks, {})
+
+    expect(linked).toHaveLength(chunkCount)
+    expect(linked[0].parentChunkId).toBeUndefined()
+    expect(linked[0].childChunkIds).toEqual(["chunk:1"])
+    expect(linked[500].parentChunkId).toBe("chunk:499")
+    expect(linked[500].childChunkIds).toEqual(["chunk:501"])
+    expect(linked.at(-1)?.parentChunkId).toBe("chunk:998")
+    expect(linked.at(-1)?.childChunkIds).toEqual([])
   })
 
   test("links children to parent symbols and siblings", () => {

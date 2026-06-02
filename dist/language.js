@@ -118,7 +118,7 @@ function adaptNode(node) {
         type: node.type,
         startIndex: node.startIndex,
         endIndex: node.endIndex,
-        children: node.children.filter((child) => child !== null).map(adaptNode),
+        children: node.namedChildren.filter((child) => child !== null).map(adaptNode),
     };
 }
 function resolveWasm(input) {

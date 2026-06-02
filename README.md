@@ -48,7 +48,7 @@ Restart opencode after changing plugin configuration. Plugins are loaded when op
 }
 ```
 
-`dimensions` is optional and is forwarded to providers that support embedding dimension selection. Indexing sends embeddings in batches; set `embedding.batchSize` to tune the number of chunks per request. The default is `16`.
+`dimensions` is optional and is forwarded to providers that support embedding dimension selection. Indexing sends embeddings in batches; set `embedding.batchSize` to tune the number of chunk texts per embedding request. The default is `16`. Set `embedding.concurrency` to control how many embedding batches are allowed concurrently. The default is `1`; increase it cautiously for providers with generous rate limits. Provider requests default to a `timeoutMs` of `30000`.
 
 ## OpenRouter HyDE Example
 
@@ -211,6 +211,8 @@ Configure file scanning with plugin options:
   "maxFileBytes": 2097152
 }
 ```
+
+For large repositories, start with low `embedding.concurrency`, narrow `includeGlobs` to the code you need, add explicit `excludeGlobs` for generated and vendor directories, and use `refresh` only when you need to rebuild or update the index. Higher `embedding.batchSize` can reduce request overhead, but provider limits vary; if you see rate limits or timeouts, reduce batch size and concurrency first.
 
 Configure chunking with plugin options:
 

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
-import { chmod, mkdir, mkdtemp, rm, symlink, utimes } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, utimes } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { parseOptions } from "./options.js"
@@ -115,6 +115,90 @@ describe("createIndexer", () => {
       expect(Object.keys(index.files).sort()).toEqual(["a.ts", "b.ts"])
       expect(batches).toHaveLength(1)
       expect(batches[0]).toHaveLength(2)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("captures parsed root once before embedding chunks", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const source = "export function example() { return 1 }\n"
+      await Bun.write(path.join(dir, "example.ts"), source)
+      let rootReads = 0
+      const root = {
+        type: "program",
+        startIndex: 0,
+        endIndex: source.length,
+        children: [
+          {
+            type: "function_declaration",
+            startIndex: 0,
+            endIndex: source.length,
+            children: [],
+          },
+        ],
+      }
+      const parsed = {
+        language: "typescript",
+        get root() {
+          rootReads += 1
+          return root
+        },
+      }
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: createMemoryStore(),
+        parse: async () => parsed,
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+
+      expect(rootReads).toBe(1)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("aborts before embedding batches after parsing", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "example.ts"), "export const example = 1\n")
+      const controller = new AbortController()
+      let embedBatchCalled = false
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: createMemoryStore(),
+        parse: async () => {
+          controller.abort()
+          return { language: "typescript", root: undefined }
+        },
+        embed: async () => {
+          throw new Error("single embedding should not be called")
+        },
+        embedBatch: async () => {
+          embedBatchCalled = true
+          return [[1, 0]]
+        },
+      })
+
+      await expect(indexer.refresh(controller.signal)).rejects.toThrow("operation was aborted")
+      expect(embedBatchCalled).toBe(false)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -690,6 +774,220 @@ describe("createIndexer", () => {
     }
   })
 
+  test("reuses unchanged file from stat metadata before reading bytes", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const filePath = path.join(dir, "a.ts")
+      await Bun.write(filePath, "export const a = 1\n")
+      let parseCalls = 0
+      let embedCalls = 0
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => {
+          parseCalls++
+          return { language: "typescript", root: undefined }
+        },
+        embed: async () => {
+          embedCalls++
+          return [1, 0]
+        },
+      })
+
+      await indexer.refresh()
+      await chmod(filePath, 0)
+      const unreadableStat = await stat(filePath)
+      index.files["a.ts"].ctimeMs = unreadableStat.ctimeMs
+      index.metadata.updatedAt = unreadableStat.ctimeMs + 2000
+      const refreshed = await indexer.refresh()
+
+      expect(refreshed.files["a.ts"]?.sizeBytes).toBeGreaterThan(0)
+      expect(refreshed.files["a.ts"]?.mtimeMs).toBeNumber()
+      expect(parseCalls).toBe(1)
+      expect(embedCalls).toBe(1)
+    } finally {
+      await chmod(path.join(dir, "a.ts"), 0o600).catch(() => undefined)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("does not parse or embed unchanged files after stat fast-path reuse", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const unchangedPath = path.join(dir, "unchanged.ts")
+      const changedPath = path.join(dir, "changed.ts")
+      await Bun.write(unchangedPath, "export const unchanged = 1\n")
+      await Bun.write(changedPath, "export const changed = 1\n")
+      const parsedFiles: string[] = []
+      const embeddedTexts: string[] = []
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async (filePath) => {
+          parsedFiles.push(path.basename(filePath))
+          return { language: "typescript", root: undefined }
+        },
+        embed: async (text) => {
+          embeddedTexts.push(text)
+          return [1, 0]
+        },
+      })
+
+      await indexer.refresh()
+      expect([...parsedFiles].sort()).toEqual(["changed.ts", "unchanged.ts"])
+      expect(embeddedTexts).toHaveLength(2)
+      parsedFiles.length = 0
+      embeddedTexts.length = 0
+
+      await chmod(unchangedPath, 0)
+      const unreadableStat = await stat(unchangedPath)
+      index.files["unchanged.ts"].ctimeMs = unreadableStat.ctimeMs
+      index.metadata.updatedAt = unreadableStat.ctimeMs + 2000
+      await Bun.write(changedPath, "export const changed = 200\n")
+
+      await indexer.refresh()
+
+      expect(parsedFiles).toEqual(["changed.ts"])
+      expect(embeddedTexts).toHaveLength(1)
+      expect(embeddedTexts[0]).toContain("path: changed.ts")
+      expect(embeddedTexts[0]).toContain("export const changed = 200")
+    } finally {
+      await chmod(path.join(dir, "unchanged.ts"), 0o600).catch(() => undefined)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("does not reuse unreadable file when ctime differs", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const filePath = path.join(dir, "a.ts")
+      await Bun.write(filePath, "export const a = 1\n")
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+      const previousMtime = new Date(index.files["a.ts"].mtimeMs ?? 0)
+      await Bun.write(filePath, "export const b = 2\n")
+      await utimes(filePath, previousMtime, previousMtime)
+      await chmod(filePath, 0)
+      const changedStat = await stat(filePath)
+      index.files["a.ts"].sizeBytes = changedStat.size
+      index.files["a.ts"].mtimeMs = changedStat.mtimeMs
+      index.files["a.ts"].ctimeMs = changedStat.ctimeMs - 1
+
+      await expect(indexer.refresh()).rejects.toThrow()
+    } finally {
+      await chmod(path.join(dir, "a.ts"), 0o600).catch(() => undefined)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("falls back to fingerprint reuse when cached file stat metadata is missing", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const filePath = path.join(dir, "a.ts")
+      await Bun.write(filePath, "export const a = 1\n")
+      const fingerprint = await testFingerprint(filePath)
+      let index = createEmptyIndex({
+        projectId: "p",
+        worktree: dir,
+        cacheKey: "key",
+        maxChunkNonWhitespaceChars: 2000,
+        chunking: DEFAULT_CHUNKING_OPTIONS,
+      })
+      index.metadata.status = "ready"
+      index.metadata.maxFileBytes = DEFAULT_MAX_FILE_BYTES
+      index.metadata.includeGlobs = ["**/*.ts"]
+      index.metadata.excludeGlobs = []
+      index.files["a.ts"] = { path: "a.ts", language: "typescript", fingerprint, chunkIds: ["a.ts:0"], diagnostics: [] }
+      index.chunks["a.ts:0"] = {
+        id: "a.ts:0",
+        filePath: "a.ts",
+        language: "typescript",
+        kind: "file",
+        range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+        text: "export const a = 1\n",
+        nonWhitespaceChars: 15,
+        nodeTypes: [],
+        symbolIds: [],
+        childChunkIds: [],
+        embedding: [1, 0],
+      }
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => {
+          throw new Error("old-cache unchanged file should be reused after fingerprinting")
+        },
+        embed: async () => {
+          throw new Error("old-cache unchanged file should not be embedded")
+        },
+      })
+
+      const refreshed = await indexer.refresh()
+
+      expect(refreshed.files["a.ts"]?.sizeBytes).toBeUndefined()
+      expect(refreshed.files["a.ts"]?.mtimeMs).toBeUndefined()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("persists ordered glob metadata changes on unchanged indexes", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
@@ -934,6 +1232,47 @@ describe("createIndexer", () => {
       await indexer.refresh()
 
       expect(batchWritesAtChangedParse).toEqual([["a.ts", "b.ts", "c.ts", "d.ts"]])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("flushes queued reused file results when an unchanged refresh reaches the reuse queue cap", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Promise.all(
+        Array.from({ length: 257 }, (_, index) => `${String(index).padStart(3, "0")}.ts`).map((fileName) =>
+          Bun.write(path.join(dir, fileName), `export const value${fileName.replace(/\W/g, "")} = 1\n`),
+        ),
+      )
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
+      const originalWriteFileResults = store.writeFileResults.bind(store)
+      const batchWrites: number[] = []
+      store.writeFileResults = async (runId, fileResults) => {
+        batchWrites.push(fileResults.length)
+        await originalWriteFileResults(runId, fileResults)
+      }
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store,
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+      batchWrites.length = 0
+      await indexer.refresh()
+
+      expect(batchWrites.reduce((sum, count) => sum + count, 0)).toBeGreaterThanOrEqual(256)
     } finally {
       await rm(dir, { recursive: true, force: true })
       await rm(cacheDir, { recursive: true, force: true })
@@ -1641,6 +1980,41 @@ describe("createIndexer", () => {
 
       expect(Object.keys(index.files)).toEqual(["foo/bar/keep.ts"])
     } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("starts indexing yielded files before traversal finishes", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const unreadableDir = path.join(dir, "z-unreadable")
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await mkdir(unreadableDir)
+      await chmod(unreadableDir, 0)
+      const parsedPaths: string[] = []
+
+      await expect(
+        createIndexer({
+          worktree: dir,
+          options: {
+            maxChunkNonWhitespaceChars: 2000,
+            includeGlobs: ["**/*.ts"],
+            excludeGlobs: [],
+            topK: 5,
+            maxContextChars: 12_000,
+          },
+          store: createMemoryStore(),
+          parse: async (filePath) => {
+            parsedPaths.push(path.relative(dir, filePath))
+            return { language: "typescript", root: undefined }
+          },
+          embed: async () => [1, 0, 0],
+        }).refresh(),
+      ).rejects.toThrow()
+
+      expect(parsedPaths).toEqual(["a.ts"])
+    } finally {
+      await chmod(unreadableDir, 0o700).catch(() => undefined)
       await rm(dir, { recursive: true, force: true })
     }
   })

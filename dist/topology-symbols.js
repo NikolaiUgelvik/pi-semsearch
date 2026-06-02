@@ -1,4 +1,4 @@
-import { rangeForSlice, textForByteSlice } from "./range.js";
+import { createSourceIndex, rangeForIndexedSlice, textForIndexedByteSlice } from "./range.js";
 const CLASS_NAME_PATTERN = /class\s+([\p{L}_$][\p{L}\p{N}_$]*)/u;
 const INTERFACE_NAME_PATTERN = /interface\s+([\p{L}_$][\p{L}\p{N}_$]*)/u;
 const FUNCTION_DECLARATION_NAME_PATTERN = /function\s+([\p{L}_$][\p{L}\p{N}_$]*)/u;
@@ -19,35 +19,49 @@ const NAME_PATTERN_BY_KIND = {
     module: METHOD_NAME_PATTERN,
 };
 function extractSymbolRecords(input) {
-    const symbols = input.nodes.flatMap((node) => extractNodeSymbols(input, node, undefined));
-    const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]));
-    return symbols.map((symbol) => ({
-        ...symbol,
-        childSymbolIds: symbols
-            .filter((child) => child.parentSymbolId === symbol.id && symbolsById[child.id])
-            .map((child) => child.id),
-    }));
-}
-function extractNodeSymbols(input, node, parentSymbolId) {
-    const kind = symbolKindFor(input.source, node);
-    const symbol = kind
-        ? {
-            id: `${input.filePath}:${kind}:${nameFor(input.source, node, kind)}:${node.startIndex}:${node.endIndex}`,
-            name: nameFor(input.source, node, kind),
-            kind,
-            filePath: input.filePath,
-            range: rangeForSlice(input.source, node.startIndex, node.endIndex),
-            parentSymbolId,
-            childSymbolIds: [],
+    const indexedInput = { ...input, sourceIndex: input.sourceIndex ?? createSourceIndex(input.source) };
+    const symbols = [];
+    const childrenByParentId = {};
+    const stack = input.nodes
+        .slice()
+        .reverse()
+        .map((node) => ({ node, parentSymbolId: undefined }));
+    while (stack.length > 0) {
+        const { node, parentSymbolId } = stack.pop();
+        const symbol = symbolForNode(indexedInput, node, parentSymbolId);
+        if (symbol) {
+            symbols.push(symbol);
+            if (parentSymbolId) {
+                const children = childrenByParentId[parentSymbolId] ?? [];
+                children.push(symbol.id);
+                childrenByParentId[parentSymbolId] = children;
+            }
         }
-        : undefined;
-    return [
-        ...(symbol ? [symbol] : []),
-        ...node.children.flatMap((child) => extractNodeSymbols(input, child, symbol?.id ?? parentSymbolId)),
-    ];
+        const childParentSymbolId = symbol?.id ?? parentSymbolId;
+        for (let index = node.children.length - 1; index >= 0; index -= 1) {
+            stack.push({ node: node.children[index], parentSymbolId: childParentSymbolId });
+        }
+    }
+    return symbols.map((symbol) => ({ ...symbol, childSymbolIds: childrenByParentId[symbol.id] ?? [] }));
 }
-function symbolKindFor(source, node) {
-    const text = () => textForByteSlice(source, node.startIndex, node.endIndex);
+function symbolForNode(input, node, parentSymbolId) {
+    const kind = symbolKindFor(input.sourceIndex, node);
+    if (!kind) {
+        return;
+    }
+    const name = nameFor(input.sourceIndex, node, kind);
+    return {
+        id: `${input.filePath}:${kind}:${name}:${node.startIndex}:${node.endIndex}`,
+        name,
+        kind,
+        filePath: input.filePath,
+        range: rangeForIndexedSlice(input.sourceIndex, node.startIndex, node.endIndex),
+        parentSymbolId,
+        childSymbolIds: [],
+    };
+}
+function symbolKindFor(sourceIndex, node) {
+    const text = () => textForIndexedByteSlice(sourceIndex, node.startIndex, node.endIndex);
     if (objectPropertyIsFunction(node.type, text) || callIsTestFunction(node.type, text)) {
         return "function";
     }
@@ -62,8 +76,8 @@ function callIsTestFunction(type, text) {
 function symbolKindForNodeType(type) {
     return SYMBOL_KIND_BY_NODE_TYPE.find(([nodeType]) => type.includes(nodeType))?.[1];
 }
-function nameFor(source, node, kind) {
-    const text = textForByteSlice(source, node.startIndex, node.endIndex);
+function nameFor(sourceIndex, node, kind) {
+    const text = textForIndexedByteSlice(sourceIndex, node.startIndex, node.endIndex);
     return nameForKind(text, kind) ?? "anonymous";
 }
 function nameForKind(text, kind) {

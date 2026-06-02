@@ -1824,7 +1824,7 @@ describe("cast plugin", () => {
     expect(events).toEqual(["startup started", "startup finished", "forced started"])
   })
 
-  test("concurrent forced refreshes run one at a time after startup refresh", async () => {
+  test("concurrent forced refreshes share one refresh after startup refresh", async () => {
     let resolveStartupRefresh: (() => void) | undefined
     let resolveFirstForcedRefresh: (() => void) | undefined
     const events: string[] = []
@@ -1849,9 +1849,7 @@ describe("cast plugin", () => {
               }
             })
           }
-          events.push("forced 2 started")
-          events.push("forced 2 finished")
-          return Promise.resolve(emptyReadyIndex())
+          throw new Error("second forced refresh should not start")
         },
       }),
       createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
@@ -1881,14 +1879,7 @@ describe("cast plugin", () => {
     resolveFirstForcedRefresh?.()
     await Promise.all([first, second])
 
-    expect(events).toEqual([
-      "startup started",
-      "startup finished",
-      "forced 1 started",
-      "forced 1 finished",
-      "forced 2 started",
-      "forced 2 finished",
-    ])
+    expect(events).toEqual(["startup started", "startup finished", "forced 1 started", "forced 1 finished"])
   })
 
   test("background refresh failure does not reject initialization or configured search", async () => {
@@ -2003,6 +1994,7 @@ describe("cast plugin", () => {
           apiKey: "rerank-key",
           model: "cohere/rerank-4-fast",
           candidateMultiplier: 4,
+          timeoutMs: 30_000,
         },
         results: [{ index: 0, score: 0.77 }],
       })

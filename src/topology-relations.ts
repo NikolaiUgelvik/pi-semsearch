@@ -2,7 +2,12 @@ import type { ChunkRecord, SymbolRecord } from "./types.js"
 
 function linkSymbolsToChunks(chunks: ChunkRecord[], symbols: Record<string, SymbolRecord>) {
   const symbolsByFile = groupByFile(Object.values(symbols))
-  return chunks.map((chunk) => ({ ...chunk, symbolIds: symbolIdsForChunk(chunk, symbolsByFile[chunk.filePath] ?? []) }))
+  const symbolIdsByChunkId: Record<string, string[]> = {}
+  for (const [filePath, fileChunks] of Object.entries(groupByFile(chunks))) {
+    Object.assign(symbolIdsByChunkId, symbolIdsForFileChunks(fileChunks, symbolsByFile[filePath] ?? []))
+  }
+
+  return chunks.map((chunk) => ({ ...chunk, symbolIds: symbolIdsByChunkId[chunk.id] ?? [] }))
 }
 
 function linkChunkTopology(chunks: ChunkRecord[], symbols: Record<string, SymbolRecord>) {
@@ -28,11 +33,31 @@ function chunkRelations(chunks: ChunkRecord[]) {
   return relations
 }
 
-function symbolIdsForChunk(chunk: ChunkRecord, symbols: SymbolRecord[]) {
-  return symbols
-    .filter((symbol) => containsSymbol(symbol, chunk))
-    .sort(compareSymbolsForChunk)
-    .map((symbol) => symbol.id)
+function symbolIdsForFileChunks(chunks: ChunkRecord[], symbols: SymbolRecord[]) {
+  const sortedSymbols = [...symbols].sort(compareSymbolsForChunk)
+  const sortedChunks = [...chunks].sort((left, right) => left.range.byteStart - right.range.byteStart)
+  const idsByChunkId: Record<string, string[]> = {}
+  const activeSymbols: SymbolRecord[] = []
+  let symbolIndex = 0
+
+  for (const chunk of sortedChunks) {
+    while (symbolIndex < sortedSymbols.length && sortedSymbols[symbolIndex].range.byteStart <= chunk.range.byteStart) {
+      activeSymbols.push(sortedSymbols[symbolIndex])
+      symbolIndex += 1
+    }
+    pruneInactiveSymbols(activeSymbols, chunk.range.byteStart)
+    idsByChunkId[chunk.id] = activeSymbols.filter((symbol) => containsSymbol(symbol, chunk)).map((symbol) => symbol.id)
+  }
+
+  return idsByChunkId
+}
+
+function pruneInactiveSymbols(activeSymbols: SymbolRecord[], chunkStart: number) {
+  for (let index = activeSymbols.length - 1; index >= 0; index -= 1) {
+    if (activeSymbols[index].range.byteEnd < chunkStart) {
+      activeSymbols.splice(index, 1)
+    }
+  }
 }
 
 function containsSymbol(symbol: SymbolRecord, chunk: ChunkRecord) {
@@ -84,7 +109,9 @@ function compareForTopology(left: ChunkRecord, right: ChunkRecord) {
 function groupByFile<T extends { filePath: string }>(items: T[]) {
   const groups: Record<string, T[]> = {}
   for (const item of items) {
-    groups[item.filePath] = [...(groups[item.filePath] ?? []), item]
+    const group = groups[item.filePath] ?? []
+    group.push(item)
+    groups[item.filePath] = group
   }
   return groups
 }
@@ -93,7 +120,9 @@ function attachSiblingLinks(chunksWithParents: ChunkRecord[], symbols: Record<st
   const siblingGroups: Record<string, ChunkRecord[]> = {}
   for (const chunk of chunksWithParents) {
     const contextId = siblingContextId(chunk, symbols)
-    siblingGroups[contextId] = [...(siblingGroups[contextId] ?? []), chunk]
+    const group = siblingGroups[contextId] ?? []
+    group.push(chunk)
+    siblingGroups[contextId] = group
   }
   const siblingIdsByChunkId = Object.fromEntries(
     Object.values(siblingGroups).flatMap((group) =>

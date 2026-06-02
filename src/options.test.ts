@@ -25,6 +25,7 @@ describe("parseOptions", () => {
       dimensions: undefined,
       batchSize: 16,
       concurrency: 1,
+      timeoutMs: 30_000,
     })
     expect(options.hyde).toEqual({
       mode: "opencode",
@@ -33,6 +34,7 @@ describe("parseOptions", () => {
       model: undefined,
       threshold: 0.42,
       enabled: true,
+      timeoutMs: 30_000,
     })
     expect(options.maxChunkNonWhitespaceChars).toBe(2000)
     expect(options.maxContextChars).toBe(12_000)
@@ -63,6 +65,8 @@ describe("parseOptions", () => {
       vectorWeight: 1,
       bm25Weight: 1,
     })
+    expect(options.retrieval.maxVectorCandidates).toBe(512)
+    expect(options.retrieval.maxRerankCandidates).toBe(64)
   })
 
   test("parses configured embedding batch size", () => {
@@ -79,6 +83,50 @@ describe("parseOptions", () => {
     )
 
     expect(options.embedding?.batchSize).toBe(4)
+  })
+
+  test("parses configured provider request timeouts", () => {
+    const options = parseOptions(
+      {
+        embedding: { baseURL: "https://example.test/v1", model: "embed", timeoutMs: 5000 },
+        hyde: { baseURL: "https://hyde.example.test/v1", model: "chat", timeoutMs: 6000 },
+        rerank: { baseURL: "https://rerank.example.test/v1", model: "rerank", timeoutMs: 7000 },
+      },
+      {},
+    )
+
+    expect(options.embedding?.timeoutMs).toBe(5000)
+    expect(options.hyde.timeoutMs).toBe(6000)
+    expect(options.rerank?.timeoutMs).toBe(7000)
+  })
+
+  test("reports invalid provider request timeouts and falls back to defaults", () => {
+    const options = parseOptions(
+      {
+        embedding: { baseURL: "https://example.test/v1", model: "embed", timeoutMs: 0 },
+        hyde: { baseURL: "https://hyde.example.test/v1", model: "chat", timeoutMs: -1 },
+        rerank: { baseURL: "https://rerank.example.test/v1", model: "rerank", timeoutMs: 0 },
+      },
+      {},
+    )
+
+    expect(options.embedding?.timeoutMs).toBe(30_000)
+    expect(options.hyde.timeoutMs).toBe(30_000)
+    expect(options.rerank?.timeoutMs).toBe(30_000)
+    expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("embedding.timeoutMs:"))).toBe(true)
+    expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("hyde.timeoutMs:"))).toBe(true)
+    expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("rerank.timeoutMs:"))).toBe(true)
+  })
+
+  test("caps unsafe embedding batch and concurrency settings", () => {
+    const options = parseOptions({
+      embedding: { baseURL: "https://example.test/v1", model: "embed", batchSize: 9999, concurrency: 99 },
+    })
+
+    expect(options.embedding?.batchSize).toBe(2048)
+    expect(options.embedding?.concurrency).toBe(8)
+    expect(options.diagnostics).toContain("embedding.batchSize: Number must be less than or equal to 2048")
+    expect(options.diagnostics).toContain("embedding.concurrency: Number must be less than or equal to 8")
   })
 
   test("parses embedding concurrency", () => {
@@ -129,6 +177,18 @@ describe("parseOptions", () => {
     })
   })
 
+  test("parses retrieval candidate caps", () => {
+    const options = parseOptions({
+      retrieval: {
+        maxVectorCandidates: 128,
+        maxRerankCandidates: 16,
+      },
+    })
+
+    expect(options.retrieval.maxVectorCandidates).toBe(128)
+    expect(options.retrieval.maxRerankCandidates).toBe(16)
+  })
+
   test("parses configured rerank options and resolves api key from env", () => {
     const options = parseOptions(
       {
@@ -152,6 +212,7 @@ describe("parseOptions", () => {
       apiKey: "rerank-key",
       model: "cohere/rerank-4-fast",
       candidateMultiplier: 6,
+      timeoutMs: 30_000,
     })
   })
 
@@ -177,6 +238,7 @@ describe("parseOptions", () => {
       apiKey: "rerank-key",
       model: "cohere/rerank-4-fast",
       candidateMultiplier: 4,
+      timeoutMs: 30_000,
     })
   })
 
@@ -204,6 +266,7 @@ describe("parseOptions", () => {
       dimensions: undefined,
       batchSize: 16,
       concurrency: 1,
+      timeoutMs: 30_000,
     })
     expect(options.rerank).toBeUndefined()
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("rerank.baseURL:"))).toBe(true)
@@ -356,6 +419,7 @@ describe("parseOptions", () => {
       model: undefined,
       threshold: 0.35,
       enabled: true,
+      timeoutMs: 30_000,
     })
   })
 
@@ -381,6 +445,7 @@ describe("parseOptions", () => {
       model: undefined,
       threshold: 0.35,
       enabled: false,
+      timeoutMs: 30_000,
     })
   })
 
@@ -406,6 +471,7 @@ describe("parseOptions", () => {
       model: undefined,
       threshold: 0.6,
       enabled: true,
+      timeoutMs: 30_000,
     })
   })
 
@@ -433,6 +499,7 @@ describe("parseOptions", () => {
       model: undefined,
       threshold: 0.2,
       enabled: true,
+      timeoutMs: 30_000,
     })
   })
 
@@ -461,6 +528,7 @@ describe("parseOptions", () => {
       model: "gpt-4o-mini",
       threshold: 0.2,
       enabled: true,
+      timeoutMs: 30_000,
     })
   })
 
@@ -499,6 +567,7 @@ describe("parseOptions", () => {
       dimensions: undefined,
       batchSize: 16,
       concurrency: 1,
+      timeoutMs: 30_000,
     })
     expect(options.topK).toBe(5)
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("topK:"))).toBe(true)
@@ -561,6 +630,7 @@ describe("parseOptions", () => {
       dimensions: undefined,
       batchSize: 16,
       concurrency: 1,
+      timeoutMs: 30_000,
     })
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("embedding.dimensions:"))).toBe(true)
     expect(options.diagnostics).not.toContain("embedding.baseURL is required")
@@ -591,6 +661,7 @@ describe("parseOptions", () => {
       model: undefined,
       threshold: 0.35,
       enabled: true,
+      timeoutMs: 30_000,
     })
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("hyde.baseURL:"))).toBe(true)
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("hyde.model:"))).toBe(true)

@@ -1,10 +1,12 @@
 import { fallbackChunks } from "./fallback.js";
-import { nonWhitespaceLength, rangeForSlice, stableChunkId, textForByteSlice } from "./range.js";
+import { createSourceIndex, nonWhitespaceLengthForIndexedSlice, rangeForIndexedSlice, stableChunkId, textForIndexedByteSlice, } from "./range.js";
 const IDENTIFIER_PATTERN = /[A-Za-z_$][\w$]*/;
 const PUNCTUATION_OR_SYMBOL_PATTERN = /^[\p{P}\p{S}\s]+$/u;
 export function castChunks(input) {
-    if (nonWhitespaceLength(input.source) <= input.maxNonWhitespaceChars) {
-        return [makeChunk(input, "file", input.root.startIndex, input.root.endIndex, [input.root.type])];
+    const indexedInput = { ...input, sourceIndex: input.sourceIndex ?? createSourceIndex(input.source) };
+    if (nonWhitespaceLengthForIndexedSlice(indexedInput.sourceIndex, 0, indexedInput.sourceIndex.bytes.length) <=
+        input.maxNonWhitespaceChars) {
+        return [makeChunk(indexedInput, "file", input.root.startIndex, input.root.endIndex, [input.root.type])];
     }
     if (input.root.children.length === 0) {
         return fallbackChunks({
@@ -12,12 +14,13 @@ export function castChunks(input) {
             language: input.language,
             text: input.source,
             maxNonWhitespaceChars: input.maxNonWhitespaceChars,
+            sourceIndex: indexedInput.sourceIndex,
         });
     }
-    const windows = buildWindows(input, input.root.children, undefined);
-    const normalized = normalizeTrivialWindows(input, windows);
+    const windows = buildWindows(indexedInput, input.root.children, undefined);
+    const normalized = normalizeTrivialWindows(indexedInput, windows);
     const overlapped = applyOverlap(normalized, input.chunking.overlap);
-    return linkSiblings(overlapped.map((window) => makeChunkFromWindow(input, window)));
+    return linkSiblings(overlapped.map((window) => makeChunkFromWindow(indexedInput, window)));
 }
 function buildWindows(input, nodes, parentChunkId) {
     const windows = [];
@@ -54,12 +57,14 @@ function splitOversizedNode(input, node) {
         return fallbackChunks({
             filePath: input.filePath,
             language: input.language,
-            text: textForByteSlice(input.source, node.startIndex, node.endIndex),
+            text: textForIndexedByteSlice(input.sourceIndex, node.startIndex, node.endIndex),
             maxNonWhitespaceChars: input.maxNonWhitespaceChars,
+            sourceIndex: input.sourceIndex,
+            byteOffset: node.startIndex,
         }).map((chunk) => ({
             nodes: [],
-            byteStart: node.startIndex + chunk.range.byteStart,
-            byteEnd: node.startIndex + chunk.range.byteEnd,
+            byteStart: chunk.range.byteStart,
+            byteEnd: chunk.range.byteEnd,
             nodeTypes: [node.type],
             kind: chunk.kind,
             parentChunkId,
@@ -170,8 +175,9 @@ function mergeTrivialWindow(input, normalized, windows, index, window) {
     return { window, skipNext: false };
 }
 function isTrivialWindow(input, window) {
-    const text = textForByteSlice(input.source, window.byteStart, window.byteEnd).trim();
-    return (nonWhitespaceLength(text) < input.chunking.minSemanticNonWhitespaceChars ||
+    const text = textForIndexedByteSlice(input.sourceIndex, window.byteStart, window.byteEnd).trim();
+    const nonWhitespaceChars = nonWhitespaceLengthForIndexedSlice(input.sourceIndex, window.byteStart, window.byteEnd);
+    return (nonWhitespaceChars < input.chunking.minSemanticNonWhitespaceChars ||
         !IDENTIFIER_PATTERN.test(text) ||
         PUNCTUATION_OR_SYMBOL_PATTERN.test(text));
 }
@@ -210,17 +216,18 @@ function nodeNonWhitespace(input, node) {
     return rangeNonWhitespace(input, node.startIndex, node.endIndex);
 }
 function rangeNonWhitespace(input, byteStart, byteEnd) {
-    return nonWhitespaceLength(textForByteSlice(input.source, byteStart, byteEnd));
+    return nonWhitespaceLengthForIndexedSlice(input.sourceIndex, byteStart, byteEnd);
 }
 function makeChunk(input, kind, byteStart, byteEnd, nodeTypes, parentChunkId, idByteStart, idByteEnd) {
+    const text = textForIndexedByteSlice(input.sourceIndex, byteStart, byteEnd);
     return {
         id: stableChunkId(input.filePath, idByteStart ?? byteStart, idByteEnd ?? byteEnd),
         filePath: input.filePath,
         language: input.language,
         kind,
-        range: rangeForSlice(input.source, byteStart, byteEnd),
-        text: textForByteSlice(input.source, byteStart, byteEnd),
-        nonWhitespaceChars: nonWhitespaceLength(textForByteSlice(input.source, byteStart, byteEnd)),
+        range: rangeForIndexedSlice(input.sourceIndex, byteStart, byteEnd),
+        text,
+        nonWhitespaceChars: nonWhitespaceLengthForIndexedSlice(input.sourceIndex, byteStart, byteEnd),
         nodeTypes,
         symbolIds: [],
         parentChunkId,

@@ -1,6 +1,10 @@
 function linkSymbolsToChunks(chunks, symbols) {
     const symbolsByFile = groupByFile(Object.values(symbols));
-    return chunks.map((chunk) => ({ ...chunk, symbolIds: symbolIdsForChunk(chunk, symbolsByFile[chunk.filePath] ?? []) }));
+    const symbolIdsByChunkId = {};
+    for (const [filePath, fileChunks] of Object.entries(groupByFile(chunks))) {
+        Object.assign(symbolIdsByChunkId, symbolIdsForFileChunks(fileChunks, symbolsByFile[filePath] ?? []));
+    }
+    return chunks.map((chunk) => ({ ...chunk, symbolIds: symbolIdsByChunkId[chunk.id] ?? [] }));
 }
 function linkChunkTopology(chunks, symbols) {
     const relations = chunkRelations(chunks);
@@ -21,11 +25,28 @@ function chunkRelations(chunks) {
     }
     return relations;
 }
-function symbolIdsForChunk(chunk, symbols) {
-    return symbols
-        .filter((symbol) => containsSymbol(symbol, chunk))
-        .sort(compareSymbolsForChunk)
-        .map((symbol) => symbol.id);
+function symbolIdsForFileChunks(chunks, symbols) {
+    const sortedSymbols = [...symbols].sort(compareSymbolsForChunk);
+    const sortedChunks = [...chunks].sort((left, right) => left.range.byteStart - right.range.byteStart);
+    const idsByChunkId = {};
+    const activeSymbols = [];
+    let symbolIndex = 0;
+    for (const chunk of sortedChunks) {
+        while (symbolIndex < sortedSymbols.length && sortedSymbols[symbolIndex].range.byteStart <= chunk.range.byteStart) {
+            activeSymbols.push(sortedSymbols[symbolIndex]);
+            symbolIndex += 1;
+        }
+        pruneInactiveSymbols(activeSymbols, chunk.range.byteStart);
+        idsByChunkId[chunk.id] = activeSymbols.filter((symbol) => containsSymbol(symbol, chunk)).map((symbol) => symbol.id);
+    }
+    return idsByChunkId;
+}
+function pruneInactiveSymbols(activeSymbols, chunkStart) {
+    for (let index = activeSymbols.length - 1; index >= 0; index -= 1) {
+        if (activeSymbols[index].range.byteEnd < chunkStart) {
+            activeSymbols.splice(index, 1);
+        }
+    }
 }
 function containsSymbol(symbol, chunk) {
     return containsRange(symbol.range.byteStart, symbol.range.byteEnd, chunk.range.byteStart, chunk.range.byteEnd);
@@ -62,7 +83,9 @@ function compareForTopology(left, right) {
 function groupByFile(items) {
     const groups = {};
     for (const item of items) {
-        groups[item.filePath] = [...(groups[item.filePath] ?? []), item];
+        const group = groups[item.filePath] ?? [];
+        group.push(item);
+        groups[item.filePath] = group;
     }
     return groups;
 }
@@ -70,7 +93,9 @@ function attachSiblingLinks(chunksWithParents, symbols) {
     const siblingGroups = {};
     for (const chunk of chunksWithParents) {
         const contextId = siblingContextId(chunk, symbols);
-        siblingGroups[contextId] = [...(siblingGroups[contextId] ?? []), chunk];
+        const group = siblingGroups[contextId] ?? [];
+        group.push(chunk);
+        siblingGroups[contextId] = group;
     }
     const siblingIdsByChunkId = Object.fromEntries(Object.values(siblingGroups).flatMap((group) => [...group]
         .sort((left, right) => left.range.byteStart - right.range.byteStart)

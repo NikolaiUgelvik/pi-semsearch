@@ -1,4 +1,5 @@
 import type { SyntaxNode } from "./cast.js"
+import type { SourceIndex } from "./range.js"
 import { linkChunkTopology, linkSymbolsToChunks } from "./topology-relations.js"
 import {
   summaryChunkBreadcrumbs,
@@ -10,7 +11,7 @@ import {
 import { extractSymbolRecords } from "./topology-symbols.js"
 import type { ChunkRecord, SymbolRecord } from "./types.js"
 
-function extractSymbols(input: { filePath: string; source: string; nodes: SyntaxNode[] }) {
+function extractSymbols(input: { filePath: string; source: string; sourceIndex?: SourceIndex; nodes: SyntaxNode[] }) {
   return extractSymbolRecords(input)
 }
 

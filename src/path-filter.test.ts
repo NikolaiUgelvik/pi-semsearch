@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { matchesPaths } from "./path-filter.js"
+import { compilePathFilters, matchesPaths } from "./path-filter.js"
 
 describe("path filters", () => {
   test("matches omitted, exact, directory, and glob filters", () => {
@@ -21,5 +21,34 @@ describe("path filters", () => {
     expect(matchesPaths("test/package.json", ["@(src|test)/package.json"])).toBe(true)
     expect(matchesPaths("docs/package.json", ["{src,test}/package.json"])).toBe(false)
     expect(matchesPaths("docs/package.json", ["@(src|test)/package.json"])).toBe(false)
+  })
+
+  test("compiled filters preserve raw matching behavior", () => {
+    const filters: Array<string[] | undefined> = [
+      undefined,
+      [],
+      ["src/a.ts"],
+      ["src/"],
+      ["src/**/*.ts"],
+      ["src/[ab].ts"],
+      ["{src,test}/package.json"],
+      ["@(src|test)/package.json"],
+      ["src/", "test/**/*.ts"],
+    ]
+    const paths = ["src/a.ts", "src/nested/a.ts", "src/c.ts", "test/package.json", "docs/package.json"]
+
+    for (const filter of filters) {
+      const compiled = compilePathFilters(filter)
+      expect(paths.map((filePath) => compiled.matches(filePath))).toEqual(
+        paths.map((filePath) => matchesPaths(filePath, filter)),
+      )
+    }
+  })
+
+  test("compiled filters expose prefix and glob metadata", () => {
+    const compiled = compilePathFilters(["src/", "test/**/*.ts"])
+
+    expect(compiled.prefixes).toEqual(["src/"])
+    expect(compiled.hasGlob).toBe(true)
   })
 })

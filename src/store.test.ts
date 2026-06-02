@@ -130,6 +130,43 @@ describe("index store", () => {
     }
   })
 
+  test("persists optional file stat metadata in SQLite records", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const worktree = path.join(dir, "worktree")
+      const sourcePath = path.join(worktree, "src.ts")
+      await mkdir(worktree, { recursive: true })
+      await Bun.write(sourcePath, "function hello() {}\n")
+      const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
+      const index = createEmptyIndex({
+        projectId: "p",
+        worktree,
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      index.metadata.status = "ready"
+      index.metadata.embeddingDimensions = 2
+      index.files["src.ts"] = {
+        path: "src.ts",
+        language: "typescript",
+        fingerprint: await testFingerprint(sourcePath),
+        sizeBytes: 20,
+        mtimeMs: 1234,
+        chunkIds: ["hello"],
+        diagnostics: [],
+      }
+      index.chunks.hello = chunk("hello", "src.ts", [1, 0])
+
+      await store.write(index)
+      const cached = await store.read()
+
+      expect(cached.files["src.ts"]?.sizeBytes).toBe(20)
+      expect(cached.files["src.ts"]?.mtimeMs).toBe(1234)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("returns empty chunk text and diagnostic when source fingerprint mismatches", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
     try {
@@ -1233,6 +1270,33 @@ describe("index store", () => {
     }
   })
 
+  test("marks path-filtered sqlite vector results incomplete when the max search window is exhausted", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
+      const index = createEmptyIndex({
+        projectId: "p",
+        worktree: "/repo",
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      index.metadata.status = "ready"
+      index.metadata.embeddingDimensions = 2
+      for (let indexNumber = 0; indexNumber < 4096; indexNumber += 1) {
+        index.chunks[`outside-${indexNumber}`] = chunk(`outside-${indexNumber}`, `vendor/${indexNumber}.ts`, [1, 0])
+      }
+      index.chunks.allowed = chunk("allowed", "src/allowed.ts", [0, 1])
+      await store.write(index)
+
+      const results = await (store as VectorSearchStore).searchVectorCandidates?.([1, 0], 2, ["**/allowed.ts"])
+
+      expect(results).toEqual([])
+      expect((results as typeof results & { incomplete?: boolean })?.incomplete).toBe(true)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("populates SQLite FTS rows when writing an index", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
     try {
@@ -1648,7 +1712,30 @@ describe("index store", () => {
     }
   })
 
-  test("hydrateChunks returns selected chunks as a HydratedChunkSet", async () => {
+  test("creates indexes for file-path scoped store operations", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
+      await store.readMetadata()
+
+      const db = new Database(path.join(dir, "project", "index.sqlite"))
+      try {
+        const indexNames = db
+          .query("select name from sqlite_master where type = 'index' and name not like 'sqlite_autoindex_%'")
+          .all() as Array<{ name: string }>
+
+        expect(indexNames.map((row) => row.name).sort()).toContain("chunks_run_file_path_idx")
+        expect(indexNames.map((row) => row.name).sort()).toContain("symbols_run_file_path_idx")
+        expect(indexNames.map((row) => row.name).sort()).toContain("chunk_rowids_run_rowid_idx")
+      } finally {
+        db.close()
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("hydrateChunks returns selected chunks as a HydratedChunkSet without global lexical metadata by default", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
     try {
       const worktree = path.join(dir, "worktree")
@@ -1689,6 +1776,7 @@ describe("index store", () => {
         ...chunk("beta", "src/b.ts", [0, 1]),
         range: { byteStart: 0, byteEnd: 18, lineStart: 1, lineEnd: 1 },
         symbolIds: ["symbol-beta"],
+        lexical: { length: 2, termFrequencies: { beta: 1, function: 1 } },
       }
       index.symbols["symbol-alpha"] = {
         id: "symbol-alpha",
@@ -1719,11 +1807,15 @@ describe("index store", () => {
       expect(hydrated.metadata.cacheKey).toBe("project")
       expect(Object.keys(hydrated.chunks)).toEqual(["beta"])
       expect(hydrated.chunks.beta.text).toBe("function beta() {}")
+      expect(hydrated.chunks.beta.lexical).toEqual(index.chunks.beta.lexical)
       expect(Object.keys(hydrated.files)).toEqual(["src/b.ts"])
       expect(Object.keys(hydrated.symbols)).toEqual(["symbol-beta"])
-      expect(hydrated.lexical).toEqual(index.lexical)
+      expect(hydrated.lexical).toBeUndefined()
       expect(hydrated.diagnostics).toEqual([])
-      expect(Object.keys(hydrated).sort()).toEqual(["chunks", "diagnostics", "files", "lexical", "metadata", "symbols"])
+      expect(Object.keys(hydrated).sort()).toEqual(["chunks", "diagnostics", "files", "metadata", "symbols"])
+
+      const hydratedWithLexical = await store.hydrateChunks(["beta"], { includeLexical: true })
+      expect(hydratedWithLexical.lexical).toEqual(index.lexical)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

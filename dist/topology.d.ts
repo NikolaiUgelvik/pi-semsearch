@@ -1,9 +1,11 @@
 import type { SyntaxNode } from "./cast.js";
+import type { SourceIndex } from "./range.js";
 import { summaryChunkBreadcrumbs, summaryChunkMatchesSource, summaryExpandWithParentContext, summarySummarizeChunk, summarySummarizeTopology } from "./topology-summary.js";
 import type { ChunkRecord, SymbolRecord } from "./types.js";
 declare function extractSymbols(input: {
     filePath: string;
     source: string;
+    sourceIndex?: SourceIndex;
     nodes: SyntaxNode[];
 }): {
     childSymbolIds: string[];

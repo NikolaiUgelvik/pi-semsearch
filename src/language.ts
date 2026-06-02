@@ -147,7 +147,7 @@ function adaptNode(node: Node): SyntaxNode {
     type: node.type,
     startIndex: node.startIndex,
     endIndex: node.endIndex,
-    children: node.children.filter((child): child is Node => child !== null).map(adaptNode),
+    children: node.namedChildren.filter((child): child is Node => child !== null).map(adaptNode),
   }
 }
 

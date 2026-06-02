@@ -233,6 +233,61 @@ describe("retrieve", () => {
     expect(output.results.map((result) => result.filePath)).toEqual(["a.ts"])
   })
 
+  test("does not read source when parent context is not requested", async () => {
+    let sourceReads = 0
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "alpha", topK: 1, includeParents: false, maxContextChars: 100 },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => {
+        sourceReads += 1
+        throw new Error("source should not be read")
+      },
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async () => [{ id: "c1", score: 0.9 }],
+        hydrateChunks: async () => ({
+          metadata,
+          files: {
+            "a.ts": { path: "a.ts", language: "typescript", fingerprint: "fp", chunkIds: ["c1"], diagnostics: [] },
+          },
+          chunks: {
+            c1: {
+              id: "c1",
+              filePath: "a.ts",
+              language: "typescript",
+              kind: "function",
+              range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+              text: "function alpha() {}",
+              nonWhitespaceChars: 17,
+              nodeTypes: [],
+              symbolIds: [],
+              childChunkIds: [],
+            },
+          },
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(sourceReads).toBe(0)
+    expect(output.results[0].text).toBe("function alpha() {}")
+    expect(output.diagnostics).not.toContain("source read failed for a.ts; parent context omitted")
+  })
+
   test("store-backed retrieval uses HyDE vector candidates", async () => {
     const hydratedChunkIds: string[][] = []
     const output = await retrieveFromStore({
@@ -321,6 +376,69 @@ describe("retrieve", () => {
     expect(output.status.hydeUsed).toBe(true)
     expect(output.results.map((result) => result.filePath)).toEqual(["hyde.ts"])
     expect(hydratedChunkIds).toEqual([["hyde"]])
+  })
+
+  test("diagnoses incomplete path-filtered HyDE vector searches", async () => {
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "alpha", topK: 1, maxContextChars: 100, paths: ["src/"] },
+      options: { topK: 1, maxContextChars: 100, hyde: { enabled: true, threshold: 0.5 } },
+      embed: async (text) => (text === "alpha" ? [1, 0] : [0, 1]),
+      generateHyde: async () => "hyde alpha",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async (vector) =>
+          vector[0] === 1
+            ? [{ id: "initial", score: 0.1 }]
+            : Object.assign([{ id: "hyde", score: 0.95 }], { incomplete: true }),
+        hydrateChunks: async () => ({
+          metadata,
+          files: {
+            "hyde.ts": {
+              path: "hyde.ts",
+              language: "typescript",
+              fingerprint: "hyde-fp",
+              chunkIds: ["hyde"],
+              diagnostics: [],
+            },
+          },
+          chunks: {
+            hyde: {
+              id: "hyde",
+              filePath: "hyde.ts",
+              language: "typescript",
+              kind: "function",
+              range: { byteStart: 0, byteEnd: 24, lineStart: 1, lineEnd: 1 },
+              text: "function hydeAlpha() {}",
+              nonWhitespaceChars: 21,
+              nodeTypes: [],
+              symbolIds: [],
+              childChunkIds: [],
+            },
+          },
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(output.status.hydeUsed).toBe(true)
+    expect(output.diagnostics).toContain("path-filtered vector search hit the candidate cap; results may be incomplete")
+    expect(output.diagnosticDetails).toContainEqual({
+      code: "retrieval.knn_capped",
+      message: "path-filtered vector search hit the candidate cap; results may be incomplete",
+    })
   })
 
   test("store-backed retrieval de-duplicates hydrated diagnostics preserving order", async () => {
@@ -568,6 +686,402 @@ describe("retrieve", () => {
     })
 
     expect(vectorTopKs[0]).toBe(16)
+  })
+
+  test("caps vector and rerank candidate requests", async () => {
+    const vectorTopKs: number[] = []
+    let rerankDocumentCount = 0
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "cap", topK: 10, maxContextChars: 100 },
+      options: {
+        topK: 10,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        hybrid: hybridOptions({ vectorCandidateMultiplier: 100 }),
+        rerank: rerankOptions({ candidateMultiplier: 100 }),
+        maxVectorCandidates: 12,
+        maxRerankCandidates: 3,
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      rerank: async (_query, documents) => {
+        rerankDocumentCount = documents.length
+        return documents.map((_document, index) => ({ index, score: 1 - index / 10 }))
+      },
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async (_vector, topK) => {
+          vectorTopKs.push(topK)
+          return Array.from({ length: topK }, (_, index) => ({ id: `c${index}`, score: 1 - index / topK }))
+        },
+        searchLexicalCandidates: async () => [],
+        hydrateChunks: async (ids) => ({
+          metadata,
+          files: Object.fromEntries(
+            ids.map((id) => [
+              `${id}.ts`,
+              { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+            ]),
+          ),
+          chunks: Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: `function ${id}() {}`,
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            ]),
+          ),
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(vectorTopKs).toEqual([12])
+    expect(rerankDocumentCount).toBe(10)
+    expect(output.status.candidateCount).toBe(10)
+  })
+
+  test("diagnoses path-filtered vector searches that hit the candidate cap", async () => {
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "cap", topK: 2, maxContextChars: 100, paths: ["src/"] },
+      options: {
+        topK: 2,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        maxVectorCandidates: 2,
+        maxRerankCandidates: 64,
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async () =>
+          Object.assign([{ id: "c1", score: 1 }], {
+            incomplete: true,
+          }),
+        hydrateChunks: async (ids) => ({
+          metadata,
+          files: Object.fromEntries(
+            ids.map((id) => [
+              `${id}.ts`,
+              { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+            ]),
+          ),
+          chunks: Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: `function ${id}() {}`,
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            ]),
+          ),
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(output.diagnostics).toContain("path-filtered vector search hit the candidate cap; results may be incomplete")
+    expect(output.diagnosticDetails).toContainEqual({
+      code: "retrieval.knn_capped",
+      message: "path-filtered vector search hit the candidate cap; results may be incomplete",
+    })
+  })
+
+  test("does not diagnose path-filtered vector searches only because the result count equals the request", async () => {
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "cap", topK: 2, maxContextChars: 100, paths: ["src/"] },
+      options: {
+        topK: 2,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        maxVectorCandidates: 2,
+        maxRerankCandidates: 64,
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async () => [
+          { id: "c1", score: 1 },
+          { id: "c2", score: 0.9 },
+        ],
+        hydrateChunks: async (ids) => ({
+          metadata,
+          files: Object.fromEntries(
+            ids.map((id) => [
+              `${id}.ts`,
+              { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+            ]),
+          ),
+          chunks: Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: `function ${id}() {}`,
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            ]),
+          ),
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(output.diagnostics).not.toContain(
+      "path-filtered vector search hit the candidate cap; results may be incomplete",
+    )
+  })
+
+  test("does not apply the rerank cap when rerank is disabled", async () => {
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "many", topK: 5, maxContextChars: 100 },
+      options: {
+        topK: 5,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        maxVectorCandidates: 100,
+        maxRerankCandidates: 3,
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async () =>
+          Array.from({ length: 5 }, (_, index) => ({ id: `c${index}`, score: 1 - index / 10 })),
+        hydrateChunks: async (ids) => ({
+          metadata,
+          files: Object.fromEntries(
+            ids.map((id) => [
+              `${id}.ts`,
+              { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+            ]),
+          ),
+          chunks: Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: `function ${id}() {}`,
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            ]),
+          ),
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["c0", "c1", "c2", "c3", "c4"])
+  })
+
+  test("preserves vector-only topK when it exceeds the vector candidate cap", async () => {
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "many", topK: 6, maxContextChars: 100 },
+      options: {
+        topK: 6,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        maxVectorCandidates: 3,
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async (_vector, topK) =>
+          Array.from({ length: topK }, (_, index) => ({ id: `c${index}`, score: 1 - index / 10 })),
+        hydrateChunks: async (ids) => ({
+          metadata,
+          files: Object.fromEntries(
+            ids.map((id) => [
+              `${id}.ts`,
+              { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+            ]),
+          ),
+          chunks: Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: `function ${id}() {}`,
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            ]),
+          ),
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(output.results).toHaveLength(6)
+  })
+
+  test("preserves reranked topK when it exceeds the rerank candidate cap", async () => {
+    const metadata = {
+      schemaVersion: 1,
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+      chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
+      updatedAt: 1,
+      status: "ready" as const,
+      diagnostics: [],
+    }
+    const output = await retrieveFromStore({
+      input: { query: "many", topK: 6, maxContextChars: 100 },
+      options: {
+        topK: 6,
+        maxContextChars: 100,
+        hyde: { enabled: false, threshold: 0.5 },
+        rerank: rerankOptions({ candidateMultiplier: 10 }),
+        maxVectorCandidates: 100,
+        maxRerankCandidates: 3,
+      },
+      embed: async () => [1, 0],
+      generateHyde: async () => "hyde text",
+      rerank: async (_query, documents) => documents.map((_document, index) => ({ index, score: 1 - index / 10 })),
+      readSource: async () => "",
+      indexStore: {
+        readMetadata: async () => metadata,
+        searchVectorCandidates: async (_vector, topK) =>
+          Array.from({ length: topK }, (_, index) => ({ id: `c${index}`, score: 1 - index / 10 })),
+        hydrateChunks: async (ids) => ({
+          metadata,
+          files: Object.fromEntries(
+            ids.map((id) => [
+              `${id}.ts`,
+              { path: `${id}.ts`, language: "typescript", fingerprint: "fp", chunkIds: [id], diagnostics: [] },
+            ]),
+          ),
+          chunks: Object.fromEntries(
+            ids.map((id) => [
+              id,
+              {
+                id,
+                filePath: `${id}.ts`,
+                language: "typescript",
+                kind: "function" as const,
+                range: { byteStart: 0, byteEnd: 10, lineStart: 1, lineEnd: 1 },
+                text: `function ${id}() {}`,
+                nonWhitespaceChars: 20,
+                nodeTypes: [],
+                symbolIds: [],
+                childChunkIds: [],
+              },
+            ]),
+          ),
+          symbols: {},
+          diagnostics: [],
+        }),
+      },
+    })
+
+    expect(output.results).toHaveLength(6)
   })
 
   test("store-backed hybrid hydrates only ranked vector candidates", async () => {
@@ -1766,7 +2280,7 @@ describe("retrieve", () => {
     let reads = 0
     const output = await retrieveFromIndex({
       index,
-      input: { query: "const", topK: 2 },
+      input: { query: "const", topK: 2, includeParents: true },
       options: { topK: 2, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
       embed: async () => [1, 0, 0],
       generateHyde: async () => "",
@@ -1826,7 +2340,7 @@ describe("retrieve", () => {
 
     const output = await retrieveFromIndex({
       index,
-      input: { query: "const", topK: 2 },
+      input: { query: "const", topK: 2, includeParents: true },
       options: { topK: 2, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
       embed: async () => [1, 0, 0],
       generateHyde: async () => "",

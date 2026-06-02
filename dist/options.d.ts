@@ -15,6 +15,7 @@ export declare function parseOptions(input: unknown, env?: Record<string, string
         dimensions: number | undefined;
         batchSize: number;
         concurrency: number;
+        timeoutMs: number;
     } | undefined;
     hyde: HydeOptions;
     rerank: {
@@ -22,6 +23,7 @@ export declare function parseOptions(input: unknown, env?: Record<string, string
         apiKey: string | undefined;
         model: string;
         candidateMultiplier: number;
+        timeoutMs: number;
     } | undefined;
     retrieval: {
         hybrid: {
@@ -32,6 +34,8 @@ export declare function parseOptions(input: unknown, env?: Record<string, string
             vectorWeight: number;
             bm25Weight: number;
         };
+        maxVectorCandidates: number;
+        maxRerankCandidates: number;
     };
     chunking: ChunkingOptions;
 };

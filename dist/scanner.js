@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import ignore from "ignore";
 import { Minimatch } from "minimatch";
 import { castChunks } from "./cast.js";
 import { fallbackChunks } from "./fallback.js";
 import { buildLexicalIndex } from "./lexical.js";
+import { createSourceIndex } from "./range.js";
 import { assignSymbolsToChunks, attachTopology, extractSymbols } from "./topology.js";
 const BINARY_SAMPLE_BYTES = Number("16") * Number("1024");
 const BYTE_NUL = 0;
@@ -21,25 +23,28 @@ const DEFAULT_EMBEDDING_BATCH_CONCURRENCY = 1;
 const DEFAULT_FILE_CONCURRENCY = 4;
 const DEFAULT_FILE_RESULT_WRITE_BATCH_SIZE = 32;
 const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", ".cache"]);
-const DEFAULT_WALK_DIRECTORY_CONCURRENCY = 16;
+const MAX_QUEUED_REUSED_FILE_RESULTS = 256;
+const STAT_FAST_PATH_SETTLE_MS = 1000;
 const TRAILING_SLASHES = /\/+$/;
 export function createIndexer(input) {
     return {
-        async refresh() {
+        async refresh(signal) {
+            signal?.throwIfAborted();
             const store = input.store;
             const index = await store.read();
+            signal?.throwIfAborted();
             const canReuseExistingRecords = index.metadata.maxChunkNonWhitespaceChars === input.options.maxChunkNonWhitespaceChars &&
                 sameChunkingOptions(index.metadata.chunking, input.options.chunking);
             const runConfigHash = indexRunConfigHash(index, input.worktree, input.options);
             const runStore = hasRunStore(store) ? store : undefined;
-            const files = await scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs);
+            const files = scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs);
             const groupedSymbols = symbolsByFilePath(index.symbols);
             const nextFiles = {};
             const nextChunks = {};
             const nextSymbols = {};
             const metadataDiagnostics = [];
             const metadataDiagnosticDetails = [];
-            const embeddingBatcher = createEmbeddingBatcher(input);
+            const embeddingBatcher = createEmbeddingBatcher(input, signal);
             const fileResultWriter = createFileResultWriter({ runStore, run: () => run });
             let changed = false;
             const state = {
@@ -89,8 +94,11 @@ export function createIndexer(input) {
                 ensureRun,
                 embeddingBatcher,
                 fileResultWriter,
+                signal,
             });
+            signal?.throwIfAborted();
             await embeddingBatcher.drain();
+            signal?.throwIfAborted();
             await fileResultWriter.flush();
             metadataDiagnostics.sort();
             const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols);
@@ -109,6 +117,7 @@ export function createIndexer(input) {
                 fileResultWriter,
             });
             await fileResultWriter.flush();
+            signal?.throwIfAborted();
             index.files = nextFiles;
             index.chunks = lexicalIndex.chunks;
             index.symbols = nextSymbols;
@@ -129,14 +138,46 @@ export function createIndexer(input) {
     };
 }
 async function processScannedFiles(input) {
+    const inFlight = new Set();
+    let failed = false;
+    let firstError;
+    const recordFailure = (error) => {
+        if (!failed) {
+            failed = true;
+            firstError = error;
+        }
+    };
+    const waitForCapacity = async () => {
+        while (!failed && inFlight.size >= DEFAULT_FILE_CONCURRENCY) {
+            await Promise.race(inFlight);
+        }
+    };
     try {
-        await mapWithConcurrency(input.files, DEFAULT_FILE_CONCURRENCY, async (relativePath) => {
-            const nextChanged = await processScannedFile({ ...input, relativePath });
-            input.state.changed = input.state.changed || nextChanged;
-        });
+        for await (const relativePath of input.files) {
+            input.signal?.throwIfAborted();
+            await waitForCapacity();
+            input.signal?.throwIfAborted();
+            if (failed) {
+                break;
+            }
+            const worker = processScannedFile({ ...input, relativePath })
+                .then((nextChanged) => {
+                input.state.changed = input.state.changed || nextChanged;
+            })
+                .catch(recordFailure)
+                .finally(() => {
+                inFlight.delete(worker);
+            });
+            inFlight.add(worker);
+        }
+        await Promise.allSettled(inFlight);
+        if (failed) {
+            throw firstError;
+        }
         return input.state.changed;
     }
     catch (error) {
+        await Promise.allSettled(inFlight);
         await flushFileResultsAfterWorkerFailure(input.fileResultWriter, error);
         throw error;
     }
@@ -179,7 +220,18 @@ async function persistRefreshedIndex(input) {
     await input.store.write(input.index);
 }
 async function processScannedFile(input) {
+    input.signal?.throwIfAborted();
     const absolutePath = path.join(input.input.worktree, input.relativePath);
+    const fileStat = await statFileForIndexing(absolutePath);
+    const previousFile = input.index.files[input.relativePath];
+    const canRead = fileStat ? await canReadFile(absolutePath) : false;
+    if (fileStat &&
+        fileStat.sizeBytes <= input.input.options.maxFileBytes &&
+        (!canRead || statIsOlderThanIndex(fileStat, input.index.metadata.updatedAt)) &&
+        canReuseFileWithStat(input.index, input.state.symbolsByFilePath, previousFile, input.relativePath, fileStat, input.state.canReuseExistingRecords)) {
+        await reuseScannedFile(input, previousFile);
+        return input.state.changed;
+    }
     const file = Bun.file(absolutePath);
     const skipDiagnostic = await skipFileDiagnostic(input.relativePath, file, input.input.options.maxFileBytes);
     if (skipDiagnostic) {
@@ -188,16 +240,10 @@ async function processScannedFile(input) {
         return input.state.changed;
     }
     const loaded = await loadTextFileForIndexing(absolutePath);
+    input.signal?.throwIfAborted();
     const currentFingerprint = loaded.fingerprint;
-    const previousFile = input.index.files[input.relativePath];
     if (canReuseFile(input.index, input.state.symbolsByFilePath, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords)) {
-        const reused = reuseFileRecords(input.index, previousFile, input.state);
-        if (input.run()) {
-            await input.fileResultWriter.add(reused);
-        }
-        else {
-            input.state.reusedFileResults.push(reused);
-        }
+        await reuseScannedFile(input, previousFile);
         return input.state.changed;
     }
     const activeRun = await input.ensureRun();
@@ -209,8 +255,22 @@ async function processScannedFile(input) {
         reuseCompletedFileRecords(completed, input.state);
         return true;
     }
-    await indexFile({ ...input, absolutePath, currentFingerprint, text: loaded.text });
+    await indexFile({ ...input, absolutePath, currentFingerprint, fileStat, text: loaded.text });
     return true;
+}
+async function reuseScannedFile(input, previousFile) {
+    const reused = reuseFileRecords(input.index, previousFile, input.state);
+    if (!input.runStore) {
+        return;
+    }
+    if (input.run()) {
+        await input.fileResultWriter.add(reused);
+        return;
+    }
+    input.state.reusedFileResults.push(reused);
+    if (input.state.reusedFileResults.length >= MAX_QUEUED_REUSED_FILE_RESULTS) {
+        await flushQueuedReusedFileResults(input);
+    }
 }
 function reuseFileRecords(index, file, state) {
     state.nextFiles[file.path] = file;
@@ -296,41 +356,50 @@ function reuseCompletedFileRecords(completed, state) {
     Object.assign(state.nextSymbols, completed.symbols);
 }
 async function indexFile(input) {
+    const sourceIndex = createSourceIndex(input.text);
     const parsed = await input.input.parse(input.absolutePath, input.text).catch((error) => ({
         language: "text",
         root: undefined,
         diagnostic: String(error),
     }));
-    const rawChunks = parsed.root
+    input.signal?.throwIfAborted();
+    const language = parsed.language;
+    const root = parsed.root;
+    const rawChunks = root
         ? castChunks({
             filePath: input.relativePath,
-            language: parsed.language,
+            language,
             source: input.text,
-            root: parsed.root,
+            sourceIndex,
+            root,
             maxNonWhitespaceChars: input.input.options.maxChunkNonWhitespaceChars,
             chunking: input.input.options.chunking,
         })
         : fallbackChunks({
             filePath: input.relativePath,
-            language: parsed.language,
+            language,
             text: input.text,
             maxNonWhitespaceChars: input.input.options.maxChunkNonWhitespaceChars,
+            sourceIndex,
         });
-    const symbols = parsed.root
-        ? extractSymbols({ filePath: input.relativePath, source: input.text, nodes: parsed.root.children })
+    const symbols = root
+        ? extractSymbols({ filePath: input.relativePath, source: input.text, sourceIndex, nodes: root.children })
         : [];
     const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]));
     const chunks = attachTopology(assignSymbolsToChunks(rawChunks, symbolsById), symbolsById);
     const fileDiagnostics = "diagnostic" in parsed ? [String(parsed.diagnostic)] : [];
-    const fileChunks = await embedChunks({ ...input, parsed, chunks, symbolsById, fileDiagnostics });
+    const fileChunks = await embedChunks({ ...input, parsed: { language }, chunks, symbolsById, fileDiagnostics });
     Object.assign(input.state.nextChunks, fileChunks);
     for (const symbol of symbols) {
         input.state.nextSymbols[symbol.id] = symbol;
     }
     const fileRecord = {
         path: input.relativePath,
-        language: parsed.language,
+        language,
         fingerprint: input.currentFingerprint,
+        sizeBytes: input.fileStat?.sizeBytes,
+        mtimeMs: input.fileStat?.mtimeMs,
+        ctimeMs: input.fileStat?.ctimeMs,
         chunkIds: chunks.map((chunk) => chunk.id),
         diagnostics: fileDiagnostics,
     };
@@ -391,19 +460,29 @@ function createFileResultWriter(input) {
         },
     };
 }
-function createEmbeddingBatcher(input) {
+function createEmbeddingBatcher(input, signal) {
     const batchSize = Math.max(1, input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
     const maxOutstanding = Math.max(1, input.options.embeddingBatchConcurrency ?? DEFAULT_EMBEDDING_BATCH_CONCURRENCY);
     const queue = [];
     const outstanding = new Set();
     let scheduled = false;
+    const rejectQueued = () => {
+        const error = signal?.reason ?? new Error("This operation was aborted");
+        for (const item of queue.splice(0)) {
+            item.reject(error);
+        }
+    };
     const flush = () => {
         scheduled = false;
+        if (signal?.aborted) {
+            rejectQueued();
+            return;
+        }
         if (queue.length === 0 || outstanding.size >= maxOutstanding) {
             return;
         }
         const batch = queue.splice(0, batchSize);
-        const run = embedPendingBatch(input, batch).finally(() => {
+        const run = embedPendingBatch(input, batch, signal).finally(() => {
             outstanding.delete(run);
             if (queue.length > 0) {
                 scheduleFlush();
@@ -420,8 +499,12 @@ function createEmbeddingBatcher(input) {
     };
     return {
         embed(text) {
-            return new Promise((resolve) => {
-                queue.push({ text, resolve });
+            return new Promise((resolve, reject) => {
+                if (signal?.aborted) {
+                    reject(signal.reason);
+                    return;
+                }
+                queue.push({ text, resolve, reject });
                 if (queue.length >= batchSize) {
                     flush();
                     return;
@@ -431,19 +514,29 @@ function createEmbeddingBatcher(input) {
         },
         async drain() {
             while (queue.length > 0 || outstanding.size > 0) {
+                if (signal?.aborted) {
+                    rejectQueued();
+                    signal.throwIfAborted();
+                }
                 flush();
                 await Promise.all(Array.from(outstanding));
             }
         },
     };
 }
-async function embedPendingBatch(input, batch) {
+async function embedPendingBatch(input, batch, signal) {
     const errorResult = (error) => ({
         embeddingError: error instanceof Error ? error.message : String(error),
     });
+    if (signal?.aborted) {
+        for (const item of batch) {
+            item.reject(signal.reason);
+        }
+        return;
+    }
     if (input.embedBatch) {
         await Promise.resolve()
-            .then(() => input.embedBatch?.(batch.map((item) => item.text)) ?? [])
+            .then(() => input.embedBatch?.(batch.map((item) => item.text), signal) ?? [])
             .then((embeddings) => {
             for (const [index, item] of batch.entries()) {
                 item.resolve(embeddings[index]
@@ -461,7 +554,7 @@ async function embedPendingBatch(input, batch) {
     }
     await Promise.all(batch.map(async (item) => {
         const result = await Promise.resolve()
-            .then(() => input.embed(item.text))
+            .then(() => input.embed(item.text, signal))
             .then((embedding) => ({ embedding }))
             .catch(errorResult);
         item.resolve(result);
@@ -472,7 +565,11 @@ async function embedChunks(input) {
     const embeddedChunks = new Array(input.chunks.length);
     const concurrency = Math.max(1, input.input.options.embeddingBatchConcurrency ?? DEFAULT_EMBEDDING_BATCH_CONCURRENCY) *
         Math.max(1, input.input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
-    await mapWithConcurrency(input.chunks.map((chunk, index) => ({ chunk, index })), concurrency, async ({ chunk, index }) => {
+    await mapIndexesWithConcurrency(input.chunks.length, concurrency, async (index) => {
+        const chunk = input.chunks[index];
+        if (!chunk) {
+            return;
+        }
         embeddedChunks[index] = {
             chunk,
             embedded: await input.embeddingBatcher.embed(embeddingText(input.relativePath, input.parsed.language, chunk, input.symbolsById, input.input.options.chunking.expansion)),
@@ -485,6 +582,30 @@ async function embedChunks(input) {
         fileChunks[chunk.id] = { ...chunk, ...embedded };
     }
     return fileChunks;
+}
+async function mapIndexesWithConcurrency(length, concurrency, worker) {
+    let next = 0;
+    let failed = false;
+    let firstError;
+    const workers = Array.from({ length: Math.min(concurrency, length) }, async () => {
+        while (!failed && next < length) {
+            const index = next;
+            next += 1;
+            try {
+                await worker(index);
+            }
+            catch (error) {
+                if (!failed) {
+                    failed = true;
+                    firstError = error;
+                }
+            }
+        }
+    });
+    await Promise.allSettled(workers);
+    if (failed) {
+        throw firstError;
+    }
 }
 function hasRunStore(store) {
     return Boolean(store.beginIndexRun && store.getCompletedFile && store.writeFileResult && store.activateRun);
@@ -569,6 +690,19 @@ function canReuseFile(index, groupedSymbols, file, relativePath, fingerprint, ca
     if (!canReuseExistingRecords || file?.path !== relativePath || file.fingerprint !== fingerprint) {
         return false;
     }
+    return canReuseFileRecords(index, groupedSymbols, file, relativePath);
+}
+function canReuseFileWithStat(index, groupedSymbols, file, relativePath, fileStat, canReuseExistingRecords) {
+    if (!canReuseExistingRecords ||
+        file?.path !== relativePath ||
+        file.sizeBytes !== fileStat.sizeBytes ||
+        file.mtimeMs !== fileStat.mtimeMs ||
+        file.ctimeMs !== fileStat.ctimeMs) {
+        return false;
+    }
+    return canReuseFileRecords(index, groupedSymbols, file, relativePath);
+}
+function canReuseFileRecords(index, groupedSymbols, file, relativePath) {
     const chunks = file.chunkIds.map((id) => ({ id, chunk: index.chunks[id] }));
     const chunkIds = new Set(file.chunkIds);
     if (chunks.some((entry) => !entry.chunk || entry.chunk.id !== entry.id)) {
@@ -634,10 +768,13 @@ function embeddingText(filePath, language, chunk, symbols, expansion) {
     fields.push(`text:\n${chunk.text}`);
     return fields.join("\n");
 }
-async function scanFiles(root, includeGlobs, excludeGlobs) {
+async function* scanFiles(root, includeGlobs, excludeGlobs) {
     const predicates = createScanPredicates(includeGlobs, excludeGlobs);
-    const files = await walk(root, predicates);
-    return files.filter((file) => predicates.includes(file) && !predicates.excludes(file));
+    for await (const file of walk(root, predicates)) {
+        if (predicates.includes(file) && !predicates.excludes(file)) {
+            yield file;
+        }
+    }
 }
 function createScanPredicates(includeGlobs, excludeGlobs) {
     const includes = includeGlobs.map((pattern) => new Minimatch(pattern, { dot: true }));
@@ -661,30 +798,6 @@ function canPruneDirectoryForExclude(pattern) {
     }
     return !new Minimatch(pattern, { dot: true }).hasMagic();
 }
-async function mapWithConcurrency(items, concurrency, worker) {
-    let next = 0;
-    let failed = false;
-    let firstError;
-    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-        while (!failed && next < items.length) {
-            const item = items[next];
-            next += 1;
-            try {
-                await worker(item);
-            }
-            catch (error) {
-                if (!failed) {
-                    failed = true;
-                    firstError = error;
-                }
-            }
-        }
-    });
-    await Promise.allSettled(workers);
-    if (failed) {
-        throw firstError;
-    }
-}
 async function loadGitignore(root, prefix) {
     const matcher = ignore();
     try {
@@ -698,33 +811,30 @@ async function loadGitignore(root, prefix) {
     }
     return { base: prefix, matcher };
 }
-async function walk(root, predicates) {
-    const files = [];
+async function* walk(root, predicates) {
     const queue = [{ prefix: "", gitignores: [] }];
     while (queue.length > 0) {
-        const batch = queue.splice(0, queue.length);
-        await mapWithConcurrency(batch, DEFAULT_WALK_DIRECTORY_CONCURRENCY, async (directory) => {
-            const entries = await readdir(path.join(root, directory.prefix), { withFileTypes: true });
-            const localGitignore = await loadGitignore(root, directory.prefix);
-            const gitignores = localGitignore ? [...directory.gitignores, localGitignore] : directory.gitignores;
-            for (const entry of entries) {
-                const relative = path.join(directory.prefix, entry.name);
-                if (DEFAULT_IGNORED_DIRECTORIES.has(entry.name) ||
-                    entry.isSymbolicLink() ||
-                    isGitignored(relative, gitignores)) {
-                    continue;
-                }
-                if (entry.isDirectory()) {
-                    if (!predicates.excludesDirectory(relative)) {
-                        queue.push({ prefix: relative, gitignores });
-                    }
-                    continue;
-                }
-                files.push(relative);
+        const directory = queue.shift();
+        if (!directory) {
+            continue;
+        }
+        const entries = (await readdir(path.join(root, directory.prefix), { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name));
+        const localGitignore = await loadGitignore(root, directory.prefix);
+        const gitignores = localGitignore ? [...directory.gitignores, localGitignore] : directory.gitignores;
+        for (const entry of entries) {
+            const relative = path.join(directory.prefix, entry.name);
+            if (DEFAULT_IGNORED_DIRECTORIES.has(entry.name) || entry.isSymbolicLink() || isGitignored(relative, gitignores)) {
+                continue;
             }
-        });
+            if (entry.isDirectory()) {
+                if (!predicates.excludesDirectory(relative)) {
+                    queue.push({ prefix: relative, gitignores });
+                }
+                continue;
+            }
+            yield relative;
+        }
     }
-    return files.sort();
 }
 function isGitignored(relativePath, gitignores) {
     return gitignores.some(({ base, matcher }) => {
@@ -743,6 +853,30 @@ async function loadTextFileForIndexing(filePath) {
         fingerprint: fingerprintBytes(bytes),
         text: new TextDecoder().decode(bytes),
     };
+}
+async function statFileForIndexing(filePath) {
+    try {
+        const fileStat = await stat(filePath);
+        return { sizeBytes: fileStat.size, mtimeMs: fileStat.mtimeMs, ctimeMs: fileStat.ctimeMs };
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return;
+        }
+        throw error;
+    }
+}
+async function canReadFile(filePath) {
+    try {
+        await access(filePath, constants.R_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function statIsOlderThanIndex(fileStat, updatedAt) {
+    return (updatedAt - fileStat.mtimeMs >= STAT_FAST_PATH_SETTLE_MS && updatedAt - fileStat.ctimeMs >= STAT_FAST_PATH_SETTLE_MS);
 }
 function fingerprintBytes(bytes) {
     return createHash("sha256").update(bytes).digest("hex");

@@ -18,6 +18,7 @@ export type RerankOptions = {
     apiKey?: string;
     model: string;
     candidateMultiplier: number;
+    timeoutMs: number;
 };
 export type HydeOptions = {
     mode: "openai-compatible" | "opencode";
@@ -26,6 +27,7 @@ export type HydeOptions = {
     model?: string;
     threshold: number;
     enabled: boolean;
+    timeoutMs: number;
 };
 export type ChunkingOptions = {
     overlap: number;
@@ -59,6 +61,9 @@ export type SearchResultRetrievalDetails = {
 export type RankedChunkCandidate = {
     id: string;
     score: number;
+};
+export type VectorCandidateSearchResult = RankedChunkCandidate[] & {
+    incomplete?: boolean;
 };
 export type LexicalChunkCandidate = RankedChunkCandidate & {
     bm25Score: number;
@@ -103,6 +108,9 @@ export type FileRecord = {
     path: string;
     language: string;
     fingerprint: string;
+    sizeBytes?: number;
+    mtimeMs?: number;
+    ctimeMs?: number;
     chunkIds: string[];
     diagnostics: string[];
 };

@@ -9,6 +9,7 @@ const ApiConfig = z.object({
   apiKeyEnv: z.string().optional(),
   model: z.string().optional(),
   dimensions: z.number().int().positive().optional(),
+  timeoutMs: z.number().int().positive().optional(),
 })
 const EmbeddingConfig = ApiConfig.extend({
   batchSize: z.number().int().positive().optional(),
@@ -28,6 +29,8 @@ const HybridOptions = z.object({
 })
 const RetrievalOptions = z.object({
   hybrid: HybridOptions.optional(),
+  maxVectorCandidates: z.number().int().positive().optional(),
+  maxRerankCandidates: z.number().int().positive().optional(),
 })
 
 const ChunkingOptionsSchema = z.object({
@@ -72,6 +75,8 @@ const DEFAULT_HYBRID_OPTIONS = {
   vectorWeight: 1,
   bm25Weight: 1,
 }
+const DEFAULT_MAX_VECTOR_CANDIDATES = 512
+const DEFAULT_MAX_RERANK_CANDIDATES = 64
 const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = {
   overlap: 0,
   expansion: false,
@@ -85,6 +90,9 @@ const DEFAULT_MAX_CONTEXT_CHARS = 12_000
 const DEFAULT_TOP_K = 5
 const DEFAULT_EMBEDDING_BATCH_SIZE = 16
 const DEFAULT_EMBEDDING_CONCURRENCY = 1
+const DEFAULT_PROVIDER_TIMEOUT_MS = 30_000
+const MAX_EMBEDDING_BATCH_SIZE = 2048
+const MAX_EMBEDDING_CONCURRENCY = 8
 const DEFAULT_EXCLUDE_GLOBS = [
   "**/*.{png,jpg,jpeg,gif,webp,ico,pdf,zip,gz,tgz,tar,7z,mp4,mov,mp3,woff,woff2,ttf,eot}",
   "**/bun.lock",
@@ -228,7 +236,7 @@ function assembleOptions(
     embedding,
     hyde,
     rerank: rerankOptions(raw.rerank, apiKeyOption(raw.rerank, env)),
-    retrieval: { hybrid: hybridOptions(raw.retrieval?.hybrid) },
+    retrieval: retrievalOptions(raw.retrieval),
     chunking: chunkingOptions(raw.chunking),
     ...resultOptions(raw),
     cacheDir: cacheDirOption(raw.cacheDir, env),
@@ -269,6 +277,14 @@ function addEmbeddingDiagnostics(raw: ReturnType<typeof rawOptions>["embedding"]
   if (!raw?.model) {
     diagnostics.push("embedding.model is required")
   }
+  addMaxDiagnostic("embedding.batchSize", raw?.batchSize, MAX_EMBEDDING_BATCH_SIZE, diagnostics)
+  addMaxDiagnostic("embedding.concurrency", raw?.concurrency, MAX_EMBEDDING_CONCURRENCY, diagnostics)
+}
+
+function addMaxDiagnostic(key: string, value: number | undefined, max: number, diagnostics: string[]) {
+  if (value !== undefined && value > max) {
+    diagnostics.push(`${key}: Number must be less than or equal to ${max}`)
+  }
 }
 
 function withDefault<T>(value: T | undefined, defaultValue: T) {
@@ -290,10 +306,15 @@ function embeddingOptions(raw: ReturnType<typeof rawOptions>["embedding"], apiKe
         apiKey,
         model: raw.model,
         dimensions: raw.dimensions,
-        batchSize: raw.batchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE,
-        concurrency: raw.concurrency ?? DEFAULT_EMBEDDING_CONCURRENCY,
+        batchSize: cappedOption(raw.batchSize, DEFAULT_EMBEDDING_BATCH_SIZE, MAX_EMBEDDING_BATCH_SIZE),
+        concurrency: cappedOption(raw.concurrency, DEFAULT_EMBEDDING_CONCURRENCY, MAX_EMBEDDING_CONCURRENCY),
+        timeoutMs: raw.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
       }
     : undefined
+}
+
+function cappedOption(value: number | undefined, defaultValue: number, max: number) {
+  return Math.min(value ?? defaultValue, max)
 }
 
 function hydeOptions(
@@ -309,6 +330,7 @@ function hydeOptions(
     model: api?.model,
     threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
     enabled: withDefault(raw?.enabled, hasEmbeddingConfig),
+    timeoutMs: raw?.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
   }
 }
 
@@ -331,12 +353,21 @@ function rerankOptions(raw: ReturnType<typeof rawOptions>["rerank"], apiKey: str
         apiKey,
         model: raw.model,
         candidateMultiplier: raw.candidateMultiplier ?? DEFAULT_RERANK_CANDIDATE_MULTIPLIER,
+        timeoutMs: raw.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
       }
     : undefined
 }
 
 function hybridOptions(raw: NonNullable<ReturnType<typeof rawOptions>["retrieval"]>["hybrid"]) {
   return { ...DEFAULT_HYBRID_OPTIONS, ...definedProperties(raw) }
+}
+
+function retrievalOptions(raw: ReturnType<typeof rawOptions>["retrieval"]) {
+  return {
+    hybrid: hybridOptions(raw?.hybrid),
+    maxVectorCandidates: raw?.maxVectorCandidates ?? DEFAULT_MAX_VECTOR_CANDIDATES,
+    maxRerankCandidates: raw?.maxRerankCandidates ?? DEFAULT_MAX_RERANK_CANDIDATES,
+  }
 }
 
 function chunkingOptions(raw: ReturnType<typeof rawOptions>["chunking"]): ChunkingOptions {
@@ -367,6 +398,7 @@ function parseApiConfig(input: unknown) {
     apiKeyEnv: safeField(ApiFields.apiKeyEnv, inputRecord.data.apiKeyEnv),
     model: safeField(ApiFields.model, inputRecord.data.model),
     dimensions: safeField(ApiFields.dimensions, inputRecord.data.dimensions),
+    timeoutMs: safeField(ApiFields.timeoutMs, inputRecord.data.timeoutMs),
   }
 }
 
@@ -410,6 +442,7 @@ function parseRerankConfig(input: unknown) {
     apiKey: api?.apiKey,
     apiKeyEnv: api?.apiKeyEnv,
     model: api?.model,
+    timeoutMs: api?.timeoutMs,
     candidateMultiplier: safeField(RerankFields.candidateMultiplier, inputRecord.data.candidateMultiplier),
   }
 }
@@ -422,6 +455,8 @@ function parseRetrievalOptions(input: unknown) {
 
   return {
     hybrid: parseHybridOptions(inputRecord.data.hybrid),
+    maxVectorCandidates: safeField(RetrievalOptions.shape.maxVectorCandidates, inputRecord.data.maxVectorCandidates),
+    maxRerankCandidates: safeField(RetrievalOptions.shape.maxRerankCandidates, inputRecord.data.maxRerankCandidates),
   }
 }
 

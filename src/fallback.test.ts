@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { fallbackChunks } from "./fallback.js"
-import { nonWhitespaceLength, rangeForSlice } from "./range.js"
+import { createSourceIndex, nonWhitespaceLength, rangeForSlice } from "./range.js"
 
 describe("fallbackChunks", () => {
   test("keeps small files as one chunk", () => {
@@ -70,6 +70,40 @@ describe("fallbackChunks", () => {
     expect(chunks[0].range.byteStart).toBe(0)
     expect(chunks.at(-1)?.range.byteEnd).toBe(new TextEncoder().encode(text).length)
     expect(chunks.slice(1).every((chunk, index) => chunk.range.byteStart === chunks[index].range.byteEnd)).toBe(true)
+    expect(chunks.map((chunk) => chunk.id)).toEqual(
+      chunks.map((chunk) => `src/a.ts:${chunk.range.byteStart}:${chunk.range.byteEnd}`),
+    )
+  })
+
+  test("uses a full-source index when chunking a byte-offset subrange", () => {
+    // biome-ignore lint/security/noSecrets: fixture text exercises multibyte byte offsets, not credentials.
+    const source = "préface\nαβγ\nδεζ\n"
+    const text = "αβγ\nδεζ\n"
+    const byteOffset = new TextEncoder().encode("préface\n").length
+    const chunks = fallbackChunks({
+      filePath: "src/a.ts",
+      language: "typescript",
+      text,
+      maxNonWhitespaceChars: 3,
+      sourceIndex: createSourceIndex(source),
+      byteOffset,
+    })
+
+    expect(chunks.map((chunk) => chunk.text)).toEqual(["αβγ\n", "δεζ\n"])
+    expect(chunks.map((chunk) => chunk.range)).toEqual([
+      {
+        byteStart: byteOffset,
+        byteEnd: byteOffset + new TextEncoder().encode("αβγ\n").length,
+        lineStart: 2,
+        lineEnd: 2,
+      },
+      {
+        byteStart: byteOffset + new TextEncoder().encode("αβγ\n").length,
+        byteEnd: new TextEncoder().encode(source).length,
+        lineStart: 3,
+        lineEnd: 3,
+      },
+    ])
     expect(chunks.map((chunk) => chunk.id)).toEqual(
       chunks.map((chunk) => `src/a.ts:${chunk.range.byteStart}:${chunk.range.byteEnd}`),
     )
