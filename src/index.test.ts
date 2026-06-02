@@ -65,6 +65,37 @@ describe("pi-semsearch extension", () => {
     await eventually(() => expect(refreshes).toBe(3))
   })
 
+  test("write tool results queue a background index refresh for worktree paths", async () => {
+    const worktree = await tempWorktree({ embedding: configuredEmbedding() })
+    let refreshes = 0
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => readyStore(readyIndex(worktree)),
+        createIndexer: () => ({
+          refresh: async () => {
+            refreshes += 1
+          },
+        }),
+      }),
+    )
+
+    await harness.events.tool_result?.(successfulWriteResult("src/new.ts"), ctx(worktree))
+    await eventually(() => expect(refreshes).toBe(1))
+
+    await harness.events.tool_result?.({ ...successfulWriteResult("src/failed.ts"), isError: true }, ctx(worktree))
+    await harness.events.tool_result?.(
+      { toolName: "read", input: { path: "src/read.ts" }, isError: false },
+      ctx(worktree),
+    )
+    await harness.events.tool_result?.(
+      successfulWriteResult(path.join(path.dirname(worktree), "outside.ts")),
+      ctx(worktree),
+    )
+    await waitForEventLoop()
+
+    expect(refreshes).toBe(1)
+  })
+
   test("semantic_search_code reports missing embedding configuration without breaking Pi startup", async () => {
     const worktree = await tempWorktree({})
     const harness = installExtension(createPiSemsearchExtensionForTest())
@@ -209,6 +240,13 @@ interface TestCommandRegistration {
 interface TestEventHandlers {
   session_start?: (event: unknown, ctx: ReturnType<typeof ctx>) => Promise<void>
   session_shutdown?: (event: unknown) => Promise<void>
+  tool_result?: (event: TestToolResultEvent, ctx: ReturnType<typeof ctx>) => Promise<void>
+}
+
+interface TestToolResultEvent {
+  toolName: string
+  input: Record<string, unknown>
+  isError?: boolean
 }
 
 function installExtension(extension: (pi: never) => void) {
@@ -241,6 +279,10 @@ async function executeTool(
 
 interface CtxOptions {
   activeModel?: boolean
+}
+
+function successfulWriteResult(filePath: string): TestToolResultEvent {
+  return { toolName: "write", input: { path: filePath }, isError: false }
 }
 
 function ctx(worktree: string, notifications: string[] = [], options: CtxOptions = {}) {
