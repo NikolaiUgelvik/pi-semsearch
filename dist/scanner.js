@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import ignore from "ignore";
-import { minimatch } from "minimatch";
+import { Minimatch } from "minimatch";
 import { castChunks } from "./cast.js";
 import { fallbackChunks } from "./fallback.js";
 import { buildLexicalIndex } from "./lexical.js";
@@ -20,6 +20,8 @@ const DEFAULT_EMBEDDING_BATCH_SIZE = 16;
 const DEFAULT_EMBEDDING_BATCH_CONCURRENCY = 1;
 const DEFAULT_FILE_CONCURRENCY = 4;
 const DEFAULT_FILE_RESULT_WRITE_BATCH_SIZE = 32;
+const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", ".cache"]);
+const DEFAULT_WALK_DIRECTORY_CONCURRENCY = 16;
 export function createIndexer(input) {
     return {
         async refresh() {
@@ -30,6 +32,7 @@ export function createIndexer(input) {
             const runConfigHash = indexRunConfigHash(index, input.worktree, input.options);
             const runStore = hasRunStore(store) ? store : undefined;
             const files = await scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs);
+            const groupedSymbols = symbolsByFilePath(index.symbols);
             const nextFiles = {};
             const nextChunks = {};
             const nextSymbols = {};
@@ -42,6 +45,7 @@ export function createIndexer(input) {
                 nextFiles,
                 nextChunks,
                 nextSymbols,
+                symbolsByFilePath: groupedSymbols,
                 metadataDiagnostics,
                 metadataDiagnosticDetails,
                 reusedFileResults: [],
@@ -85,16 +89,24 @@ export function createIndexer(input) {
                 fileResultWriter,
             });
             await embeddingBatcher.drain();
-            await persistReusedFileResults({ reusedFileResults: state.reusedFileResults, run: () => run, fileResultWriter });
             await fileResultWriter.flush();
             metadataDiagnostics.sort();
             const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols);
             const hasFileSetChange = !sameStringArray(Object.keys(index.files).sort(), Object.keys(nextFiles).sort());
             const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, metadataDiagnostics);
             const hasDiagnosticDetailsChange = stableStringify(index.metadata.diagnosticDetails ?? []) !== stableStringify(metadataDiagnosticDetails);
-            if (canSkipRefresh(index, input.worktree, changed, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange || hasDiagnosticDetailsChange)) {
+            const hasScannerOptionsChange = !sameScannerOptions(index.metadata, input.options);
+            if (canSkipRefresh(index, input.worktree, changed, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange || hasDiagnosticDetailsChange || hasScannerOptionsChange)) {
                 return index;
             }
+            await persistReusedFileResults({
+                reusedFileResults: state.reusedFileResults,
+                runStore,
+                run: () => run,
+                ensureRun,
+                fileResultWriter,
+            });
+            await fileResultWriter.flush();
             index.files = nextFiles;
             index.chunks = lexicalIndex.chunks;
             index.symbols = nextSymbols;
@@ -151,6 +163,23 @@ function unchangedIndexShape(index, worktree, canReuseExistingRecords, hasFileSe
         canReuseExistingRecords,
     ].every(Boolean);
 }
+function sameScannerOptions(metadata, options) {
+    return (metadata.maxFileBytes === options.maxFileBytes &&
+        sameStringSet(metadata.includeGlobs, options.includeGlobs) &&
+        sameStringSet(metadata.excludeGlobs, options.excludeGlobs));
+}
+function sameStringSet(left, right) {
+    if (!left) {
+        return false;
+    }
+    const canonicalLeft = canonicalStringSet(left);
+    const canonicalRight = canonicalStringSet(right);
+    return (canonicalLeft.length === canonicalRight.length &&
+        canonicalLeft.every((value, index) => value === canonicalRight[index]));
+}
+function canonicalStringSet(values) {
+    return [...new Set(values)].sort();
+}
 async function persistRefreshedIndex(input) {
     const run = input.run() ?? (input.runStore ? await input.ensureRun() : undefined);
     if (run && input.runStore) {
@@ -171,8 +200,14 @@ async function processScannedFile(input) {
     const loaded = await loadTextFileForIndexing(absolutePath);
     const currentFingerprint = loaded.fingerprint;
     const previousFile = input.index.files[input.relativePath];
-    if (canReuseFile(input.index, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords)) {
-        reuseFileRecords(input.index, previousFile, input.state);
+    if (canReuseFile(input.index, input.state.symbolsByFilePath, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords)) {
+        const reused = reuseFileRecords(input.index, previousFile, input.state);
+        if (input.run()) {
+            await input.fileResultWriter.add(reused);
+        }
+        else {
+            input.state.reusedFileResults.push(reused);
+        }
         return input.state.changed;
     }
     const activeRun = await input.ensureRun();
@@ -196,16 +231,17 @@ function reuseFileRecords(index, file, state) {
         }
     }
     const symbols = {};
-    for (const symbol of Object.values(index.symbols).filter((symbol) => symbol.filePath === file.path)) {
+    for (const symbol of state.symbolsByFilePath.get(file.path) ?? []) {
         state.nextSymbols[symbol.id] = symbol;
         symbols[symbol.id] = symbol;
     }
-    state.reusedFileResults.push({ file, chunks, symbols });
+    return { file, chunks, symbols };
 }
 async function persistReusedFileResults(input) {
-    if (!input.run()) {
+    if (input.reusedFileResults.length === 0 || !input.runStore) {
         return;
     }
+    await input.ensureRun();
     for (const fileResult of input.reusedFileResults) {
         await input.fileResultWriter.add(fileResult);
     }
@@ -220,7 +256,7 @@ function canReuseCompletedFile(index, completed, relativePath, currentFingerprin
         chunks: completed.chunks,
         symbols: completed.symbols,
     };
-    return canReuseFile(completedIndex, completed.file, relativePath, currentFingerprint, true);
+    return canReuseFile(completedIndex, symbolsByFilePath(completed.symbols), completed.file, relativePath, currentFingerprint, true);
 }
 function reuseCompletedFileRecords(completed, state) {
     state.nextFiles[completed.file.path] = completed.file;
@@ -325,7 +361,7 @@ function createFileResultWriter(input) {
 }
 function createEmbeddingBatcher(input) {
     const batchSize = Math.max(1, input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
-    const maxOutstanding = DEFAULT_EMBEDDING_BATCH_CONCURRENCY;
+    const maxOutstanding = Math.max(1, input.options.embeddingBatchConcurrency ?? DEFAULT_EMBEDDING_BATCH_CONCURRENCY);
     const queue = [];
     const outstanding = new Set();
     let scheduled = false;
@@ -401,10 +437,15 @@ async function embedPendingBatch(input, batch) {
 }
 async function embedChunks(input) {
     const fileChunks = {};
-    const embeddedChunks = await Promise.all(input.chunks.map(async (chunk) => {
-        const embedded = await input.embeddingBatcher.embed(embeddingText(input.relativePath, input.parsed.language, chunk, input.symbolsById, input.input.options.chunking.expansion));
-        return { chunk, embedded };
-    }));
+    const embeddedChunks = new Array(input.chunks.length);
+    const concurrency = Math.max(1, input.input.options.embeddingBatchConcurrency ?? DEFAULT_EMBEDDING_BATCH_CONCURRENCY) *
+        Math.max(1, input.input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
+    await mapWithConcurrency(input.chunks.map((chunk, index) => ({ chunk, index })), concurrency, async ({ chunk, index }) => {
+        embeddedChunks[index] = {
+            chunk,
+            embedded: await input.embeddingBatcher.embed(embeddingText(input.relativePath, input.parsed.language, chunk, input.symbolsById, input.input.options.chunking.expansion)),
+        };
+    });
     for (const { chunk, embedded } of embeddedChunks) {
         if ("embeddingError" in embedded) {
             input.fileDiagnostics.push(`embedding failed: ${embedded.embeddingError}`);
@@ -479,7 +520,20 @@ function isTextControlByte(byte) {
     return TEXT_CONTROL_BYTES.has(byte);
 }
 const TEXT_CONTROL_BYTES = new Set([BYTE_BACKSPACE, BYTE_TAB, BYTE_LINE_FEED, BYTE_FORM_FEED, BYTE_CARRIAGE_RETURN]);
-function canReuseFile(index, file, relativePath, fingerprint, canReuseExistingRecords) {
+function symbolsByFilePath(symbols) {
+    const grouped = new Map();
+    for (const symbol of Object.values(symbols)) {
+        const symbolsForFile = grouped.get(symbol.filePath);
+        if (symbolsForFile) {
+            symbolsForFile.push(symbol);
+        }
+        else {
+            grouped.set(symbol.filePath, [symbol]);
+        }
+    }
+    return grouped;
+}
+function canReuseFile(index, groupedSymbols, file, relativePath, fingerprint, canReuseExistingRecords) {
     if (!canReuseExistingRecords || file?.path !== relativePath || file.fingerprint !== fingerprint) {
         return false;
     }
@@ -497,9 +551,7 @@ function canReuseFile(index, file, relativePath, fingerprint, canReuseExistingRe
         hasDanglingChunkReference(index, entry.chunk, chunkIds))) {
         return false;
     }
-    return Object.values(index.symbols)
-        .filter((symbol) => symbol.filePath === file.path)
-        .every((symbol) => validSymbolRecord(index, symbol, file.path));
+    return (groupedSymbols.get(file.path) ?? []).every((symbol) => validSymbolRecord(index, symbol, file.path));
 }
 function validSymbolRecord(index, symbol, filePath) {
     return validSymbolIdentity(index, symbol, filePath) && validSymbolRelations(index, symbol, filePath);
@@ -548,9 +600,21 @@ function embeddingText(filePath, language, chunk, symbols, expansion) {
     return fields.join("\n");
 }
 async function scanFiles(root, includeGlobs, excludeGlobs) {
-    const files = await walk(root, "", [], excludeGlobs);
-    return files.filter((file) => includeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })) &&
-        !excludeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })));
+    const predicates = createScanPredicates(includeGlobs, excludeGlobs);
+    const files = await walk(root, predicates);
+    return files.filter((file) => predicates.includes(file) && !predicates.excludes(file));
+}
+function createScanPredicates(includeGlobs, excludeGlobs) {
+    const includes = includeGlobs.map((pattern) => new Minimatch(pattern, { dot: true }));
+    const excludes = excludeGlobs.map((pattern) => new Minimatch(pattern, { dot: true }));
+    return {
+        includes: (filePath) => includes.some((matcher) => matcher.match(filePath)),
+        excludes: (filePath) => excludes.some((matcher) => matcher.match(filePath)),
+        excludesDirectory: (relativePath) => {
+            const globPath = toGitignorePath(relativePath);
+            return excludes.some((matcher) => matcher.match(globPath) || matcher.match(`${globPath}/`) || matcher.match(`${globPath}/__placeholder__`));
+        },
+    };
 }
 async function mapWithConcurrency(items, concurrency, worker) {
     let next = 0;
@@ -589,30 +653,33 @@ async function loadGitignore(root, prefix) {
     }
     return { base: prefix, matcher };
 }
-async function walk(root, prefix = "", inheritedGitignores = [], excludeGlobs = []) {
-    const entries = await readdir(path.join(root, prefix), { withFileTypes: true });
-    const localGitignore = await loadGitignore(root, prefix);
-    const gitignores = localGitignore ? [...inheritedGitignores, localGitignore] : inheritedGitignores;
-    const ignored = new Set([".git", "node_modules", "dist", "build", ".cache"]);
-    const nested = await Promise.all(entries
-        .filter((entry) => {
-        const relative = path.join(prefix, entry.name);
-        return !(ignored.has(entry.name) ||
-            entry.isSymbolicLink() ||
-            isGitignored(relative, gitignores) ||
-            (entry.isDirectory() && isExcludedDirectory(relative, excludeGlobs)));
-    })
-        .map((entry) => {
-        const relative = path.join(prefix, entry.name);
-        return entry.isDirectory() ? walk(root, relative, gitignores, excludeGlobs) : Promise.resolve([relative]);
-    }));
-    return nested.flat();
-}
-function isExcludedDirectory(relativePath, excludeGlobs) {
-    const globPath = toGitignorePath(relativePath);
-    return excludeGlobs.some((pattern) => minimatch(globPath, pattern, { dot: true }) ||
-        minimatch(`${globPath}/`, pattern, { dot: true }) ||
-        minimatch(`${globPath}/__placeholder__`, pattern, { dot: true }));
+async function walk(root, predicates) {
+    const files = [];
+    const queue = [{ prefix: "", gitignores: [] }];
+    while (queue.length > 0) {
+        const batch = queue.splice(0, queue.length);
+        await mapWithConcurrency(batch, DEFAULT_WALK_DIRECTORY_CONCURRENCY, async (directory) => {
+            const entries = await readdir(path.join(root, directory.prefix), { withFileTypes: true });
+            const localGitignore = await loadGitignore(root, directory.prefix);
+            const gitignores = localGitignore ? [...directory.gitignores, localGitignore] : directory.gitignores;
+            for (const entry of entries) {
+                const relative = path.join(directory.prefix, entry.name);
+                if (DEFAULT_IGNORED_DIRECTORIES.has(entry.name) ||
+                    entry.isSymbolicLink() ||
+                    isGitignored(relative, gitignores)) {
+                    continue;
+                }
+                if (entry.isDirectory()) {
+                    if (!predicates.excludesDirectory(relative)) {
+                        queue.push({ prefix: relative, gitignores });
+                    }
+                    continue;
+                }
+                files.push(relative);
+            }
+        });
+    }
+    return files.sort();
 }
 function isGitignored(relativePath, gitignores) {
     return gitignores.some(({ base, matcher }) => {

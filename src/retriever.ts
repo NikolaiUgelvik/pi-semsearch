@@ -47,6 +47,10 @@ type RetrievalSettingsInput = Pick<RetrieveFromStoreInput, "input" | "options">
 
 type ResultOutputContext = RetrievalContext & Pick<RetrieveFromStoreInput, "readSource">
 
+type SourceReadResult = { text: string; ok: true } | { text: string; ok: false }
+
+type SourceCache = Map<string, Promise<SourceReadResult>>
+
 interface RankedSearch {
   results: RankedResult[]
   retrieval: Map<string, SearchResultRetrievalDetails>
@@ -362,16 +366,32 @@ async function outputResults(input: {
   maxContextChars: number
   retrieval: Map<string, SearchResultRetrievalDetails>
 }) {
-  const results = await Promise.all(input.results.flatMap((result) => outputResult(input, result)))
+  const sourceCache: SourceCache = new Map()
+  const sourceReadFailures = new Set<string>()
+  const results = await Promise.all(
+    input.results.flatMap((result) => outputResult(input, result, sourceCache, sourceReadFailures)),
+  )
   return omitDuplicateParentRanges(results.flat())
 }
 
-async function outputResult(input: Parameters<typeof outputResults>[0], result: RankedResult) {
+async function outputResult(
+  input: Parameters<typeof outputResults>[0],
+  result: RankedResult,
+  sourceCache: SourceCache,
+  sourceReadFailures: Set<string>,
+) {
   const chunk = input.chunksById[result.id]
   if (!chunk) {
     return []
   }
-  const source = await sourceForChunk(input.input, chunk, input.diagnostics, input.diagnosticDetails)
+  const source = await sourceForChunk({
+    input: input.input,
+    chunk,
+    diagnostics: input.diagnostics,
+    diagnosticDetails: input.diagnosticDetails,
+    sourceCache,
+    sourceReadFailures,
+  })
   const sourceMatches = source.ok && chunkMatchesSource(source.text, chunk)
   if (source.ok && !sourceMatches) {
     addSourceDiagnostic(input.diagnostics, input.diagnosticDetails, {
@@ -405,23 +425,38 @@ async function outputResult(input: Parameters<typeof outputResults>[0], result: 
   ]
 }
 
-function sourceForChunk(
-  input: ResultOutputContext,
-  chunk: ChunkRecord,
-  diagnostics: string[],
-  diagnosticDetails: DiagnosticRecord[],
-) {
-  return input
-    .readSource(chunk.filePath)
-    .then((text) => ({ text, ok: true }))
-    .catch(() => {
-      addSourceDiagnostic(diagnostics, diagnosticDetails, {
-        chunk,
-        code: "source.read_failed",
-        message: `source read failed for ${chunk.filePath}; parent context omitted`,
-      })
-      return { text: "", ok: false }
+function sourceForChunk(input: {
+  input: ResultOutputContext
+  chunk: ChunkRecord
+  diagnostics: string[]
+  diagnosticDetails: DiagnosticRecord[]
+  sourceCache: SourceCache
+  sourceReadFailures: Set<string>
+}) {
+  const filePath = input.chunk.filePath
+  let source = input.sourceCache.get(filePath)
+  if (!source) {
+    source = input.input
+      .readSource(filePath)
+      .then((text): SourceReadResult => ({ text, ok: true }))
+      .catch((): SourceReadResult => ({ text: "", ok: false }))
+    input.sourceCache.set(filePath, source)
+  }
+  return source.then((result) => {
+    if (result.ok) {
+      return result
+    }
+    if (input.sourceReadFailures.has(filePath)) {
+      return result
+    }
+    input.sourceReadFailures.add(filePath)
+    addSourceDiagnostic(input.diagnostics, input.diagnosticDetails, {
+      chunk: input.chunk,
+      code: "source.read_failed",
+      message: `source read failed for ${input.chunk.filePath}; parent context omitted`,
     })
+    return result
+  })
 }
 
 function addSourceDiagnostic(
@@ -451,7 +486,7 @@ function omitDuplicateParentRange<
   if (!result.parentRange) {
     return result
   }
-  const parentRangeKey = `${result.filePath}:${result.parentRange.byteStart}:${result.parentRange.byteEnd}:${result.parentText}`
+  const parentRangeKey = `${result.filePath}\0${result.parentRange.byteStart}\0${result.parentRange.byteEnd}`
   if (seenParentRanges.has(parentRangeKey)) {
     return { ...result, parentText: undefined, parentRange: undefined }
   }

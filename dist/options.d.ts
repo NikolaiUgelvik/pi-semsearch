@@ -14,6 +14,7 @@ export declare function parseOptions(input: unknown, env?: Record<string, string
         model: string;
         dimensions: number | undefined;
         batchSize: number;
+        concurrency: number;
     } | undefined;
     hyde: HydeOptions;
     rerank: {

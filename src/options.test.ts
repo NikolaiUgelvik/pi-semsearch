@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { parseOptions } from "./options.js"
 
+const POSITIVE_NUMBER_DIAGNOSTIC_PATTERN = /greater than 0|positive|>0/i
+
 describe("parseOptions", () => {
   test("applies defaults and resolves api keys from env", () => {
     const options = parseOptions(
@@ -24,6 +26,7 @@ describe("parseOptions", () => {
       model: "text-embedding-3-small",
       dimensions: undefined,
       batchSize: 16,
+      concurrency: 1,
     })
     expect(options.hyde).toEqual({
       mode: "opencode",
@@ -78,6 +81,56 @@ describe("parseOptions", () => {
     )
 
     expect(options.embedding?.batchSize).toBe(4)
+  })
+
+  test("parses configured embedding concurrency and defaults to one", () => {
+    expect(
+      parseOptions(
+        {
+          embedding: {
+            baseURL: "https://example.test/v1",
+            apiKey: "literal",
+            model: "text-embedding-3-small",
+          },
+        },
+        {},
+      ).embedding?.concurrency,
+    ).toBe(1)
+
+    expect(
+      parseOptions(
+        {
+          embedding: {
+            baseURL: "https://example.test/v1",
+            apiKey: "literal",
+            model: "text-embedding-3-small",
+            concurrency: 3,
+          },
+        },
+        {},
+      ).embedding?.concurrency,
+    ).toBe(3)
+  })
+
+  test("reports invalid embedding concurrency", () => {
+    const options = parseOptions(
+      {
+        embedding: {
+          baseURL: "https://example.test/v1",
+          apiKey: "literal",
+          model: "text-embedding-3-small",
+          concurrency: 0,
+        },
+      },
+      {},
+    )
+
+    expect(
+      options.diagnostics.some(
+        (diagnostic) =>
+          diagnostic.startsWith("embedding.concurrency:") && POSITIVE_NUMBER_DIAGNOSTIC_PATTERN.test(diagnostic),
+      ),
+    ).toBe(true)
   })
 
   test("parses configured hybrid retrieval options", () => {
@@ -186,6 +239,7 @@ describe("parseOptions", () => {
       model: "text-embedding-3-small",
       dimensions: undefined,
       batchSize: 16,
+      concurrency: 1,
     })
     expect(options.rerank).toBeUndefined()
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("rerank.baseURL:"))).toBe(true)
@@ -480,6 +534,7 @@ describe("parseOptions", () => {
       model: "text-embedding-3-small",
       dimensions: undefined,
       batchSize: 16,
+      concurrency: 1,
     })
     expect(options.topK).toBe(5)
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("topK:"))).toBe(true)
@@ -541,6 +596,7 @@ describe("parseOptions", () => {
       model: "text-embedding-3-small",
       dimensions: undefined,
       batchSize: 16,
+      concurrency: 1,
     })
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("embedding.dimensions:"))).toBe(true)
     expect(options.diagnostics).not.toContain("embedding.baseURL is required")

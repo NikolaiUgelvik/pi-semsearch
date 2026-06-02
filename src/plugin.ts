@@ -171,6 +171,7 @@ export function createCastPluginForTest(
               maxContextChars: options.maxContextChars,
               chunking: options.chunking,
               embeddingBatchSize: embedding.batchSize,
+              embeddingBatchConcurrency: embedding.concurrency,
             },
             store: indexingStore,
             parse: parseSource,
@@ -729,9 +730,28 @@ function canUseReadyIndexForStartup(
   return (
     metadata.status === "ready" &&
     metadata.worktree === worktree &&
+    metadata.maxFileBytes === options.maxFileBytes &&
+    sameStringSet(metadata.includeGlobs, options.includeGlobs) &&
+    sameStringSet(metadata.excludeGlobs, options.excludeGlobs) &&
     metadata.maxChunkNonWhitespaceChars === options.maxChunkNonWhitespaceChars &&
     sameStartupChunking(metadata.chunking, options.chunking)
   )
+}
+
+function sameStringSet(left: string[] | undefined, right: string[]) {
+  if (!left) {
+    return false
+  }
+  const canonicalLeft = canonicalStringSet(left)
+  const canonicalRight = canonicalStringSet(right)
+  return (
+    canonicalLeft.length === canonicalRight.length &&
+    canonicalLeft.every((value, index) => value === canonicalRight[index])
+  )
+}
+
+function canonicalStringSet(values: string[]) {
+  return [...new Set(values)].sort()
 }
 
 function sameStartupChunking(left: IndexMetadata["chunking"], right: IndexMetadata["chunking"]) {

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { readdir, readFile } from "node:fs/promises"
 import path from "node:path"
 import ignore, { type Ignore } from "ignore"
-import { minimatch } from "minimatch"
+import { Minimatch } from "minimatch"
 import { castChunks, type SyntaxNode } from "./cast.js"
 import { fallbackChunks } from "./fallback.js"
 import { buildLexicalIndex } from "./lexical.js"
@@ -27,10 +27,12 @@ type GitignoreMatcher = { base: string; matcher: Ignore }
 type CreateIndexerInput = Parameters<typeof createIndexer>[0]
 type IndexRunStore = Store &
   Required<Pick<Store, "beginIndexRun" | "getCompletedFile" | "writeFileResult" | "activateRun">>
+type SymbolsByFilePath = Map<string, SymbolRecord[]>
 type RefreshState = {
   nextFiles: CastIndex["files"]
   nextChunks: CastIndex["chunks"]
   nextSymbols: CastIndex["symbols"]
+  symbolsByFilePath: SymbolsByFilePath
   metadataDiagnostics: string[]
   metadataDiagnosticDetails: DiagnosticRecord[]
   reusedFileResults: FileResult[]
@@ -50,6 +52,12 @@ type FileResultWriter = {
   add(fileResult: FileResult): Promise<void>
   flush(): Promise<void>
 }
+type ScanPredicates = {
+  includes(filePath: string): boolean
+  excludes(filePath: string): boolean
+  excludesDirectory(relativePath: string): boolean
+}
+type WalkDirectory = { prefix: string; gitignores: GitignoreMatcher[] }
 const BINARY_SAMPLE_BYTES = Number("16") * Number("1024")
 const BYTE_NUL = 0
 const BYTE_BACKSPACE = 8
@@ -63,6 +71,8 @@ const DEFAULT_EMBEDDING_BATCH_SIZE = 16
 const DEFAULT_EMBEDDING_BATCH_CONCURRENCY = 1
 const DEFAULT_FILE_CONCURRENCY = 4
 const DEFAULT_FILE_RESULT_WRITE_BATCH_SIZE = 32
+const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", ".cache"])
+const DEFAULT_WALK_DIRECTORY_CONCURRENCY = 16
 
 export function createIndexer(input: {
   worktree: string
@@ -75,6 +85,7 @@ export function createIndexer(input: {
     maxContextChars: number
     chunking: ChunkingOptions
     embeddingBatchSize?: number
+    embeddingBatchConcurrency?: number
   }
   store: Store
   parse(filePath: string, source: string): Promise<{ language: string; root?: SyntaxNode }>
@@ -91,6 +102,7 @@ export function createIndexer(input: {
       const runConfigHash = indexRunConfigHash(index, input.worktree, input.options)
       const runStore = hasRunStore(store) ? store : undefined
       const files = await scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs)
+      const groupedSymbols = symbolsByFilePath(index.symbols)
       const nextFiles: CastIndex["files"] = {}
       const nextChunks: CastIndex["chunks"] = {}
       const nextSymbols: CastIndex["symbols"] = {}
@@ -103,6 +115,7 @@ export function createIndexer(input: {
         nextFiles,
         nextChunks,
         nextSymbols,
+        symbolsByFilePath: groupedSymbols,
         metadataDiagnostics,
         metadataDiagnosticDetails,
         reusedFileResults: [],
@@ -149,7 +162,6 @@ export function createIndexer(input: {
       })
 
       await embeddingBatcher.drain()
-      await persistReusedFileResults({ reusedFileResults: state.reusedFileResults, run: () => run, fileResultWriter })
       await fileResultWriter.flush()
       metadataDiagnostics.sort()
       const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols)
@@ -157,6 +169,7 @@ export function createIndexer(input: {
       const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, metadataDiagnostics)
       const hasDiagnosticDetailsChange =
         stableStringify(index.metadata.diagnosticDetails ?? []) !== stableStringify(metadataDiagnosticDetails)
+      const hasScannerOptionsChange = !sameScannerOptions(index.metadata, input.options)
       if (
         canSkipRefresh(
           index,
@@ -164,11 +177,19 @@ export function createIndexer(input: {
           changed,
           canReuseExistingRecords,
           hasFileSetChange,
-          hasDiagnosticsChange || hasDiagnosticDetailsChange,
+          hasDiagnosticsChange || hasDiagnosticDetailsChange || hasScannerOptionsChange,
         )
       ) {
         return index
       }
+      await persistReusedFileResults({
+        reusedFileResults: state.reusedFileResults,
+        runStore,
+        run: () => run,
+        ensureRun,
+        fileResultWriter,
+      })
+      await fileResultWriter.flush()
 
       index.files = nextFiles
       index.chunks = lexicalIndex.chunks
@@ -254,6 +275,30 @@ function unchangedIndexShape(
   ].every(Boolean)
 }
 
+function sameScannerOptions(metadata: CastIndex["metadata"], options: CreateIndexerInput["options"]) {
+  return (
+    metadata.maxFileBytes === options.maxFileBytes &&
+    sameStringSet(metadata.includeGlobs, options.includeGlobs) &&
+    sameStringSet(metadata.excludeGlobs, options.excludeGlobs)
+  )
+}
+
+function sameStringSet(left: string[] | undefined, right: string[]) {
+  if (!left) {
+    return false
+  }
+  const canonicalLeft = canonicalStringSet(left)
+  const canonicalRight = canonicalStringSet(right)
+  return (
+    canonicalLeft.length === canonicalRight.length &&
+    canonicalLeft.every((value, index) => value === canonicalRight[index])
+  )
+}
+
+function canonicalStringSet(values: string[]) {
+  return [...new Set(values)].sort()
+}
+
 async function persistRefreshedIndex(input: {
   index: CastIndex
   store: Store
@@ -292,9 +337,21 @@ async function processScannedFile(input: {
   const currentFingerprint = loaded.fingerprint
   const previousFile = input.index.files[input.relativePath]
   if (
-    canReuseFile(input.index, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords)
+    canReuseFile(
+      input.index,
+      input.state.symbolsByFilePath,
+      previousFile,
+      input.relativePath,
+      currentFingerprint,
+      input.state.canReuseExistingRecords,
+    )
   ) {
-    reuseFileRecords(input.index, previousFile, input.state)
+    const reused = reuseFileRecords(input.index, previousFile, input.state)
+    if (input.run()) {
+      await input.fileResultWriter.add(reused)
+    } else {
+      input.state.reusedFileResults.push(reused)
+    }
     return input.state.changed
   }
 
@@ -311,7 +368,7 @@ async function processScannedFile(input: {
   return true
 }
 
-function reuseFileRecords(index: CastIndex, file: FileRecord, state: RefreshState) {
+function reuseFileRecords(index: CastIndex, file: FileRecord, state: RefreshState): FileResult {
   state.nextFiles[file.path] = file
   const chunks: Record<string, ChunkRecord> = {}
   for (const chunkId of file.chunkIds) {
@@ -321,21 +378,24 @@ function reuseFileRecords(index: CastIndex, file: FileRecord, state: RefreshStat
     }
   }
   const symbols: Record<string, SymbolRecord> = {}
-  for (const symbol of Object.values(index.symbols).filter((symbol) => symbol.filePath === file.path)) {
+  for (const symbol of state.symbolsByFilePath.get(file.path) ?? []) {
     state.nextSymbols[symbol.id] = symbol
     symbols[symbol.id] = symbol
   }
-  state.reusedFileResults.push({ file, chunks, symbols })
+  return { file, chunks, symbols }
 }
 
 async function persistReusedFileResults(input: {
   reusedFileResults: FileResult[]
+  runStore: IndexRunStore | undefined
   run: () => { runId: string } | undefined
+  ensureRun: () => Promise<{ runId: string } | undefined>
   fileResultWriter: FileResultWriter
 }) {
-  if (!input.run()) {
+  if (input.reusedFileResults.length === 0 || !input.runStore) {
     return
   }
+  await input.ensureRun()
   for (const fileResult of input.reusedFileResults) {
     await input.fileResultWriter.add(fileResult)
   }
@@ -362,7 +422,14 @@ function canReuseCompletedFile(
     chunks: completed.chunks,
     symbols: completed.symbols,
   }
-  return canReuseFile(completedIndex, completed.file, relativePath, currentFingerprint, true)
+  return canReuseFile(
+    completedIndex,
+    symbolsByFilePath(completed.symbols),
+    completed.file,
+    relativePath,
+    currentFingerprint,
+    true,
+  )
 }
 
 function reuseCompletedFileRecords(completed: FileResult, state: RefreshState) {
@@ -490,7 +557,7 @@ function createEmbeddingBatcher(input: CreateIndexerInput): EmbeddingBatcher {
   type PendingEmbedding = { text: string; resolve: (result: EmbeddingResult) => void }
 
   const batchSize = Math.max(1, input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE)
-  const maxOutstanding = DEFAULT_EMBEDDING_BATCH_CONCURRENCY
+  const maxOutstanding = Math.max(1, input.options.embeddingBatchConcurrency ?? DEFAULT_EMBEDDING_BATCH_CONCURRENCY)
   const queue: PendingEmbedding[] = []
   const outstanding = new Set<Promise<void>>()
   let scheduled = false
@@ -588,20 +655,29 @@ async function embedChunks(input: {
   embeddingBatcher: EmbeddingBatcher
 }) {
   const fileChunks: CastIndex["chunks"] = {}
-  const embeddedChunks = await Promise.all(
-    input.chunks.map(async (chunk) => {
-      const embedded = await input.embeddingBatcher.embed(
-        embeddingText(
-          input.relativePath,
-          input.parsed.language,
-          chunk,
-          input.symbolsById,
-          input.input.options.chunking.expansion,
+  const embeddedChunks: Array<{ chunk: ChunkRecord; embedded: EmbeddingResult }> = new Array(input.chunks.length)
+  const concurrency =
+    Math.max(1, input.input.options.embeddingBatchConcurrency ?? DEFAULT_EMBEDDING_BATCH_CONCURRENCY) *
+    Math.max(1, input.input.options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE)
+  await mapWithConcurrency(
+    input.chunks.map((chunk, index) => ({ chunk, index })),
+    concurrency,
+    async ({ chunk, index }) => {
+      embeddedChunks[index] = {
+        chunk,
+        embedded: await input.embeddingBatcher.embed(
+          embeddingText(
+            input.relativePath,
+            input.parsed.language,
+            chunk,
+            input.symbolsById,
+            input.input.options.chunking.expansion,
+          ),
         ),
-      )
-      return { chunk, embedded }
-    }),
+      }
+    },
   )
+
   for (const { chunk, embedded } of embeddedChunks) {
     if ("embeddingError" in embedded) {
       input.fileDiagnostics.push(`embedding failed: ${embedded.embeddingError}`)
@@ -696,8 +772,22 @@ function isTextControlByte(byte: number) {
 
 const TEXT_CONTROL_BYTES = new Set([BYTE_BACKSPACE, BYTE_TAB, BYTE_LINE_FEED, BYTE_FORM_FEED, BYTE_CARRIAGE_RETURN])
 
+function symbolsByFilePath(symbols: Record<string, SymbolRecord>): SymbolsByFilePath {
+  const grouped: SymbolsByFilePath = new Map()
+  for (const symbol of Object.values(symbols)) {
+    const symbolsForFile = grouped.get(symbol.filePath)
+    if (symbolsForFile) {
+      symbolsForFile.push(symbol)
+    } else {
+      grouped.set(symbol.filePath, [symbol])
+    }
+  }
+  return grouped
+}
+
 function canReuseFile(
   index: CastIndex,
+  groupedSymbols: SymbolsByFilePath,
   file: CastIndex["files"][string] | undefined,
   relativePath: string,
   fingerprint: string,
@@ -725,9 +815,7 @@ function canReuseFile(
   ) {
     return false
   }
-  return Object.values(index.symbols)
-    .filter((symbol) => symbol.filePath === file.path)
-    .every((symbol) => validSymbolRecord(index, symbol, file.path))
+  return (groupedSymbols.get(file.path) ?? []).every((symbol) => validSymbolRecord(index, symbol, file.path))
 }
 
 function validSymbolRecord(index: CastIndex, symbol: SymbolRecord, filePath: string) {
@@ -802,12 +890,25 @@ function embeddingText(
 }
 
 async function scanFiles(root: string, includeGlobs: string[], excludeGlobs: string[]) {
-  const files = await walk(root, "", [], excludeGlobs)
-  return files.filter(
-    (file) =>
-      includeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })) &&
-      !excludeGlobs.some((pattern) => minimatch(file, pattern, { dot: true })),
-  )
+  const predicates = createScanPredicates(includeGlobs, excludeGlobs)
+  const files = await walk(root, predicates)
+  return files.filter((file) => predicates.includes(file) && !predicates.excludes(file))
+}
+
+function createScanPredicates(includeGlobs: string[], excludeGlobs: string[]): ScanPredicates {
+  const includes = includeGlobs.map((pattern) => new Minimatch(pattern, { dot: true }))
+  const excludes = excludeGlobs.map((pattern) => new Minimatch(pattern, { dot: true }))
+  return {
+    includes: (filePath) => includes.some((matcher) => matcher.match(filePath)),
+    excludes: (filePath) => excludes.some((matcher) => matcher.match(filePath)),
+    excludesDirectory: (relativePath) => {
+      const globPath = toGitignorePath(relativePath)
+      return excludes.some(
+        (matcher) =>
+          matcher.match(globPath) || matcher.match(`${globPath}/`) || matcher.match(`${globPath}/__placeholder__`),
+      )
+    },
+  }
 }
 
 async function mapWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>) {
@@ -847,43 +948,36 @@ async function loadGitignore(root: string, prefix: string): Promise<GitignoreMat
   return { base: prefix, matcher }
 }
 
-async function walk(
-  root: string,
-  prefix = "",
-  inheritedGitignores: GitignoreMatcher[] = [],
-  excludeGlobs: string[] = [],
-): Promise<string[]> {
-  const entries = await readdir(path.join(root, prefix), { withFileTypes: true })
-  const localGitignore = await loadGitignore(root, prefix)
-  const gitignores = localGitignore ? [...inheritedGitignores, localGitignore] : inheritedGitignores
-  const ignored = new Set([".git", "node_modules", "dist", "build", ".cache"])
-  const nested = await Promise.all(
-    entries
-      .filter((entry) => {
-        const relative = path.join(prefix, entry.name)
-        return !(
-          ignored.has(entry.name) ||
-          entry.isSymbolicLink() ||
-          isGitignored(relative, gitignores) ||
-          (entry.isDirectory() && isExcludedDirectory(relative, excludeGlobs))
-        )
-      })
-      .map((entry) => {
-        const relative = path.join(prefix, entry.name)
-        return entry.isDirectory() ? walk(root, relative, gitignores, excludeGlobs) : Promise.resolve([relative])
-      }),
-  )
-  return nested.flat()
-}
+async function walk(root: string, predicates: ScanPredicates): Promise<string[]> {
+  const files: string[] = []
+  const queue: WalkDirectory[] = [{ prefix: "", gitignores: [] }]
 
-function isExcludedDirectory(relativePath: string, excludeGlobs: string[]) {
-  const globPath = toGitignorePath(relativePath)
-  return excludeGlobs.some(
-    (pattern) =>
-      minimatch(globPath, pattern, { dot: true }) ||
-      minimatch(`${globPath}/`, pattern, { dot: true }) ||
-      minimatch(`${globPath}/__placeholder__`, pattern, { dot: true }),
-  )
+  while (queue.length > 0) {
+    const batch = queue.splice(0, queue.length)
+    await mapWithConcurrency(batch, DEFAULT_WALK_DIRECTORY_CONCURRENCY, async (directory) => {
+      const entries = await readdir(path.join(root, directory.prefix), { withFileTypes: true })
+      const localGitignore = await loadGitignore(root, directory.prefix)
+      const gitignores = localGitignore ? [...directory.gitignores, localGitignore] : directory.gitignores
+      for (const entry of entries) {
+        const relative = path.join(directory.prefix, entry.name)
+        if (
+          DEFAULT_IGNORED_DIRECTORIES.has(entry.name) ||
+          entry.isSymbolicLink() ||
+          isGitignored(relative, gitignores)
+        ) {
+          continue
+        }
+        if (entry.isDirectory()) {
+          if (!predicates.excludesDirectory(relative)) {
+            queue.push({ prefix: relative, gitignores })
+          }
+          continue
+        }
+        files.push(relative)
+      }
+    })
+  }
+  return files.sort()
 }
 
 function isGitignored(relativePath: string, gitignores: GitignoreMatcher[]) {

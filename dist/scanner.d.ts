@@ -30,6 +30,7 @@ export declare function createIndexer(input: {
         maxContextChars: number;
         chunking: ChunkingOptions;
         embeddingBatchSize?: number;
+        embeddingBatchConcurrency?: number;
     };
     store: Store;
     parse(filePath: string, source: string): Promise<{

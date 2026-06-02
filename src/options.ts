@@ -12,6 +12,7 @@ const ApiConfig = z.object({
 })
 const EmbeddingConfig = ApiConfig.extend({
   batchSize: z.number().int().positive().optional(),
+  concurrency: z.number().int().positive().optional(),
 })
 const RerankConfig = ApiConfig.omit({ dimensions: true }).extend({
   candidateMultiplier: z.number().int().positive().optional(),
@@ -83,6 +84,7 @@ const DEFAULT_MAX_FILE_BYTES = Number("2") * MIB
 const DEFAULT_MAX_CONTEXT_CHARS = 12_000
 const DEFAULT_TOP_K = 5
 const DEFAULT_EMBEDDING_BATCH_SIZE = 16
+const DEFAULT_EMBEDDING_CONCURRENCY = 1
 const DEFAULT_EXCLUDE_GLOBS = [
   "**/*.{png,jpg,jpeg,gif,webp,ico,pdf,zip,gz,tgz,tar,7z,mp4,mov,mp3,woff,woff2,ttf,eot}",
   "**/bun.lock",
@@ -276,6 +278,7 @@ function embeddingOptions(raw: ReturnType<typeof rawOptions>["embedding"], apiKe
         model: raw.model,
         dimensions: raw.dimensions,
         batchSize: raw.batchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE,
+        concurrency: raw.concurrency ?? DEFAULT_EMBEDDING_CONCURRENCY,
       }
     : undefined
 }
@@ -364,6 +367,7 @@ function parseEmbeddingConfig(input: unknown) {
   return {
     ...api,
     batchSize: safeField(EmbeddingFields.batchSize, inputRecord.data.batchSize),
+    concurrency: safeField(EmbeddingFields.concurrency, inputRecord.data.concurrency),
   }
 }
 

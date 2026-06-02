@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
 import castPlugin from "./index.js"
+import { parseOptions } from "./options.js"
 import { createCastPluginForTest } from "./plugin.js"
 import { createEmptyIndex } from "./store.js"
 
@@ -1617,12 +1618,10 @@ describe("cast plugin", () => {
     resolveStartupRefresh?.()
   })
 
-  test("ready metadata with mismatched scanner options skips startup refresh", async () => {
+  test("startup refreshes when maxFileBytes differs", async () => {
     let refreshes = 0
     const ready = emptyReadyIndex()
-    ready.metadata.includeGlobs = ["src/**/*.ts"]
-    ready.metadata.excludeGlobs = ["generated/**"]
-    ready.metadata.maxFileBytes = 1024
+    ready.metadata.maxFileBytes = 123
     const plugin = createCastPluginForTest({
       createIndexer: () => ({
         refresh: async () => {
@@ -1635,27 +1634,126 @@ describe("cast plugin", () => {
         read: async () => emptyReadyIndex(),
         write: async () => undefined,
       }),
-      retrieve: async () => ({
-        status: searchStatus(),
-        results: [],
-        diagnostics: [],
+    })
+    await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      maxFileBytes: 456,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(refreshes).toBe(1)
+  })
+
+  test("startup refreshes when includeGlobs differ", async () => {
+    let refreshes = 0
+    const ready = emptyReadyIndex()
+    ready.metadata.includeGlobs = ["src/**/*.ts"]
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          return emptyReadyIndex()
+        },
+      }),
+      createStore: () => ({
+        readMetadata: async () => ready.metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
       }),
     })
-    const hooks = await plugin(input as never, {
+    await plugin(input as never, {
       embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      includeGlobs: ["lib/**/*.ts"],
     })
+    await new Promise((resolve) => setTimeout(resolve, 0))
 
-    await semanticSearchTool(hooks).execute({ query: "session" }, {
-      worktree: "/repo",
-      directory: "/repo",
-    } as never)
+    expect(refreshes).toBe(1)
+  })
+
+  test("startup refreshes when excludeGlobs differ", async () => {
+    let refreshes = 0
+    const ready = emptyReadyIndex()
+    ready.metadata.excludeGlobs = ["generated/**"]
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          return emptyReadyIndex()
+        },
+      }),
+      createStore: () => ({
+        readMetadata: async () => ready.metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
+    })
+    await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      excludeGlobs: ["dist/**"],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(refreshes).toBe(1)
+  })
+
+  test("startup does not refresh when includeGlobs contain the same patterns in a different order", async () => {
+    let refreshes = 0
+    const ready = emptyReadyIndex()
+    ready.metadata.includeGlobs = ["lib/**/*.ts", "src/**/*.ts"]
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          return emptyReadyIndex()
+        },
+      }),
+      createStore: () => ({
+        readMetadata: async () => ready.metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
+    })
+    await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      includeGlobs: ["src/**/*.ts", "lib/**/*.ts"],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect(refreshes).toBe(0)
   })
 
-  test("legacy ready metadata skips startup refresh when current scanner options are customized", async () => {
+  test("startup does not refresh when excludeGlobs contain the same patterns in a different order", async () => {
     let refreshes = 0
     const ready = emptyReadyIndex()
+    ready.metadata.excludeGlobs = ["dist/**", "generated/**"]
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: async () => {
+          refreshes += 1
+          return emptyReadyIndex()
+        },
+      }),
+      createStore: () => ({
+        readMetadata: async () => ready.metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
+    })
+    await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+      excludeGlobs: ["generated/**", "dist/**"],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(refreshes).toBe(0)
+  })
+
+  test("startup refreshes when legacy metadata lacks scanner options", async () => {
+    let refreshes = 0
+    const ready = emptyReadyIndex()
+    ready.metadata.maxFileBytes = undefined
+    ready.metadata.includeGlobs = undefined
+    ready.metadata.excludeGlobs = undefined
     const plugin = createCastPluginForTest({
       createIndexer: () => ({
         refresh: async () => {
@@ -1684,7 +1782,7 @@ describe("cast plugin", () => {
       directory: "/repo",
     } as never)
 
-    expect(refreshes).toBe(0)
+    expect(refreshes).toBe(1)
   })
 
   test("refresh true waits for startup refresh before forcing another refresh", async () => {
@@ -1982,12 +2080,14 @@ describe("cast plugin", () => {
       maxChunkNonWhitespaceChars: 2000,
       maxFileBytes: 2 * 1024 * 1024,
       includeGlobs: ["**/*"],
-      excludeGlobs: expect.arrayContaining(["**/bun.lock"]),
+      excludeGlobs: expect.any(Array),
       topK: 5,
       maxContextChars: 12_000,
       chunking: { overlap: 2, expansion: true, minSemanticNonWhitespaceChars: 16 },
       embeddingBatchSize: 16,
+      embeddingBatchConcurrency: 1,
     })
+    expect((indexerOptions as { excludeGlobs: string[] }).excludeGlobs).toContain("**/bun.lock")
     expect(Object.keys(semanticSearchTool(hooks).args)).not.toContain("chunking")
   })
 
@@ -2266,6 +2366,7 @@ describe("cast plugin", () => {
 })
 
 function emptyReadyIndex() {
+  const options = parseOptions({})
   const index = createEmptyIndex({
     projectId: "p",
     worktree: "/repo",
@@ -2273,6 +2374,9 @@ function emptyReadyIndex() {
     maxChunkNonWhitespaceChars: 2000,
   })
   index.metadata.status = "ready"
+  index.metadata.maxFileBytes = options.maxFileBytes
+  index.metadata.includeGlobs = options.includeGlobs
+  index.metadata.excludeGlobs = options.excludeGlobs
   return index
 }
 
@@ -2293,7 +2397,7 @@ function recordEventAndReturnIndex(events: string[], event: string) {
 }
 
 function searchStatus(
-  metadata = emptyReadyIndex().metadata,
+  metadata = compactReadyMetadata(),
   overrides: Partial<{
     hydeUsed: boolean
     rerankUsed: boolean
@@ -2311,6 +2415,12 @@ function searchStatus(
     candidateCount: 0,
     ...overrides,
   }
+}
+
+function compactReadyMetadata() {
+  const metadata = { ...emptyReadyIndex().metadata }
+  metadata.excludeGlobs = ["**/bun.lock"]
+  return metadata
 }
 
 function semanticSearchTool(hooks: Awaited<ReturnType<typeof castPlugin>>) {

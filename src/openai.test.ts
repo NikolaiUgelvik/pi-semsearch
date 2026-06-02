@@ -73,6 +73,46 @@ describe("createOpenAIClient", () => {
     expect(bodies).toEqual([{ model: "embed", input: ["first", "second"] }])
   })
 
+  test("retries transient embedding failures", async () => {
+    let calls = 0
+    const client = createOpenAIClient({
+      fetch: async () => {
+        calls++
+        return calls === 1
+          ? new Response("rate limited", { status: 429 })
+          : Response.json({ data: [{ embedding: [1] }] })
+      },
+    })
+
+    await expect(
+      client.embed({
+        baseURL: "https://example.test/v1",
+        model: "embed",
+        input: "hello",
+      }),
+    ).resolves.toEqual([1])
+    expect(calls).toBe(2)
+  })
+
+  test("does not retry permanent embedding failures", async () => {
+    let calls = 0
+    const client = createOpenAIClient({
+      fetch: async () => {
+        calls++
+        return new Response("bad request", { status: 400 })
+      },
+    })
+
+    await expect(
+      client.embed({
+        baseURL: "https://example.test/v1",
+        model: "embed",
+        input: "hello",
+      }),
+    ).rejects.toThrow("Embedding request failed: 400")
+    expect(calls).toBe(1)
+  })
+
   test("generates HyDE text with chat completions", async () => {
     const calls: unknown[] = []
     const client = createOpenAIClient({

@@ -3,6 +3,11 @@ import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>
 
 const TRAILING_SLASHES_PATTERN = /\/+$/
+const EMBEDDING_RETRIES = 2
+const EMBEDDING_RETRY_DELAY_MS = 10
+const HTTP_REQUEST_TIMEOUT = 408
+const HTTP_TOO_MANY_REQUESTS = 429
+const HTTP_SERVER_ERROR_MIN = 500
 
 export function createOpenAIClient(options: { fetch?: FetchLike } = {}) {
   const request = options.fetch ?? fetch
@@ -42,10 +47,10 @@ async function requestEmbeddings(
   request: FetchLike,
   input: { baseURL: string; apiKey?: string; model: string; dimensions?: number; input: string | string[] },
 ) {
-  const body = await requestJson(
+  const body = await requestJsonWithRetries({
     request,
-    `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`,
-    {
+    url: `${input.baseURL.replace(TRAILING_SLASHES_PATTERN, "")}/embeddings`,
+    init: {
       method: "POST",
       headers: buildHeaders(input.apiKey),
       body: JSON.stringify({
@@ -54,8 +59,9 @@ async function requestEmbeddings(
         ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
       }),
     },
-    "Embedding",
-  )
+    label: "Embedding",
+    retries: EMBEDDING_RETRIES,
+  })
   return body
 }
 
@@ -113,6 +119,35 @@ async function requestJson(request: FetchLike, url: string, init: RequestInit, l
     throw new Error(`${label} request failed: ${response.status}`)
   }
   return response.json().catch(() => undefined)
+}
+
+function requestJsonWithRetries(input: {
+  request: FetchLike
+  url: string
+  init: RequestInit
+  label: string
+  retries: number
+}) {
+  const attemptRequest = async (attempt: number): Promise<unknown> => {
+    const response = await input.request(input.url, input.init)
+    if (response.ok) {
+      return response.json().catch(() => undefined)
+    }
+    if (attempt >= input.retries || !isTransientEmbeddingStatus(response.status)) {
+      throw new Error(`${input.label} request failed: ${response.status}`)
+    }
+    await delay(EMBEDDING_RETRY_DELAY_MS * (attempt + 1))
+    return attemptRequest(attempt + 1)
+  }
+  return attemptRequest(0)
+}
+
+function isTransientEmbeddingStatus(status: number) {
+  return status === HTTP_REQUEST_TIMEOUT || status === HTTP_TOO_MANY_REQUESTS || status >= HTTP_SERVER_ERROR_MIN
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function embeddingFromBody(body: unknown) {

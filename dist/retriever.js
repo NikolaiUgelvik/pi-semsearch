@@ -245,15 +245,24 @@ async function rerankedSearch(input) {
     };
 }
 async function outputResults(input) {
-    const results = await Promise.all(input.results.flatMap((result) => outputResult(input, result)));
+    const sourceCache = new Map();
+    const sourceReadFailures = new Set();
+    const results = await Promise.all(input.results.flatMap((result) => outputResult(input, result, sourceCache, sourceReadFailures)));
     return omitDuplicateParentRanges(results.flat());
 }
-async function outputResult(input, result) {
+async function outputResult(input, result, sourceCache, sourceReadFailures) {
     const chunk = input.chunksById[result.id];
     if (!chunk) {
         return [];
     }
-    const source = await sourceForChunk(input.input, chunk, input.diagnostics, input.diagnosticDetails);
+    const source = await sourceForChunk({
+        input: input.input,
+        chunk,
+        diagnostics: input.diagnostics,
+        diagnosticDetails: input.diagnosticDetails,
+        sourceCache,
+        sourceReadFailures,
+    });
     const sourceMatches = source.ok && chunkMatchesSource(source.text, chunk);
     if (source.ok && !sourceMatches) {
         addSourceDiagnostic(input.diagnostics, input.diagnosticDetails, {
@@ -286,17 +295,30 @@ async function outputResult(input, result) {
         },
     ];
 }
-function sourceForChunk(input, chunk, diagnostics, diagnosticDetails) {
-    return input
-        .readSource(chunk.filePath)
-        .then((text) => ({ text, ok: true }))
-        .catch(() => {
-        addSourceDiagnostic(diagnostics, diagnosticDetails, {
-            chunk,
+function sourceForChunk(input) {
+    const filePath = input.chunk.filePath;
+    let source = input.sourceCache.get(filePath);
+    if (!source) {
+        source = input.input
+            .readSource(filePath)
+            .then((text) => ({ text, ok: true }))
+            .catch(() => ({ text: "", ok: false }));
+        input.sourceCache.set(filePath, source);
+    }
+    return source.then((result) => {
+        if (result.ok) {
+            return result;
+        }
+        if (input.sourceReadFailures.has(filePath)) {
+            return result;
+        }
+        input.sourceReadFailures.add(filePath);
+        addSourceDiagnostic(input.diagnostics, input.diagnosticDetails, {
+            chunk: input.chunk,
             code: "source.read_failed",
-            message: `source read failed for ${chunk.filePath}; parent context omitted`,
+            message: `source read failed for ${input.chunk.filePath}; parent context omitted`,
         });
-        return { text: "", ok: false };
+        return result;
     });
 }
 function addSourceDiagnostic(diagnostics, diagnosticDetails, detail) {
@@ -316,7 +338,7 @@ function omitDuplicateParentRange(result, seenParentRanges) {
     if (!result.parentRange) {
         return result;
     }
-    const parentRangeKey = `${result.filePath}:${result.parentRange.byteStart}:${result.parentRange.byteEnd}:${result.parentText}`;
+    const parentRangeKey = `${result.filePath}\0${result.parentRange.byteStart}\0${result.parentRange.byteEnd}`;
     if (seenParentRanges.has(parentRangeKey)) {
         return { ...result, parentText: undefined, parentRange: undefined };
     }

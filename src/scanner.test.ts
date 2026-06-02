@@ -653,6 +653,54 @@ describe("createIndexer", () => {
     }
   })
 
+  test("reuses file symbols through a per-file symbol index", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export function alpha() { return 1 }\n")
+      await Bun.write(path.join(dir, "b.ts"), "export function beta() { return 2 }\n")
+      let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
+      const parseCalls: string[] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async (filePath, source) => {
+          parseCalls.push(path.basename(filePath))
+          return {
+            language: "typescript",
+            root: {
+              type: "program",
+              startIndex: 0,
+              endIndex: source.length,
+              children: [{ type: "function_declaration", startIndex: 0, endIndex: source.length, children: [] }],
+            },
+          }
+        },
+        embed: async () => [1, 0, 0],
+      })
+
+      await indexer.refresh()
+      const previousSymbols = index.symbols
+      await indexer.refresh()
+
+      expect(index.symbols).toEqual(previousSymbols)
+      expect(parseCalls.sort()).toEqual(["a.ts", "b.ts"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("updates a changed ready SQLite index with a replacement run", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
@@ -1191,6 +1239,65 @@ describe("createIndexer", () => {
     }
   })
 
+  test("indexes deep files without traversing excluded subtrees", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const deepPathSegments = Array.from({ length: 40 }, (_, index) => `level-${index}`)
+      const current = path.join(dir, ...deepPathSegments)
+      await mkdir(current, { recursive: true })
+      await Bun.write(path.join(current, "deep.ts"), "export const deepValue = 1\n")
+      await mkdir(path.join(dir, "ignored", "nested"), { recursive: true })
+      await Bun.write(path.join(dir, "ignored", "nested", "skip.ts"), "export const skipped = 1\n")
+
+      const index = await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: ["ignored/**"],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: createMemoryStore(),
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0, 0],
+      }).refresh()
+
+      expect(Object.keys(index.files)).toEqual([`${deepPathSegments.join("/")}/deep.ts`])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("scan predicates preserve include and exclude glob semantics", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await mkdir(path.join(dir, "src"), { recursive: true })
+      await mkdir(path.join(dir, "vendor"), { recursive: true })
+      await Bun.write(path.join(dir, "src", "keep.ts"), "export const keep = 1\n")
+      await Bun.write(path.join(dir, "src", "drop.map"), "{}\n")
+      await Bun.write(path.join(dir, "vendor", "skip.ts"), "export const skip = 1\n")
+
+      const index = await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["src/**"],
+          excludeGlobs: ["**/*.map", "vendor/**"],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: createMemoryStore(),
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0, 0],
+      }).refresh()
+
+      expect(Object.keys(index.files)).toEqual(["src/keep.ts"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("skips default language artifact directories without traversing them", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const pycacheDir = path.join(dir, "__pycache__")
@@ -1394,6 +1501,39 @@ describe("createIndexer", () => {
       expect(index.symbols).toEqual(previousSymbols)
     } finally {
       await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("persists refreshed scanner metadata when file contents are unchanged", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 })
+      const makeIndexer = (maxFileBytes: number) =>
+        createIndexer({
+          worktree: dir,
+          options: {
+            maxChunkNonWhitespaceChars: 2000,
+            maxFileBytes,
+            includeGlobs: ["**/*.ts"],
+            excludeGlobs: [],
+            topK: 5,
+            maxContextChars: 12_000,
+          },
+          store,
+          parse: async () => ({ language: "typescript", root: undefined }),
+          embed: async () => [1, 0],
+        })
+
+      await makeIndexer(123).refresh()
+      await makeIndexer(456).refresh()
+      const metadata = await store.readMetadata()
+
+      expect(metadata.maxFileBytes).toBe(456)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
     }
   })
 
@@ -2252,6 +2392,51 @@ describe("createIndexer", () => {
         [2, 0],
         [2, 1],
       ])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("uses configured concurrency for embedding batches", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "a.txt"), "abcdef\n")
+      let active = 0
+      let maxActive = 0
+      const store = createMemoryStore(
+        createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 }),
+      )
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 1,
+          maxFileBytes: 1024,
+          includeGlobs: ["**/*.txt"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          embeddingBatchSize: 1,
+          embeddingBatchConcurrency: 2,
+          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
+        },
+        store,
+        parse: async () => ({ language: "text", root: undefined }),
+        embed: async () => {
+          throw new Error("single embedding should not be used")
+        },
+        embedBatch: async (texts) => {
+          active++
+          maxActive = Math.max(maxActive, active)
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          active--
+          return texts.map((_, index) => [active, index])
+        },
+      })
+
+      await indexer.refresh()
+
+      expect(maxActive).toBeGreaterThan(1)
+      expect(maxActive).toBeLessThanOrEqual(2)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

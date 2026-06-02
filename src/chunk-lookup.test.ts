@@ -215,6 +215,73 @@ describe("chunk lookup", () => {
     expect(output.chunk?.related.childrenPage).toEqual({ offset: 1, limit: 1, total: 3, hasMore: true })
   })
 
+  test("returns only requested child page entries", async () => {
+    // Store hydration may still load full topology before this function receives the index;
+    // this test protects the response assembly boundary until store-side paging is added.
+    const index = createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+    })
+    index.metadata.status = "ready"
+    const source = ["function parent() {", ...Array.from({ length: 50 }, (_, child) => `  child${child}()`), "}"].join(
+      "\n",
+    )
+    index.chunks.parent = {
+      id: "parent",
+      filePath: "src/parent.ts",
+      language: "typescript",
+      kind: "function",
+      range: { byteStart: 0, byteEnd: source.length, lineStart: 1, lineEnd: 52 },
+      text: source,
+      nonWhitespaceChars: 400,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: Array.from({ length: 50 }, (_, child) => `child-${child}`),
+    }
+    for (let child = 0; child < 50; child += 1) {
+      const text = `child${child}()`
+      const start = source.indexOf(text)
+      index.chunks[`child-${child}`] = {
+        id: `child-${child}`,
+        filePath: "src/parent.ts",
+        language: "typescript",
+        kind: "block",
+        range: { byteStart: start, byteEnd: start + text.length, lineStart: child + 2, lineEnd: child + 2 },
+        text,
+        nonWhitespaceChars: text.length,
+        nodeTypes: [],
+        symbolIds: [],
+        parentChunkId: "parent",
+        childChunkIds: [],
+      }
+    }
+
+    const output = await getChunkById({
+      index,
+      input: {
+        id: "parent",
+        includeChildren: true,
+        includeParents: false,
+        includeSiblings: false,
+        childrenOffset: 10,
+        childrenLimit: 5,
+        maxContextChars: 100,
+      },
+      readSource: async () => source,
+    })
+
+    expect(output.chunk?.related.children.map((child) => child.id)).toEqual([
+      "child-10",
+      "child-11",
+      "child-12",
+      "child-13",
+      "child-14",
+    ])
+    expect(output.chunk?.related.childrenPage).toEqual({ offset: 10, limit: 5, total: 50, hasMore: true })
+  })
+
   test("caps default related child pages and parent context", async () => {
     const index = createEmptyIndex({
       projectId: "p",

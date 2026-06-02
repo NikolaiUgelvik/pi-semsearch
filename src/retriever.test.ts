@@ -1721,6 +1721,131 @@ describe("retrieve", () => {
     expect(output.diagnostics).toContain("source mismatch for a.ts:c1; parent context omitted")
   })
 
+  test("reads shared result source once per search", async () => {
+    const index = createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+    })
+    index.metadata.status = "ready"
+    index.files["same.ts"] = {
+      path: "same.ts",
+      language: "typescript",
+      fingerprint: "test",
+      chunkIds: ["one", "two"],
+      diagnostics: [],
+    }
+    index.chunks.one = {
+      id: "one",
+      filePath: "same.ts",
+      language: "typescript",
+      kind: "block",
+      range: { byteStart: 0, byteEnd: 20, lineStart: 1, lineEnd: 1 },
+      text: "export const one = 1",
+      nonWhitespaceChars: 16,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: [],
+      embedding: [1, 0, 0],
+    }
+    index.chunks.two = {
+      id: "two",
+      filePath: "same.ts",
+      language: "typescript",
+      kind: "block",
+      range: { byteStart: 21, byteEnd: 41, lineStart: 2, lineEnd: 2 },
+      text: "export const two = 2",
+      nonWhitespaceChars: 16,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: [],
+      embedding: [0.9, 0, 0],
+    }
+    addLexicalStats(index)
+    let reads = 0
+    const output = await retrieveFromIndex({
+      index,
+      input: { query: "const", topK: 2 },
+      options: { topK: 2, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0, 0],
+      generateHyde: async () => "",
+      rerank: undefined,
+      readSource: async () => {
+        reads += 1
+        return "export const one = 1\nexport const two = 2\n"
+      },
+    })
+
+    expect(output.results.map((result) => result.filePath)).toEqual(["same.ts", "same.ts"])
+    expect(reads).toBe(1)
+  })
+
+  test("reports shared source read failed diagnostic once per file", async () => {
+    const index = createEmptyIndex({
+      projectId: "p",
+      worktree: "/repo",
+      cacheKey: "key",
+      maxChunkNonWhitespaceChars: 2000,
+    })
+    index.metadata.status = "ready"
+    index.files["same.ts"] = {
+      path: "same.ts",
+      language: "typescript",
+      fingerprint: "test",
+      chunkIds: ["one", "two"],
+      diagnostics: [],
+    }
+    index.chunks.one = {
+      id: "one",
+      filePath: "same.ts",
+      language: "typescript",
+      kind: "block",
+      range: { byteStart: 0, byteEnd: 20, lineStart: 1, lineEnd: 1 },
+      text: "export const one = 1",
+      nonWhitespaceChars: 16,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: [],
+      embedding: [1, 0, 0],
+    }
+    index.chunks.two = {
+      id: "two",
+      filePath: "same.ts",
+      language: "typescript",
+      kind: "block",
+      range: { byteStart: 21, byteEnd: 41, lineStart: 2, lineEnd: 2 },
+      text: "export const two = 2",
+      nonWhitespaceChars: 16,
+      nodeTypes: [],
+      symbolIds: [],
+      childChunkIds: [],
+      embedding: [0.9, 0, 0],
+    }
+    addLexicalStats(index)
+
+    const output = await retrieveFromIndex({
+      index,
+      input: { query: "const", topK: 2 },
+      options: { topK: 2, maxContextChars: 100, hyde: { enabled: false, threshold: 0.5 } },
+      embed: async () => [1, 0, 0],
+      generateHyde: async () => "",
+      rerank: undefined,
+      readSource: async () => {
+        throw new Error("read failed")
+      },
+    })
+
+    const message = "source read failed for same.ts; parent context omitted"
+    expect(output.results.map((result) => result.filePath)).toEqual(["same.ts", "same.ts"])
+    expect(output.diagnostics.filter((diagnostic) => diagnostic === message)).toHaveLength(1)
+    expect(output.diagnosticDetails?.filter((diagnostic) => diagnostic.message === message)).toHaveLength(1)
+    expect(output.diagnosticDetails?.find((diagnostic) => diagnostic.message === message)).toMatchObject({
+      code: "source.read_failed",
+      filePath: "same.ts",
+    })
+  })
+
   test("suppresses duplicate parent context for repeated parent ranges", async () => {
     const index = createEmptyIndex({
       projectId: "p",
@@ -1780,7 +1905,7 @@ describe("retrieve", () => {
     expect(output.results[1].parentRange).toBeUndefined()
   })
 
-  test("keeps distinct compact parent excerpts for oversized repeated parent ranges", async () => {
+  test("suppresses compact parent excerpts for repeated parent ranges", async () => {
     const index = createEmptyIndex({
       projectId: "p",
       worktree: "/repo",
@@ -1844,9 +1969,8 @@ describe("retrieve", () => {
     })
 
     expect(output.results[0].parentText).toContain("aLongName")
-    expect(output.results[1].parentText).toContain("bLongName")
-    expect(output.results[0].parentText).not.toBe(output.results[1].parentText)
-    expect(output.results[1].parentRange).toEqual(index.symbols.s1.range)
+    expect(output.results[1].parentText).toBeUndefined()
+    expect(output.results[1].parentRange).toBeUndefined()
   })
 
   test("parallel hybrid returns a BM25-only exact identifier match when vector score is weak", async () => {
