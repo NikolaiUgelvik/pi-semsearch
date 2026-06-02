@@ -22,6 +22,7 @@ const DEFAULT_FILE_CONCURRENCY = 4;
 const DEFAULT_FILE_RESULT_WRITE_BATCH_SIZE = 32;
 const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", ".cache"]);
 const DEFAULT_WALK_DIRECTORY_CONCURRENCY = 16;
+const TRAILING_SLASHES = /\/+$/;
 export function createIndexer(input) {
     return {
         async refresh() {
@@ -50,6 +51,7 @@ export function createIndexer(input) {
                 metadataDiagnosticDetails,
                 reusedFileResults: [],
                 canReuseExistingRecords,
+                reusedRecordsChanged: false,
                 changed,
             };
             let run;
@@ -96,11 +98,11 @@ export function createIndexer(input) {
             const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, metadataDiagnostics);
             const hasDiagnosticDetailsChange = stableStringify(index.metadata.diagnosticDetails ?? []) !== stableStringify(metadataDiagnosticDetails);
             const hasScannerOptionsChange = !sameScannerOptions(index.metadata, input.options);
-            if (canSkipRefresh(index, input.worktree, changed, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange || hasDiagnosticDetailsChange || hasScannerOptionsChange)) {
+            if (canSkipRefresh(index, input.worktree, changed || state.reusedRecordsChanged, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange || hasDiagnosticDetailsChange || hasScannerOptionsChange)) {
                 return index;
             }
-            await persistReusedFileResults({
-                reusedFileResults: state.reusedFileResults,
+            await flushQueuedReusedFileResults({
+                state,
                 runStore,
                 run: () => run,
                 ensureRun,
@@ -165,20 +167,8 @@ function unchangedIndexShape(index, worktree, canReuseExistingRecords, hasFileSe
 }
 function sameScannerOptions(metadata, options) {
     return (metadata.maxFileBytes === options.maxFileBytes &&
-        sameStringSet(metadata.includeGlobs, options.includeGlobs) &&
-        sameStringSet(metadata.excludeGlobs, options.excludeGlobs));
-}
-function sameStringSet(left, right) {
-    if (!left) {
-        return false;
-    }
-    const canonicalLeft = canonicalStringSet(left);
-    const canonicalRight = canonicalStringSet(right);
-    return (canonicalLeft.length === canonicalRight.length &&
-        canonicalLeft.every((value, index) => value === canonicalRight[index]));
-}
-function canonicalStringSet(values) {
-    return [...new Set(values)].sort();
+        sameStringArray(metadata.includeGlobs, options.includeGlobs) &&
+        sameStringArray(metadata.excludeGlobs, options.excludeGlobs));
 }
 async function persistRefreshedIndex(input) {
     const run = input.run() ?? (input.runStore ? await input.ensureRun() : undefined);
@@ -211,6 +201,7 @@ async function processScannedFile(input) {
         return input.state.changed;
     }
     const activeRun = await input.ensureRun();
+    await flushQueuedReusedFileResults(input);
     const completed = activeRun
         ? await completedFileResult(input.runStore, activeRun.runId, input.relativePath, currentFingerprint)
         : undefined;
@@ -231,20 +222,61 @@ function reuseFileRecords(index, file, state) {
         }
     }
     const symbols = {};
-    for (const symbol of state.symbolsByFilePath.get(file.path) ?? []) {
-        state.nextSymbols[symbol.id] = symbol;
-        symbols[symbol.id] = symbol;
+    const referencedSymbolIds = referencedSymbolsForReusedChunks(index, file.path, chunks);
+    for (const symbolId of referencedSymbolIds) {
+        const symbol = index.symbols[symbolId];
+        if (symbol) {
+            const retainedSymbol = retainedSymbolRecord(index, symbol, referencedSymbolIds);
+            state.nextSymbols[retainedSymbol.id] = retainedSymbol;
+            symbols[retainedSymbol.id] = retainedSymbol;
+        }
+    }
+    if (reusedSymbolsChanged(state.symbolsByFilePath.get(file.path) ?? [], Object.values(symbols))) {
+        state.reusedRecordsChanged = true;
     }
     return { file, chunks, symbols };
 }
-async function persistReusedFileResults(input) {
-    if (input.reusedFileResults.length === 0 || !input.runStore) {
+function reusedSymbolsChanged(originalSymbols, retainedSymbols) {
+    return (stableStringify(symbolsForComparison(originalSymbols)) !== stableStringify(symbolsForComparison(retainedSymbols)));
+}
+function symbolsForComparison(symbols) {
+    return [...symbols].sort((left, right) => left.id.localeCompare(right.id));
+}
+function referencedSymbolsForReusedChunks(index, filePath, chunks) {
+    const referenced = new Set();
+    const queue = Object.values(chunks).flatMap((chunk) => chunk.symbolIds);
+    while (queue.length > 0) {
+        const symbolId = queue.shift();
+        if (!symbolId) {
+            continue;
+        }
+        if (referenced.has(symbolId) || !validSymbolId(index, symbolId, filePath)) {
+            continue;
+        }
+        referenced.add(symbolId);
+        const symbol = index.symbols[symbolId];
+        if (symbol.parentSymbolId) {
+            queue.push(symbol.parentSymbolId);
+        }
+    }
+    return referenced;
+}
+function retainedSymbolRecord(index, symbol, retainedSymbolIds) {
+    return {
+        ...symbol,
+        childSymbolIds: symbol.childSymbolIds.filter((id) => retainedSymbolIds.has(id) && index.symbols[id]?.parentSymbolId === symbol.id),
+    };
+}
+async function flushQueuedReusedFileResults(input) {
+    if (input.state.reusedFileResults.length === 0 || !input.runStore) {
         return;
     }
     await input.ensureRun();
-    for (const fileResult of input.reusedFileResults) {
+    const queued = input.state.reusedFileResults.splice(0);
+    for (const fileResult of queued) {
         await input.fileResultWriter.add(fileResult);
     }
+    await input.fileResultWriter.flush();
 }
 function completedFileResult(runStore, runId, relativePath, currentFingerprint) {
     return runStore?.getCompletedFile(runId, relativePath, currentFingerprint);
@@ -575,6 +607,9 @@ function sameChunkingOptions(left, right) {
         left.minSemanticNonWhitespaceChars === right.minSemanticNonWhitespaceChars);
 }
 function sameStringArray(left, right) {
+    if (!left) {
+        return false;
+    }
     return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 function hasDanglingChunkReference(index, chunk, chunkIds) {
@@ -607,14 +642,24 @@ async function scanFiles(root, includeGlobs, excludeGlobs) {
 function createScanPredicates(includeGlobs, excludeGlobs) {
     const includes = includeGlobs.map((pattern) => new Minimatch(pattern, { dot: true }));
     const excludes = excludeGlobs.map((pattern) => new Minimatch(pattern, { dot: true }));
+    const directoryExcludes = excludeGlobs
+        .filter((pattern) => canPruneDirectoryForExclude(pattern))
+        .map((pattern) => new Minimatch(pattern, { dot: true }));
     return {
         includes: (filePath) => includes.some((matcher) => matcher.match(filePath)),
         excludes: (filePath) => excludes.some((matcher) => matcher.match(filePath)),
         excludesDirectory: (relativePath) => {
             const globPath = toGitignorePath(relativePath);
-            return excludes.some((matcher) => matcher.match(globPath) || matcher.match(`${globPath}/`) || matcher.match(`${globPath}/__placeholder__`));
+            return directoryExcludes.some((matcher) => matcher.match(globPath) || matcher.match(`${globPath}/`));
         },
     };
+}
+function canPruneDirectoryForExclude(pattern) {
+    const normalizedPattern = pattern.replaceAll("\\", "/").replace(TRAILING_SLASHES, "");
+    if (normalizedPattern.endsWith("/**")) {
+        return true;
+    }
+    return !new Minimatch(pattern, { dot: true }).hasMagic();
 }
 async function mapWithConcurrency(items, concurrency, worker) {
     let next = 0;

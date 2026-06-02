@@ -582,22 +582,16 @@ function canUseReadyIndexForStartup(metadata, worktree, options) {
     return (metadata.status === "ready" &&
         metadata.worktree === worktree &&
         metadata.maxFileBytes === options.maxFileBytes &&
-        sameStringSet(metadata.includeGlobs, options.includeGlobs) &&
-        sameStringSet(metadata.excludeGlobs, options.excludeGlobs) &&
+        sameStringArray(metadata.includeGlobs, options.includeGlobs) &&
+        sameStringArray(metadata.excludeGlobs, options.excludeGlobs) &&
         metadata.maxChunkNonWhitespaceChars === options.maxChunkNonWhitespaceChars &&
         sameStartupChunking(metadata.chunking, options.chunking));
 }
-function sameStringSet(left, right) {
+function sameStringArray(left, right) {
     if (!left) {
         return false;
     }
-    const canonicalLeft = canonicalStringSet(left);
-    const canonicalRight = canonicalStringSet(right);
-    return (canonicalLeft.length === canonicalRight.length &&
-        canonicalLeft.every((value, index) => value === canonicalRight[index]));
-}
-function canonicalStringSet(values) {
-    return [...new Set(values)].sort();
+    return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 function sameStartupChunking(left, right) {
     return (left.overlap === right.overlap &&

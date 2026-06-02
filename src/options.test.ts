@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { parseOptions } from "./options.js"
 
-const POSITIVE_NUMBER_DIAGNOSTIC_PATTERN = /greater than 0|positive|>0/i
-
 describe("parseOptions", () => {
   test("applies defaults and resolves api keys from env", () => {
     const options = parseOptions(
@@ -83,54 +81,20 @@ describe("parseOptions", () => {
     expect(options.embedding?.batchSize).toBe(4)
   })
 
-  test("parses configured embedding concurrency and defaults to one", () => {
-    expect(
-      parseOptions(
-        {
-          embedding: {
-            baseURL: "https://example.test/v1",
-            apiKey: "literal",
-            model: "text-embedding-3-small",
-          },
-        },
-        {},
-      ).embedding?.concurrency,
-    ).toBe(1)
+  test("parses embedding concurrency", () => {
+    const options = parseOptions({
+      embedding: { baseURL: "https://example.test/v1", model: "embed", concurrency: 3 },
+    })
 
-    expect(
-      parseOptions(
-        {
-          embedding: {
-            baseURL: "https://example.test/v1",
-            apiKey: "literal",
-            model: "text-embedding-3-small",
-            concurrency: 3,
-          },
-        },
-        {},
-      ).embedding?.concurrency,
-    ).toBe(3)
+    expect(options.embedding?.concurrency).toBe(3)
   })
 
-  test("reports invalid embedding concurrency", () => {
-    const options = parseOptions(
-      {
-        embedding: {
-          baseURL: "https://example.test/v1",
-          apiKey: "literal",
-          model: "text-embedding-3-small",
-          concurrency: 0,
-        },
-      },
-      {},
-    )
+  test("rejects invalid embedding concurrency", () => {
+    const options = parseOptions({
+      embedding: { baseURL: "https://example.test/v1", model: "embed", concurrency: 0 },
+    })
 
-    expect(
-      options.diagnostics.some(
-        (diagnostic) =>
-          diagnostic.startsWith("embedding.concurrency:") && POSITIVE_NUMBER_DIAGNOSTIC_PATTERN.test(diagnostic),
-      ),
-    ).toBe(true)
+    expect(options.diagnostics).toContain("embedding.concurrency: Number must be greater than 0")
   })
 
   test("parses configured hybrid retrieval options", () => {

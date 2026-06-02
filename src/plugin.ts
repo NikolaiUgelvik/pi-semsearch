@@ -731,27 +731,18 @@ function canUseReadyIndexForStartup(
     metadata.status === "ready" &&
     metadata.worktree === worktree &&
     metadata.maxFileBytes === options.maxFileBytes &&
-    sameStringSet(metadata.includeGlobs, options.includeGlobs) &&
-    sameStringSet(metadata.excludeGlobs, options.excludeGlobs) &&
+    sameStringArray(metadata.includeGlobs, options.includeGlobs) &&
+    sameStringArray(metadata.excludeGlobs, options.excludeGlobs) &&
     metadata.maxChunkNonWhitespaceChars === options.maxChunkNonWhitespaceChars &&
     sameStartupChunking(metadata.chunking, options.chunking)
   )
 }
 
-function sameStringSet(left: string[] | undefined, right: string[]) {
+function sameStringArray(left: string[] | undefined, right: string[]) {
   if (!left) {
     return false
   }
-  const canonicalLeft = canonicalStringSet(left)
-  const canonicalRight = canonicalStringSet(right)
-  return (
-    canonicalLeft.length === canonicalRight.length &&
-    canonicalLeft.every((value, index) => value === canonicalRight[index])
-  )
-}
-
-function canonicalStringSet(values: string[]) {
-  return [...new Set(values)].sort()
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function sameStartupChunking(left: IndexMetadata["chunking"], right: IndexMetadata["chunking"]) {

@@ -164,7 +164,17 @@ function diagnosticsForOptions(inputRecord, parsed) {
     return diagnostics;
 }
 function diagnosticMessage(key, issue) {
-    return `${[key, ...issue.path].filter(Boolean).join(".")}: ${issue.message}`;
+    return `${[key, ...issue.path].filter(Boolean).join(".")}: ${diagnosticIssueMessage(issue)}`;
+}
+function diagnosticIssueMessage(issue) {
+    const details = issue;
+    if (details.code === "too_small" &&
+        details.minimum === 0 &&
+        details.inclusive === false &&
+        (details.origin === "number" || details.type === "number")) {
+        return "Number must be greater than 0";
+    }
+    return issue.message;
 }
 function rawOptions(data, parsed) {
     return {

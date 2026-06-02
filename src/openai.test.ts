@@ -77,10 +77,11 @@ describe("createOpenAIClient", () => {
     let calls = 0
     const client = createOpenAIClient({
       fetch: async () => {
-        calls++
-        return calls === 1
-          ? new Response("rate limited", { status: 429 })
-          : Response.json({ data: [{ embedding: [1] }] })
+        calls += 1
+        if (calls === 1) {
+          return new Response("rate limited", { status: 429 })
+        }
+        return Response.json({ data: [{ embedding: [1, 0, 0] }] })
       },
     })
 
@@ -88,9 +89,9 @@ describe("createOpenAIClient", () => {
       client.embed({
         baseURL: "https://example.test/v1",
         model: "embed",
-        input: "hello",
+        input: "text",
       }),
-    ).resolves.toEqual([1])
+    ).resolves.toEqual([1, 0, 0])
     expect(calls).toBe(2)
   })
 
@@ -98,7 +99,7 @@ describe("createOpenAIClient", () => {
     let calls = 0
     const client = createOpenAIClient({
       fetch: async () => {
-        calls++
+        calls += 1
         return new Response("bad request", { status: 400 })
       },
     })
@@ -107,7 +108,7 @@ describe("createOpenAIClient", () => {
       client.embed({
         baseURL: "https://example.test/v1",
         model: "embed",
-        input: "hello",
+        input: "text",
       }),
     ).rejects.toThrow("Embedding request failed: 400")
     expect(calls).toBe(1)

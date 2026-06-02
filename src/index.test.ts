@@ -1696,7 +1696,7 @@ describe("cast plugin", () => {
     expect(refreshes).toBe(1)
   })
 
-  test("startup does not refresh when includeGlobs contain the same patterns in a different order", async () => {
+  test("startup refreshes when includeGlobs contain the same patterns in a different order", async () => {
     let refreshes = 0
     const ready = emptyReadyIndex()
     ready.metadata.includeGlobs = ["lib/**/*.ts", "src/**/*.ts"]
@@ -1719,10 +1719,10 @@ describe("cast plugin", () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    expect(refreshes).toBe(0)
+    expect(refreshes).toBe(1)
   })
 
-  test("startup does not refresh when excludeGlobs contain the same patterns in a different order", async () => {
+  test("startup refreshes when excludeGlobs contain the same patterns in a different order", async () => {
     let refreshes = 0
     const ready = emptyReadyIndex()
     ready.metadata.excludeGlobs = ["dist/**", "generated/**"]
@@ -1745,7 +1745,7 @@ describe("cast plugin", () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    expect(refreshes).toBe(0)
+    expect(refreshes).toBe(1)
   })
 
   test("startup refreshes when legacy metadata lacks scanner options", async () => {

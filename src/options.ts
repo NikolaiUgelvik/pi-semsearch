@@ -178,7 +178,20 @@ function diagnosticsForOptions(
 }
 
 function diagnosticMessage(key: string, issue: z.ZodIssue) {
-  return `${[key, ...issue.path].filter(Boolean).join(".")}: ${issue.message}`
+  return `${[key, ...issue.path].filter(Boolean).join(".")}: ${diagnosticIssueMessage(issue)}`
+}
+
+function diagnosticIssueMessage(issue: z.ZodIssue) {
+  const details = issue as { code?: string; minimum?: unknown; inclusive?: unknown; origin?: unknown; type?: unknown }
+  if (
+    details.code === "too_small" &&
+    details.minimum === 0 &&
+    details.inclusive === false &&
+    (details.origin === "number" || details.type === "number")
+  ) {
+    return "Number must be greater than 0"
+  }
+  return issue.message
 }
 
 function rawOptions(data: Record<string, unknown>, parsed: ReturnType<typeof parseOptionFields>) {

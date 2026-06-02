@@ -161,6 +161,43 @@ describe("createIndexer", () => {
     }
   })
 
+  test("limits embedding batches to configured concurrency", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await Bun.write(path.join(dir, "many.txt"), Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n"))
+      let active = 0
+      let maxActive = 0
+
+      await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 8,
+          includeGlobs: ["**/*.txt"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+          embeddingBatchSize: 1,
+          embeddingBatchConcurrency: 2,
+        },
+        store: createMemoryStore(),
+        parse: async () => ({ language: "text", root: undefined }),
+        embedBatch: async (texts) => {
+          active += 1
+          maxActive = Math.max(maxActive, active)
+          await new Promise((resolve) => setTimeout(resolve, 1))
+          active -= 1
+          return texts.map(() => [1, 0, 0])
+        },
+        embed: async () => [1, 0, 0],
+      }).refresh()
+
+      expect(maxActive).toBeLessThanOrEqual(2)
+      expect(maxActive).toBeGreaterThan(1)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("processes independent files concurrently", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
@@ -653,6 +690,76 @@ describe("createIndexer", () => {
     }
   })
 
+  test("persists ordered glob metadata changes on unchanged indexes", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const filePath = path.join(dir, "src", "a.ts")
+      await mkdir(path.dirname(filePath), { recursive: true })
+      await Bun.write(filePath, "export const a = 1\n")
+      const fingerprint = await testFingerprint(filePath)
+      let index = createEmptyIndex({
+        projectId: "p",
+        worktree: dir,
+        cacheKey: "key",
+        maxChunkNonWhitespaceChars: 2000,
+        chunking: DEFAULT_CHUNKING_OPTIONS,
+      })
+      index.metadata.status = "ready"
+      index.metadata.maxFileBytes = DEFAULT_MAX_FILE_BYTES
+      index.metadata.includeGlobs = ["src/**/*.ts", "**/*.ts"]
+      index.metadata.excludeGlobs = ["dist/**", "generated/**"]
+      index.files["src/a.ts"] = {
+        path: "src/a.ts",
+        language: "typescript",
+        fingerprint,
+        chunkIds: ["src/a.ts:0"],
+        diagnostics: [],
+      }
+      index.chunks["src/a.ts:0"] = {
+        id: "src/a.ts:0",
+        filePath: "src/a.ts",
+        language: "typescript",
+        kind: "file",
+        range: { byteStart: 0, byteEnd: 19, lineStart: 1, lineEnd: 1 },
+        text: "export const a = 1\n",
+        nonWhitespaceChars: 15,
+        nodeTypes: [],
+        symbolIds: [],
+        childChunkIds: [],
+        embedding: [1, 0],
+      }
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts", "src/**/*.ts"],
+          excludeGlobs: ["generated/**", "dist/**"],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => {
+          throw new Error("unchanged file should be reused")
+        },
+        embed: async () => {
+          throw new Error("unchanged file should not be embedded")
+        },
+      })
+
+      const refreshed = await indexer.refresh()
+
+      expect(refreshed.metadata.includeGlobs).toEqual(["**/*.ts", "src/**/*.ts"])
+      expect(refreshed.metadata.excludeGlobs).toEqual(["generated/**", "dist/**"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("reuses file symbols through a per-file symbol index", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
@@ -779,6 +886,219 @@ describe("createIndexer", () => {
     } finally {
       await rm(dir, { recursive: true, force: true })
       await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("flushes queued reused file results when a changed file starts a run", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
+    try {
+      await Promise.all(
+        ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"].map((fileName) =>
+          Bun.write(path.join(dir, fileName), `export const ${fileName[0]} = 1\n`),
+        ),
+      )
+      const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
+      const originalWriteFileResults = store.writeFileResults.bind(store)
+      const batchWrites: string[][] = []
+      let firstRefreshComplete = false
+      let batchWritesAtChangedParse: string[][] | undefined
+      store.writeFileResults = async (runId, fileResults) => {
+        batchWrites.push(fileResults.map((fileResult) => fileResult.file.path))
+        await originalWriteFileResults(runId, fileResults)
+      }
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store,
+        parse: async (filePath) => {
+          if (firstRefreshComplete && path.basename(filePath) === "e.ts") {
+            batchWritesAtChangedParse = batchWrites.map((batch) => [...batch].sort())
+          }
+          return { language: "typescript", root: undefined }
+        },
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+      firstRefreshComplete = true
+      batchWrites.length = 0
+      await Bun.write(path.join(dir, "e.ts"), "export const e = 2\n")
+
+      await indexer.refresh()
+
+      expect(batchWritesAtChangedParse).toEqual([["a.ts", "b.ts", "c.ts", "d.ts"]])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
+  })
+
+  test("reused files omit unreferenced stale symbols", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const filePath = path.join(dir, "a.ts")
+      await Bun.write(filePath, "export function used() { return 1 }\n")
+      const fingerprint = await testFingerprint(filePath)
+      const usedSymbol: SymbolRecord = {
+        id: "a.ts:function:used",
+        name: "used",
+        kind: "function",
+        filePath: "a.ts",
+        range: { byteStart: 0, byteEnd: 35, lineStart: 1, lineEnd: 1 },
+        childSymbolIds: [],
+      }
+      const orphanSymbol: SymbolRecord = {
+        id: "a.ts:function:orphan",
+        name: "orphan",
+        kind: "function",
+        filePath: "a.ts",
+        range: { byteStart: 0, byteEnd: 35, lineStart: 1, lineEnd: 1 },
+        childSymbolIds: [],
+      }
+      let index: CastIndex = createEmptyIndex({
+        projectId: "p",
+        worktree: dir,
+        cacheKey: "key",
+        maxChunkNonWhitespaceChars: 2000,
+        chunking: DEFAULT_CHUNKING_OPTIONS,
+      })
+      index.metadata.status = "ready"
+      index.metadata.maxFileBytes = DEFAULT_MAX_FILE_BYTES
+      index.metadata.includeGlobs = ["**/*.ts"]
+      index.metadata.excludeGlobs = []
+      index.files["a.ts"] = { path: "a.ts", language: "typescript", fingerprint, chunkIds: ["a.ts:0"], diagnostics: [] }
+      index.chunks["a.ts:0"] = {
+        id: "a.ts:0",
+        filePath: "a.ts",
+        language: "typescript",
+        kind: "function",
+        range: { byteStart: 0, byteEnd: 35, lineStart: 1, lineEnd: 1 },
+        text: "export function used() { return 1 }\n",
+        nonWhitespaceChars: 28,
+        nodeTypes: ["function_declaration"],
+        symbolIds: [usedSymbol.id],
+        childChunkIds: [],
+        embedding: [1, 0],
+      }
+      index.symbols[usedSymbol.id] = usedSymbol
+      index.symbols[orphanSymbol.id] = orphanSymbol
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => {
+          throw new Error("unchanged file should be reused")
+        },
+        embed: async () => {
+          throw new Error("unchanged file should not be embedded")
+        },
+      })
+
+      const refreshed = await indexer.refresh()
+
+      expect(Object.keys(refreshed.symbols)).toEqual([usedSymbol.id])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("reused files omit stale child symbols under a referenced parent", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const filePath = path.join(dir, "a.ts")
+      await Bun.write(filePath, "export class Used { method() { return 1 } }\n")
+      const fingerprint = await testFingerprint(filePath)
+      const parentSymbol: SymbolRecord = {
+        id: "a.ts:class:Used",
+        name: "Used",
+        kind: "class",
+        filePath: "a.ts",
+        range: { byteStart: 0, byteEnd: 41, lineStart: 1, lineEnd: 1 },
+        childSymbolIds: ["a.ts:method:stale-child"],
+      }
+      const staleChildSymbol: SymbolRecord = {
+        id: "a.ts:method:stale-child",
+        name: "stale-child",
+        kind: "method",
+        filePath: "a.ts",
+        range: { byteStart: 20, byteEnd: 40, lineStart: 1, lineEnd: 1 },
+        parentSymbolId: parentSymbol.id,
+        childSymbolIds: [],
+      }
+      let index: CastIndex = createEmptyIndex({
+        projectId: "p",
+        worktree: dir,
+        cacheKey: "key",
+        maxChunkNonWhitespaceChars: 2000,
+        chunking: DEFAULT_CHUNKING_OPTIONS,
+      })
+      index.metadata.status = "ready"
+      index.metadata.maxFileBytes = DEFAULT_MAX_FILE_BYTES
+      index.metadata.includeGlobs = ["**/*.ts"]
+      index.metadata.excludeGlobs = []
+      index.files["a.ts"] = { path: "a.ts", language: "typescript", fingerprint, chunkIds: ["a.ts:0"], diagnostics: [] }
+      index.chunks["a.ts:0"] = {
+        id: "a.ts:0",
+        filePath: "a.ts",
+        language: "typescript",
+        kind: "class",
+        range: { byteStart: 0, byteEnd: 41, lineStart: 1, lineEnd: 1 },
+        text: "export class Used { method() { return 1 } }\n",
+        nonWhitespaceChars: 32,
+        nodeTypes: ["class_declaration"],
+        symbolIds: [parentSymbol.id],
+        childChunkIds: [],
+        embedding: [1, 0],
+      }
+      index.symbols[parentSymbol.id] = parentSymbol
+      index.symbols[staleChildSymbol.id] = staleChildSymbol
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: {
+          read: async () => index,
+          write: async (next) => {
+            index = next
+          },
+        },
+        parse: async () => {
+          throw new Error("unchanged file should be reused")
+        },
+        embed: async () => {
+          throw new Error("unchanged file should not be embedded")
+        },
+      })
+
+      const refreshed = await indexer.refresh()
+
+      expect(Object.keys(refreshed.symbols)).toEqual([parentSymbol.id])
+      expect(refreshed.symbols[parentSymbol.id]?.childSymbolIds).toEqual([])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
     }
   })
 
@@ -1293,6 +1613,33 @@ describe("createIndexer", () => {
       }).refresh()
 
       expect(Object.keys(index.files)).toEqual(["src/keep.ts"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("single-level exclude globs do not prune deeper descendants", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await mkdir(path.join(dir, "foo", "bar"), { recursive: true })
+      await Bun.write(path.join(dir, "foo", "drop.ts"), "export const drop = 1\n")
+      await Bun.write(path.join(dir, "foo", "bar", "keep.ts"), "export const keep = 1\n")
+
+      const index = await createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["foo/**/*.ts"],
+          excludeGlobs: ["foo/*"],
+          topK: 5,
+          maxContextChars: 12_000,
+        },
+        store: createMemoryStore(),
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0, 0],
+      }).refresh()
+
+      expect(Object.keys(index.files)).toEqual(["foo/bar/keep.ts"])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
