@@ -489,10 +489,10 @@ function registerChunkLookupTool(pi, runtimeFor) {
     pi.registerTool({
         name: "semantic_get_chunk",
         label: "Semantic Get Chunk",
-        description: "Fetch an indexed semantic code chunk by ID returned from semantic_search_code, with optional parent, sibling, and child topology context.",
-        promptSnippet: "Fetch exact semantic chunk context by topology ID from semantic_search_code.",
+        description: "Fetch an indexed semantic code chunk by a topology node ID returned from semantic_search_code, with optional parent, sibling, and child topology context.",
+        promptSnippet: "Fetch exact semantic chunk context by topology node ID from semantic_search_code.",
         parameters: Type.Object({
-            id: Type.String({ description: "Chunk ID returned from semantic_search_code." }),
+            id: Type.String({ description: "A topology node id returned from semantic_search_code, such as topology.current.id, topology.parent.id, a sibling id, or a child id." }),
             includeParents: Type.Optional(Type.Boolean()),
             includeSiblings: Type.Optional(Type.Boolean()),
             includeChildren: Type.Optional(Type.Boolean()),
@@ -516,23 +516,7 @@ function piToolResult(result) {
     };
 }
 async function loadPiSemsearchOptions(worktree) {
-    const config = await loadConfigFile(worktree);
-    return parseOptions(withPiHydeDefaults(config));
-}
-function withPiHydeDefaults(config) {
-    if (!isRecord(config)) {
-        return config;
-    }
-    return hasConfiguredHyde(config.hyde) ? config : { ...config, hyde: disabledHydeConfig(config.hyde) };
-}
-function isRecord(value) {
-    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-function hasConfiguredHyde(hyde) {
-    return (isRecord(hyde) && (hyde.enabled === true || (typeof hyde.baseURL === "string" && typeof hyde.model === "string")));
-}
-function disabledHydeConfig(hyde) {
-    return isRecord(hyde) ? { ...hyde, enabled: false } : { enabled: false };
+    return parseOptions(await loadConfigFile(worktree));
 }
 async function loadConfigFile(worktree) {
     return (await readFirstConfigCandidate(configCandidates(worktree))) ?? envOptions();
@@ -584,7 +568,7 @@ function envHydeOptions() {
             model,
             threshold: numberEnv("PI_SEMSEARCH_HYDE_THRESHOLD"),
         }
-        : { enabled: false };
+        : { threshold: numberEnv("PI_SEMSEARCH_HYDE_THRESHOLD") };
 }
 function envRerankOptions() {
     const baseUrl = env.PI_SEMSEARCH_RERANK_BASE_URL;
@@ -885,9 +869,9 @@ function minimalSearchOutput(output) {
         status: output.status,
         results: output.results.map((result, index) => ({
             rank: index + SINGLE_COMPACT_CHILD,
-            id: result.topology.chunk.id,
-            label: result.topology.chunk.label,
-            range: result.topology.chunk.range,
+            id: result.topology.current.id,
+            label: result.topology.current.label,
+            range: result.topology.current.range,
             score: result.score,
             finalScore: result.finalScore,
             retrieval: result.retrieval,

@@ -315,9 +315,9 @@ function searchOutput(metadata: IndexMetadata, query: string): SearchOutput {
         breadcrumbs: ["function session"],
         text: `function session() { return ${JSON.stringify(query)} }`,
         topology: {
-          chunk: { id: "c1", label: "function session", range: "src/session.ts:1-1" },
+          current: { id: "c1", label: "function session", range: "src/session.ts:1-1" },
           children: [],
-          symbols: ["function session"],
+          containingSymbols: ["function session"],
         },
         retrieval: { mode: "vector", vectorRank: 1 },
       },

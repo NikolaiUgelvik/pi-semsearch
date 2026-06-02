@@ -324,7 +324,7 @@ function hydeOptions(
 ): HydeOptions {
   const api = openAiCompatibleConfig(raw)
   return {
-    ...hydeProviderOptions(api, raw, env),
+    ...hydeProviderOptions(api, raw, env, hasEmbeddingConfig),
     threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
     enabled: hydeEnabled(api, raw?.enabled, hasEmbeddingConfig),
     timeoutMs: raw?.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
@@ -335,20 +335,25 @@ function hydeProviderOptions(
   api: { baseURL: string; model: string } | undefined,
   raw: ReturnType<typeof rawOptions>["hyde"],
   env: Record<string, string | undefined>,
+  hasEmbeddingConfig: boolean,
 ) {
   return {
-    mode: hydeMode(api, raw?.enabled),
+    mode: hydeMode(api, raw?.enabled, hasEmbeddingConfig),
     baseURL: api?.baseURL,
     apiKey: apiKeyForOpenAiHyde(api, raw, env),
     model: api?.model,
   }
 }
 
-function hydeMode(api: { baseURL: string; model: string } | undefined, enabled: boolean | undefined) {
+function hydeMode(
+  api: { baseURL: string; model: string } | undefined,
+  enabled: boolean | undefined,
+  hasEmbeddingConfig: boolean,
+) {
   if (api) {
     return "openai-compatible" as const
   }
-  return enabled === true ? ("pi-active" as const) : ("disabled" as const)
+  return enabled !== false && hasEmbeddingConfig ? ("pi-active" as const) : ("disabled" as const)
 }
 
 function hydeEnabled(
@@ -356,7 +361,7 @@ function hydeEnabled(
   enabled: boolean | undefined,
   hasEmbeddingConfig: boolean,
 ) {
-  return (Boolean(api) || enabled === true) && withDefault(enabled, hasEmbeddingConfig)
+  return (Boolean(api) || hasEmbeddingConfig) && enabled !== false
 }
 
 function apiKeyForOpenAiHyde(

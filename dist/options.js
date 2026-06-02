@@ -280,28 +280,28 @@ function cappedOption(value, defaultValue, max) {
 function hydeOptions(raw, hasEmbeddingConfig, env) {
     const api = openAiCompatibleConfig(raw);
     return {
-        ...hydeProviderOptions(api, raw, env),
+        ...hydeProviderOptions(api, raw, env, hasEmbeddingConfig),
         threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
         enabled: hydeEnabled(api, raw?.enabled, hasEmbeddingConfig),
         timeoutMs: raw?.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
     };
 }
-function hydeProviderOptions(api, raw, env) {
+function hydeProviderOptions(api, raw, env, hasEmbeddingConfig) {
     return {
-        mode: hydeMode(api, raw?.enabled),
+        mode: hydeMode(api, raw?.enabled, hasEmbeddingConfig),
         baseURL: api?.baseURL,
         apiKey: apiKeyForOpenAiHyde(api, raw, env),
         model: api?.model,
     };
 }
-function hydeMode(api, enabled) {
+function hydeMode(api, enabled, hasEmbeddingConfig) {
     if (api) {
         return "openai-compatible";
     }
-    return enabled === true ? "pi-active" : "disabled";
+    return enabled !== false && hasEmbeddingConfig ? "pi-active" : "disabled";
 }
 function hydeEnabled(api, enabled, hasEmbeddingConfig) {
-    return (Boolean(api) || enabled === true) && withDefault(enabled, hasEmbeddingConfig);
+    return (Boolean(api) || hasEmbeddingConfig) && enabled !== false;
 }
 function apiKeyForOpenAiHyde(api, raw, env) {
     return api ? resolveSecret(raw?.apiKey, raw?.apiKeyEnv, env) : undefined;

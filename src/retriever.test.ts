@@ -610,8 +610,8 @@ describe("retrieve", () => {
     expect(output.diagnostics).not.toContain(
       "hybrid retrieval requested but lexical data is unavailable; using vector-only retrieval",
     )
-    expect(output.results.map((result) => result.topology.chunk.id).sort()).toEqual(["lexical", "vector"])
-    expect(output.results.find((result) => result.topology.chunk.id === "lexical")?.retrieval).toMatchObject({
+    expect(output.results.map((result) => result.topology.current.id).sort()).toEqual(["lexical", "vector"])
+    expect(output.results.find((result) => result.topology.current.id === "lexical")?.retrieval).toMatchObject({
       mode: "hybrid",
       bm25Rank: 1,
       bm25Score: 7,
@@ -956,7 +956,7 @@ describe("retrieve", () => {
       },
     })
 
-    expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["c0", "c1", "c2", "c3", "c4"])
+    expect(output.results.map((result) => result.topology.current.id)).toEqual(["c0", "c1", "c2", "c3", "c4"])
   })
 
   test("preserves vector-only topK when it exceeds the vector candidate cap", async () => {
@@ -1154,7 +1154,7 @@ describe("retrieve", () => {
     })
 
     expect(vectorTopKs[0]).toBe(1)
-    expect(output.results[0].topology.chunk.id).toBe("a-unrelated")
+    expect(output.results[0].topology.current.id).toBe("a-unrelated")
   })
 
   test("returns normal embedding results without HyDE above threshold", async () => {
@@ -1312,12 +1312,12 @@ describe("retrieve", () => {
     })
 
     expect(output.results[0].topology).toEqual({
-      chunk: { id: "c1", label: "function parseOptions", range: "src/options.ts:1-3" },
+      current: { id: "c1", label: "function parseOptions", range: "src/options.ts:1-3" },
       parent: { id: "parent", label: "file src/options.ts", range: "src/options.ts:1-6" },
       children: [{ id: "child", label: "function readOptions", range: "src/options.ts:2" }],
       previousSibling: { id: "previous", label: "function loadDefaults", range: "src/options.ts:1" },
       nextSibling: { id: "next", label: "function formatOptions", range: "src/options.ts:5" },
-      symbols: ["function parseOptions"],
+      containingSymbols: ["function parseOptions"],
     })
   })
 
@@ -1493,7 +1493,7 @@ describe("retrieve", () => {
     })
 
     expect(output.status.hydeUsed).toBe(false)
-    expect(output.results[0].topology.chunk.id).toBe("c1")
+    expect(output.results[0].topology.current.id).toBe("c1")
     expect(output.results[0].score).toBe(0)
     expect(output.results[0].finalScore).toBe(0)
     expect(output.diagnostics).toContain("existing")
@@ -1733,7 +1733,7 @@ describe("retrieve", () => {
     })
 
     expect(output.status.rerankUsed).toBe(true)
-    expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["c2"])
+    expect(output.results.map((result) => result.topology.current.id)).toEqual(["c2"])
     expect(output.results[0].score).toBe(0.9)
     expect(output.results[0].finalScore).toBe(0.99)
     expect(output.results[0].retrieval).toMatchObject({
@@ -1784,7 +1784,7 @@ describe("retrieve", () => {
     })
 
     expect(output.status.rerankUsed).toBe(false)
-    expect(output.results[0].topology.chunk.id).toBe("c1")
+    expect(output.results[0].topology.current.id).toBe("c1")
     expect(output.results[0].finalScore).toBe(1)
     expect(output.results[0].retrieval).toMatchObject({ mode: "vector", vectorRank: 1 })
     expect(output.results[0].retrieval?.rerankRank).toBeUndefined()
@@ -1841,7 +1841,7 @@ describe("retrieve", () => {
       readSource: async (filePath) => index.chunks[filePath === "a.ts" ? "c1" : "c2"].text,
     })
 
-    expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["c2", "c1"])
+    expect(output.results.map((result) => result.topology.current.id)).toEqual(["c2", "c1"])
     expect(output.results.map((result) => result.finalScore)).toEqual([0.99, 1])
     expect(output.results[0].retrieval?.rerankRank).toBe(1)
     expect(output.results[1].retrieval?.rerankRank).toBeUndefined()
@@ -1917,7 +1917,7 @@ describe("retrieve", () => {
       readSource: async () => "function d() {}",
     })
 
-    expect(output.results[0].topology.chunk.id).toBe("c4")
+    expect(output.results[0].topology.current.id).toBe("c4")
     expect(output.results[0].finalScore).toBeGreaterThan(0.99)
     expect(output.results[0].score).toBe(output.results[0].finalScore)
   })
@@ -2537,8 +2537,8 @@ describe("retrieve", () => {
       readSource: async (filePath) => index.chunks[filePath === "src/semantic.ts" ? "semantic" : "exact"].text,
     })
 
-    expect(output.results.map((result) => result.topology.chunk.id)).toContain("exact")
-    expect(output.results.find((result) => result.topology.chunk.id === "exact")?.retrieval).toMatchObject({
+    expect(output.results.map((result) => result.topology.current.id)).toContain("exact")
+    expect(output.results.find((result) => result.topology.current.id === "exact")?.retrieval).toMatchObject({
       mode: "hybrid",
       bm25Rank: 1,
     })
@@ -2690,7 +2690,7 @@ describe("retrieve", () => {
       readSource: async () => "function vectorOnly() {}",
     })
 
-    expect(output.results.map((result) => result.topology.chunk.id)).toEqual(["vector"])
+    expect(output.results.map((result) => result.topology.current.id)).toEqual(["vector"])
     expect(output.results[0].retrieval).toEqual({ mode: "vector", vectorRank: 1 })
   })
 
@@ -2758,8 +2758,8 @@ describe("retrieve", () => {
     })
 
     expect(output.status.hydeUsed).toBe(true)
-    expect(output.results.map((result) => result.topology.chunk.id)).toContain("hyde")
-    expect(output.results.map((result) => result.topology.chunk.id)).toContain("exact")
-    expect(output.results.find((result) => result.topology.chunk.id === "exact")?.retrieval?.bm25Rank).toBe(1)
+    expect(output.results.map((result) => result.topology.current.id)).toContain("hyde")
+    expect(output.results.map((result) => result.topology.current.id)).toContain("exact")
+    expect(output.results.find((result) => result.topology.current.id === "exact")?.retrieval?.bm25Rank).toBe(1)
   })
 })

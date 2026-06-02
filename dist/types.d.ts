@@ -153,12 +153,12 @@ export type TopologyNode = {
     range: string;
 };
 export type SearchResultTopology = {
-    chunk: TopologyNode;
+    current: TopologyNode;
     parent?: TopologyNode;
     children: TopologyNode[];
     previousSibling?: TopologyNode;
     nextSibling?: TopologyNode;
-    symbols: string[];
+    containingSymbols: string[];
 };
 export type ChunkLookupInput = {
     id: string;

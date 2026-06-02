@@ -117,11 +117,11 @@ describe("chunk lookup", () => {
       text: targetText,
       parentRange: { byteStart: 0, byteEnd: parentText.length, lineStart: 1, lineEnd: 6 },
       topology: {
-        chunk: { id: "target", label: "method parse", range: "src/parser.ts:3-5" },
+        current: { id: "target", label: "method parse", range: "src/parser.ts:3-5" },
         parent: { id: "parent", label: "class Parser", range: "src/parser.ts:1-6" },
         children: [{ id: "child", label: "block return value", range: "src/parser.ts:4" }],
         previousSibling: { id: "previous", label: "method previous", range: "src/parser.ts:2" },
-        symbols: ["class Parser", "method parse"],
+        containingSymbols: ["class Parser", "method parse"],
       },
       related: {
         parent: { id: "parent", label: "class Parser", range: "src/parser.ts:1-6", text: "class Parser" },

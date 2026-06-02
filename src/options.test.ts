@@ -28,12 +28,12 @@ describe("parseOptions", () => {
       timeoutMs: 30_000,
     })
     expect(options.hyde).toEqual({
-      mode: "disabled",
+      mode: "pi-active",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.42,
-      enabled: false,
+      enabled: true,
       timeoutMs: 30_000,
     })
     expect(options.maxChunkNonWhitespaceChars).toBe(2000)
@@ -400,7 +400,7 @@ describe("parseOptions", () => {
     expect(options.diagnostics).toContain("embedding.baseURL is required")
   })
 
-  test("disables hyde by default when no chat provider is configured", () => {
+  test("enables Pi active model HyDE by default when embeddings are configured", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -413,12 +413,12 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "disabled",
+      mode: "pi-active",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.35,
-      enabled: false,
+      enabled: true,
       timeoutMs: 30_000,
     })
   })
@@ -449,7 +449,7 @@ describe("parseOptions", () => {
     })
   })
 
-  test("keeps hyde disabled for threshold-only config", () => {
+  test("enables Pi active model HyDE for threshold-only config", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -465,12 +465,12 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "disabled",
+      mode: "pi-active",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.6,
-      enabled: false,
+      enabled: true,
       timeoutMs: 30_000,
     })
   })
@@ -637,7 +637,7 @@ describe("parseOptions", () => {
     expect(options.diagnostics).not.toContain("embedding.model is required")
   })
 
-  test("reports invalid hyde fields while disabling HyDE fallback", () => {
+  test("reports invalid hyde fields while falling back to Pi active model HyDE", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -655,12 +655,12 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "disabled",
+      mode: "pi-active",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.35,
-      enabled: false,
+      enabled: true,
       timeoutMs: 30_000,
     })
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("hyde.baseURL:"))).toBe(true)

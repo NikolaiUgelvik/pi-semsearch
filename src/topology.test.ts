@@ -496,12 +496,12 @@ describe("topology", () => {
         [functionSymbol.id]: functionSymbol,
       }),
     ).toEqual({
-      chunk: { id: "chunk:method", label: "method run", range: "src/a.ts:3" },
+      current: { id: "chunk:method", label: "method run", range: "src/a.ts:3" },
       parent: { id: "chunk:class", label: "class A", range: "src/a.ts:1-5" },
       children: [{ id: "chunk:block", label: "block body", range: "src/a.ts:4" }],
       previousSibling: { id: "chunk:function", label: "function before", range: "src/a.ts:2" },
       nextSibling: { id: "chunk:file", label: "file src/a.ts", range: "src/a.ts:1-8" },
-      symbols: ["class A", "method run"],
+      containingSymbols: ["class A", "method run"],
     })
   })
 
@@ -556,7 +556,7 @@ describe("topology", () => {
       symbolIds: [broadSymbol.id],
     } as ChunkRecord
 
-    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, { [broadSymbol.id]: broadSymbol }).chunk.label).toBe(
+    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, { [broadSymbol.id]: broadSymbol }).current.label).toBe(
       "block semantic_search_code: tool({",
     )
   })
@@ -571,7 +571,7 @@ describe("topology", () => {
       symbolIds: [],
     } as ChunkRecord
 
-    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).chunk.label).toBe("method semantic_get_chunk: tool({")
+    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).current.label).toBe("method semantic_get_chunk: tool({")
   })
 
   test("uses local fallback labels for symbol-less chunks", () => {
@@ -584,7 +584,7 @@ describe("topology", () => {
       symbolIds: [],
     } as ChunkRecord
 
-    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).chunk.label).toBe("block return parseOptions(input)")
+    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).current.label).toBe("block return parseOptions(input)")
   })
 
   test("does not duplicate chunk kind in local fallback labels", () => {
@@ -597,7 +597,7 @@ describe("topology", () => {
       symbolIds: [],
     } as ChunkRecord
 
-    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).chunk.label).toBe("function parseOptions() {")
+    expect(summarizeTopology(chunk, { [chunk.id]: chunk }, {}).current.label).toBe("function parseOptions() {")
   })
 
   test("extracts enclosing class and assigns it to contained chunks", () => {

@@ -184,12 +184,12 @@ export type TopologyNode = {
 }
 
 export type SearchResultTopology = {
-  chunk: TopologyNode
+  current: TopologyNode
   parent?: TopologyNode
   children: TopologyNode[]
   previousSibling?: TopologyNode
   nextSibling?: TopologyNode
-  symbols: string[]
+  containingSymbols: string[]
 }
 
 export type ChunkLookupInput = {

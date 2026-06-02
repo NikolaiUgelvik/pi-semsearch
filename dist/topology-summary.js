@@ -24,7 +24,7 @@ function expandWithParentContext(input) {
 }
 function summarizeTopology(chunk, chunks, symbols) {
     return {
-        chunk: summarizeChunk(chunk, symbols),
+        current: summarizeChunk(chunk, symbols),
         ...optionalChunk(chunks, chunk.parentChunkId, symbols, "parent"),
         children: chunk.childChunkIds.slice(0, TOPOLOGY_CHILDREN_LIMIT).flatMap((id) => {
             const child = chunks[id];
@@ -32,7 +32,7 @@ function summarizeTopology(chunk, chunks, symbols) {
         }),
         ...optionalChunk(chunks, chunk.previousSiblingChunkId, symbols, "previousSibling"),
         ...optionalChunk(chunks, chunk.nextSiblingChunkId, symbols, "nextSibling"),
-        symbols: symbolBreadcrumbs(chunk, symbols),
+        containingSymbols: symbolBreadcrumbs(chunk, symbols),
     };
 }
 function summarizeChunk(chunk, symbols) {
