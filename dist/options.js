@@ -256,7 +256,7 @@ function withDefault(value, defaultValue) {
     return value ?? defaultValue;
 }
 function cacheDirOption(cacheDir, env) {
-    return cacheDir ?? env.OPENCODE_CAST_CACHE_DIR ?? path.join(cacheBaseDir(env), "opencode", "cast");
+    return cacheDir ?? env.PI_SEMSEARCH_CACHE_DIR ?? path.join(cacheBaseDir(env), "pi", "semsearch");
 }
 function cacheBaseDir(env) {
     return env.XDG_CACHE_HOME ?? path.join(env.HOME ?? process.cwd(), ".cache");
@@ -280,14 +280,22 @@ function cappedOption(value, defaultValue, max) {
 function hydeOptions(raw, hasEmbeddingConfig, env) {
     const api = openAiCompatibleConfig(raw);
     return {
-        mode: api ? "openai-compatible" : "opencode",
+        ...hydeProviderOptions(api, raw, env),
+        threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
+        enabled: hydeEnabled(api, raw?.enabled, hasEmbeddingConfig),
+        timeoutMs: raw?.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
+    };
+}
+function hydeProviderOptions(api, raw, env) {
+    return {
+        mode: api ? "openai-compatible" : "disabled",
         baseURL: api?.baseURL,
         apiKey: apiKeyForOpenAiHyde(api, raw, env),
         model: api?.model,
-        threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
-        enabled: withDefault(raw?.enabled, hasEmbeddingConfig),
-        timeoutMs: raw?.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
     };
+}
+function hydeEnabled(api, enabled, hasEmbeddingConfig) {
+    return Boolean(api) && withDefault(enabled, hasEmbeddingConfig);
 }
 function apiKeyForOpenAiHyde(api, raw, env) {
     return api ? resolveSecret(raw?.apiKey, raw?.apiKeyEnv, env) : undefined;
@@ -368,14 +376,18 @@ function parseRerankConfig(input) {
     if (!inputRecord.success) {
         return;
     }
-    const api = parseApiConfig(input);
+    return {
+        ...rerankApiFields(parseApiConfig(input)),
+        candidateMultiplier: safeField(RerankFields.candidateMultiplier, inputRecord.data.candidateMultiplier),
+    };
+}
+function rerankApiFields(api) {
     return {
         baseURL: api?.baseURL,
         apiKey: api?.apiKey,
         apiKeyEnv: api?.apiKeyEnv,
         model: api?.model,
         timeoutMs: api?.timeoutMs,
-        candidateMultiplier: safeField(RerankFields.candidateMultiplier, inputRecord.data.candidateMultiplier),
     };
 }
 function parseRetrievalOptions(input) {

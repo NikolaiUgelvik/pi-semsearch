@@ -99,7 +99,7 @@
       }
     },
     {
-      "includes": ["src/options.ts", "src/plugin.ts", "src/retriever.ts", "src/scanner.ts", "src/topology.ts"],
+      "includes": ["src/options.ts", "src/extension.ts", "src/retriever.ts", "src/scanner.ts", "src/topology.ts"],
       "linter": {
         "rules": {
           "complexity": {
@@ -140,7 +140,7 @@
       }
     },
     {
-      "includes": ["src/plugin.ts"],
+      "includes": ["src/extension.ts"],
       "linter": {
         "rules": {
           "style": {
@@ -174,7 +174,7 @@
         "src/language.ts",
         "src/openai.ts",
         "src/options.ts",
-        "src/plugin.ts",
+        "src/extension.ts",
         "src/range.ts",
         "src/retriever.ts",
         "src/scanner.ts",

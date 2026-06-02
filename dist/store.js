@@ -1,8 +1,8 @@
-import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import BetterSqlite3 from "better-sqlite3";
 import { load as loadSqliteVec } from "sqlite-vec";
 import { tokenizeCodeText } from "./lexical.js";
 import { compilePathFilters } from "./path-filter.js";
@@ -28,6 +28,32 @@ class CorruptIndexError extends Error {
         super("corrupt persisted index", { cause });
         this.name = "CorruptIndexError";
     }
+}
+class Database {
+    db;
+    constructor(db) {
+        this.db = db;
+    }
+    query(sql) {
+        const statement = this.db.prepare(sql);
+        return {
+            get: (...params) => statement.get(...normalizeSqliteParams(params)),
+            all: (...params) => statement.all(...normalizeSqliteParams(params)),
+            run: (...params) => statement.run(...normalizeSqliteParams(params)),
+        };
+    }
+    run(sql, params = []) {
+        return this.db.prepare(sql).run(...params);
+    }
+    transaction(fn) {
+        return this.db.transaction(fn);
+    }
+    close() {
+        this.db.close();
+    }
+}
+function normalizeSqliteParams(params) {
+    return params.length === 1 && Array.isArray(params[0]) ? params[0] : params;
 }
 function chunkForStorage(chunk) {
     const { text: _text, embedding: _embedding, ...storedChunk } = chunk;
@@ -167,9 +193,10 @@ function createSqliteIndexStore(cacheDir, cacheKey, embeddingDimensions) {
 }
 async function openSqliteIndex(file, embeddingDimensions) {
     await mkdir(path.dirname(file), { recursive: true });
-    const db = new Database(file);
+    const rawDb = new BetterSqlite3(file);
+    const db = new Database(rawDb);
     try {
-        loadSqliteVec(db);
+        loadSqliteVec(rawDb);
         initializeSchema(db, embeddingDimensions);
         return db;
     }
@@ -792,33 +819,40 @@ function searchSqliteVectorCandidates(db, queryEmbedding, topK, paths) {
     if (!search) {
         return [];
     }
+    const result = collectSqliteVectorCandidates(db, queryEmbedding, pathFilters, search);
+    return vectorCandidateSearchResult(sortVectorCandidates(result.candidates, search.target), {
+        incomplete: result.incomplete,
+    });
+}
+function collectSqliteVectorCandidates(db, queryEmbedding, pathFilters, search) {
     const limits = sqliteVectorLimits(search.vectorCount, search.target, search.hasPathFilters);
-    let currentK = limits.initial;
     const candidates = [];
     const seen = new Set();
-    let incomplete = false;
-    while (true) {
-        const rows = safeQuerySqliteVectorCandidates({
-            db,
-            runId: search.activeRunId,
-            queryEmbedding,
-            topK: currentK,
-            pathFilter: search.pathFilter,
-        });
+    let currentK = limits.initial;
+    while (currentK <= limits.max) {
+        const rows = querySqliteVectorCandidateRows(db, search, queryEmbedding, currentK);
         appendMatchingSqliteVectorCandidates(candidates, seen, rows, pathFilters);
         if (candidates.length >= search.target || currentK >= limits.max) {
-            incomplete =
-                search.hasPathFilters &&
-                    candidates.length < search.target &&
-                    rows.length >= currentK &&
-                    currentK < search.vectorCount;
-            break;
+            return { candidates, incomplete: sqliteVectorSearchIncomplete(search, candidates.length, rows.length, currentK) };
         }
         currentK = Math.min(limits.max, currentK * 2);
     }
-    return vectorCandidateSearchResult(candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, search.target), {
-        incomplete,
+    return { candidates, incomplete: false };
+}
+function querySqliteVectorCandidateRows(db, search, queryEmbedding, currentK) {
+    return safeQuerySqliteVectorCandidates({
+        db,
+        runId: search.activeRunId,
+        queryEmbedding,
+        topK: currentK,
+        pathFilter: search.pathFilter,
     });
+}
+function sqliteVectorSearchIncomplete(search, candidateCount, rowCount, currentK) {
+    return (search.hasPathFilters && candidateCount < search.target && rowCount >= currentK && currentK < search.vectorCount);
+}
+function sortVectorCandidates(candidates, target) {
+    return candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, target);
 }
 function vectorCandidateSearchResult(candidates, metadata) {
     return Object.assign(candidates, metadata.incomplete ? { incomplete: true } : {});
@@ -1292,15 +1326,18 @@ function isChunkingOptions(value) {
         value.minSemanticNonWhitespaceChars > 0);
 }
 function isFileRecord(value) {
-    return (isObject(value) &&
-        typeof value.path === "string" &&
-        typeof value.language === "string" &&
-        typeof value.fingerprint === "string" &&
-        isOptionalNonnegativeNumber(value.sizeBytes) &&
+    return isObject(value) && hasFileRecordStrings(value) && hasFileRecordMetadata(value) && hasFileRecordArrays(value);
+}
+function hasFileRecordStrings(value) {
+    return typeof value.path === "string" && typeof value.language === "string" && typeof value.fingerprint === "string";
+}
+function hasFileRecordMetadata(value) {
+    return (isOptionalNonnegativeNumber(value.sizeBytes) &&
         isOptionalNonnegativeNumber(value.mtimeMs) &&
-        isOptionalNonnegativeNumber(value.ctimeMs) &&
-        isStringArray(value.chunkIds) &&
-        isStringArray(value.diagnostics));
+        isOptionalNonnegativeNumber(value.ctimeMs));
+}
+function hasFileRecordArrays(value) {
+    return isStringArray(value.chunkIds) && isStringArray(value.diagnostics);
 }
 function isChunkRecord(value) {
     if (!isObject(value)) {

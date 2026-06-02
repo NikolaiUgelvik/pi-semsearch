@@ -1,44 +1,31 @@
-# Archived
-Moving away from opencode. This will be deleted shortly.
+# pi-semsearch
 
-# opencode-plugin-cast
+Semantic code search extension for [Pi](https://github.com/Earendil-Works/pi) using syntax-aware structural chunking and OpenAI-compatible embeddings.
 
-Semantic code search plugin for opencode using code retrieval-augmented generation with structural chunking via abstract syntax tree.
+The extension registers two Pi tools:
 
-This is an unofficial community plugin. It is not affiliated with, endorsed by, sponsored by, or maintained by opencode, opencode.ai, or the `@opencode-ai` npm organization. It depends on `@opencode-ai/plugin` only for the public plugin API.
-
-The plugin registers `semantic_search_code`, a repository search tool that chunks code with Tree-sitter AST structure where supported, and `semantic_get_chunk`, which fetches exact chunks by IDs returned in search topology.
+- `semantic_search_code` — ranked semantic repository search with syntax-aware chunks, breadcrumbs, file/line ranges, and topology IDs.
+- `semantic_get_chunk` — fetch an exact chunk by ID and optionally include parents, siblings, and children.
 
 ## Installation
 
-Add the plugin to your opencode config:
+From a local checkout while developing:
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "opencode-plugin-cast@git+https://github.com/NikolaiUgelvik/opencode-plugin-cast.git",
-      {
-        "embedding": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "model": "text-embedding-3-small"
-        },
-        "hyde": {
-          "threshold": 0.35
-        }
-      }
-    ]
-  ]
-}
+```bash
+pi -e /home/nikolai/git/pi-semsearch
 ```
 
-Restart opencode after changing plugin configuration. Plugins are loaded when opencode starts and are not hot-reloaded.
+Or install as a Pi package:
 
-## OpenAI-Compatible Providers
+```bash
+pi install /home/nikolai/git/pi-semsearch
+# or, once pushed:
+pi install git:github.com/NikolaiUgelvik/pi-semsearch
+```
 
-`embedding.baseURL` must point at an OpenAI-compatible API root. `embedding.model` is required. Provide credentials with either `embedding.apiKey` or `embedding.apiKeyEnv`.
+## Configuration
+
+Create `.pi/semsearch.json` in the project root, `semsearch.pi.json` in the project root, or `~/.pi/semsearch.json`:
 
 ```json
 {
@@ -47,284 +34,46 @@ Restart opencode after changing plugin configuration. Plugins are loaded when op
     "apiKeyEnv": "OPENAI_API_KEY",
     "model": "text-embedding-3-small",
     "dimensions": 1536
-  }
-}
-```
-
-`dimensions` is optional and is forwarded to providers that support embedding dimension selection. Indexing sends embeddings in batches; set `embedding.batchSize` to tune the number of chunk texts per embedding request. The default is `16`. Set `embedding.concurrency` to control how many embedding batches are allowed concurrently. The default is `1`; increase it cautiously for providers with generous rate limits. Provider requests default to a `timeoutMs` of `30000`.
-
-## OpenRouter HyDE Example
-
-OpenRouter can be used as the HyDE chat provider while embeddings come from a verified OpenAI-compatible embeddings provider. `embedding.baseURL` must point to a provider and model that supports the OpenAI-compatible embeddings endpoint; only use OpenRouter for embeddings if you have verified the selected OpenRouter model supports embeddings.
-
-```json
-{
-  "plugin": [
-    [
-      "opencode-plugin-cast@git+https://github.com/NikolaiUgelvik/opencode-plugin-cast.git",
-      {
-        "embedding": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "model": "text-embedding-3-small"
-        },
-        "hyde": {
-          "baseURL": "https://openrouter.ai/api/v1",
-          "apiKeyEnv": "OPENROUTER_API_KEY",
-          "model": "openai/gpt-4o-mini",
-          "threshold": 0.35
-        }
-      }
-    ]
-  ]
-}
-```
-
-## OpenRouter Rerank Example
-
-OpenRouter's rerank endpoint can be used to reorder the candidates found by vector and hybrid retrieval. Reranking is enabled by default when `rerank.baseURL` and `rerank.model` are configured. If the rerank request fails, `semantic_search_code` falls back to the current retrieval order and includes a diagnostic.
-
-```json
-{
-  "plugin": [
-    [
-      "opencode-plugin-cast@git+https://github.com/NikolaiUgelvik/opencode-plugin-cast.git",
-      {
-        "embedding": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "model": "text-embedding-3-small"
-        },
-        "rerank": {
-          "baseURL": "https://openrouter.ai/api/v1",
-          "apiKeyEnv": "OPENROUTER_API_KEY",
-          "model": "cohere/rerank-4-fast",
-          "candidateMultiplier": 4
-        }
-      }
-    ]
-  ]
-}
-```
-
-`candidateMultiplier` controls how many already-ranked candidates are sent to the reranker: `topK * candidateMultiplier`. The default is `4`.
-
-## Tool
-
-`semantic_search_code` inputs:
-
-- `query`: natural-language repository search query.
-- `topK`: optional number of final results. Defaults to `5`.
-- `minFinalScore`: optional minimum final retrieval score. Defaults to `0.01`; set to `0` to include zero-score candidates. Negative values are clamped to `0`.
-- `maxContextChars`: optional context budget. Defaults to `12000`.
-- `includeParents`: optional expanded parent body text toggle. Defaults to `false`; set to `true` to opt in.
-- `refresh`: optional forced index refresh before searching.
-- `paths`: optional path filters. Entries can be exact file paths, directory prefixes, or glob patterns.
-
-Each search result includes labeled topology entries that keep chunk IDs actionable while making parent, child, sibling, and symbol relationships readable:
-
-```json
-{
-  "topology": {
-    "chunk": {
-      "id": "chunk_7f3a9c2e4b1d",
-      "label": "function semanticSearchCode",
-      "range": "src/plugin.ts:120-188"
-    },
-    "parent": {
-      "id": "chunk_15d8e0a6c934",
-      "label": "file src/plugin.ts",
-      "range": "src/plugin.ts:20-220"
-    },
-    "children": [
-      {
-        "id": "chunk_b8a41f0c72de",
-        "label": "block chunk",
-        "range": "src/plugin.ts:142-166"
-      }
-    ],
-    "previousSibling": {
-      "id": "chunk_029d64f1a83c",
-      "label": "function resolveWorktreePath",
-      "range": "src/plugin.ts:90-118"
-    },
-    "nextSibling": {
-      "id": "chunk_e61c5b9a0d2f",
-      "label": "function semanticGetChunk",
-      "range": "src/plugin.ts:190-218"
-    },
-    "symbols": ["function semanticSearchCode"]
-  }
-}
-```
-
-Search output is compact JSON by default: ranked matches include matched chunk text, scores, breadcrumbs, retrieval details, and topology IDs/labels. Use `semantic_get_chunk` with topology IDs when you need expanded parent, sibling, or child context.
-
-`semantic_get_chunk` inputs:
-
-- `id`: chunk ID returned from `semantic_search_code` topology.
-- `includeParents`: optional parent context toggle. Defaults to `true`.
-- `includeSiblings`: optional sibling context toggle. Defaults to `true`.
-- `includeChildren`: optional child context toggle. Defaults to `true`.
-- `childrenOffset`: optional child list offset for paging. Defaults to `0`.
-- `childrenLimit`: optional child list page size. Defaults to `20`.
-- `maxContextChars`: optional limit for parent and related chunk text. When omitted, lookup returns full stored related chunk text and full fitting parent context.
-
-`semantic_search_code` returns compact JSON search output with ranked results, diagnostics, and retrieval status metadata. `semantic_get_chunk` returns the requested chunk, labeled topology, related chunks, `related.childrenPage` paging metadata, diagnostics, and status metadata. When embedding config is missing or invalid, opencode still starts and the tools return a clear configuration error. If opencode `tool_output` limits require adaptive compaction, results include a diagnostic explaining that output was compacted.
-
-## Retrieval
-
-`semantic_search_code` uses hybrid semantic vector and BM25 lexical retrieval by default. BM25 helps with exact identifiers, paths, error strings, and config keys; vectors help with semantic intent and related code. Results are fused with reciprocal-rank fusion (RRF), so exact lexical matches and semantic matches can both contribute without requiring an external BM25 or search service.
-
-Configure hybrid retrieval under `retrieval.hybrid`:
-
-```json
-{
-  "retrieval": {
-    "hybrid": {
-      "enabled": true,
-      "rrfK": 60,
-      "vectorCandidateMultiplier": 8,
-      "bm25CandidateMultiplier": 8,
-      "vectorWeight": 1,
-      "bm25Weight": 1
-    }
-  }
-}
-```
-
-Hybrid retrieval searches semantic vector candidates and SQLite FTS/BM25 lexical candidates in parallel, then fuses both ranked lists with RRF. When HyDE is triggered, it remains on the semantic/vector side while SQLite lexical candidates still participate in fusion.
-
-When reranking is configured, the plugin first finds candidates through the normal vector, HyDE, and hybrid pipeline, then sends a larger candidate set to the reranker before returning the final `topK` results. Reranker documents include the chunk path, line range, kind, and chunk text, but not expanded parent context.
-
-SQLite FTS lexical data is persisted in the index cache. Older or missing cache data degrades to vector-only retrieval until the index is refreshed or rebuilt.
-
-## Cache
-
-The index is stored outside the repository. The default cache directory is `${XDG_CACHE_HOME:-~/.cache}/opencode/cast`. Each project cache is stored at `<cacheDir>/<cacheKey>/index.sqlite`.
-
-By default the indexer scans regular, non-gitignored worktree files, skips generated/build directories such as `.git`, `node_modules`, `dist`, `build`, and `.cache`, excludes common binary/archive/lockfile patterns, skips probable binary files, and skips files larger than `maxFileBytes` (`2097152`, 2 MiB). Skipped binary and oversized files are reported in index diagnostics.
-
-Configure file scanning with plugin options:
-
-```json
-{
-  "includeGlobs": ["src/**/*"],
-  "excludeGlobs": ["**/*.generated.ts", "**/*.map"],
-  "maxFileBytes": 2097152
-}
-```
-
-For large repositories, start with low `embedding.concurrency`, narrow `includeGlobs` to the code you need, add explicit `excludeGlobs` for generated and vendor directories, and use `refresh` only when you need to rebuild or update the index. Higher `embedding.batchSize` can reduce request overhead, but provider limits vary; if you see rate limits or timeouts, reduce batch size and concurrency first.
-
-Configure chunking with plugin options:
-
-```json
-{
-  "maxChunkNonWhitespaceChars": 2000,
-  "chunking": {
-    "overlap": 0,
-    "expansion": false,
-    "minSemanticNonWhitespaceChars": 8
-  }
-}
-```
-
-`maxChunkNonWhitespaceChars` controls the target chunk size. `chunking.overlap` adds neighboring AST-window overlap, `chunking.expansion` adds chunk metadata to the embedded text, and `chunking.minSemanticNonWhitespaceChars` controls when trivial syntax windows are merged into nearby chunks. These are indexing options, not `semantic_search_code` arguments.
-
-Override the cache location with plugin config:
-
-```json
-{
-  "cacheDir": "/absolute/path/to/cache"
-}
-```
-
-Or with an environment variable:
-
-```bash
-export OPENCODE_CAST_CACHE_DIR=/absolute/path/to/cache
-```
-
-The cache key includes the opencode project id, worktree path, embedding model settings, and chunk-size setting.
-
-## Language Coverage
-
-The bundled grammar set targets TypeScript/TSX, JavaScript/JSX, Python, PHP, HTML, Go, Rust, Java, Ruby, and Bash. Files without a supported parser are indexed with fallback text chunks.
-
-## HyDE
-
-The plugin runs normal embedding search first. If the best similarity is below `hyde.threshold`, it asks a chat model to produce a concise hypothetical code-search target, embeds that text, and reranks candidates.
-
-HyDE has two modes:
-
-- If `hyde.baseURL` and `hyde.model` are both set, Cast calls that OpenAI-compatible `/chat/completions` endpoint directly.
-- If HyDE is enabled but that complete pair is not set, Cast uses the current opencode session model. The plugin learns the current model from `chat.message`, creates a temporary child session for the HyDE prompt, disables tools for that prompt, then deletes the temporary session.
-
-Set `hyde.enabled` to `false` to disable HyDE. You can set `hyde.threshold` without setting a model; that keeps the opencode-session fallback.
-
-```json
-{
+  },
   "hyde": {
     "enabled": false
   }
 }
 ```
 
-Complete OpenAI-compatible HyDE requires both `hyde.baseURL` and `hyde.model`. HyDE failures fall back to normal embedding results.
+You can also set `PI_SEMSEARCH_CONFIG=/path/to/semsearch.json`.
 
-## Local Development
-
-Install dependencies:
+Minimal environment-based configuration is supported:
 
 ```bash
-npm_config_nodedir=/usr bun install
+export OPENAI_API_KEY=...
+export PI_SEMSEARCH_EMBEDDING_MODEL=text-embedding-3-small
+# optional; defaults to https://api.openai.com/v1
+export PI_SEMSEARCH_EMBEDDING_BASE_URL=https://api.openai.com/v1
 ```
 
-Run the usual local verification:
-
-```bash
-bun run lint
-bun test --timeout 30000
-bun run typecheck
-bun run build
-```
-
-Before packaging, run the same checks as `prepack`:
-
-```bash
-bun run check
-bun run typecheck
-bun run build
-```
-
-To test a local build in opencode, point config at the built file URL:
+HyDE is disabled by default for Pi unless configured with an OpenAI-compatible chat provider:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "file:///absolute/path/to/opencode-plugin-cast/dist/index.js",
-      {
-        "embedding": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "model": "text-embedding-3-small"
-        }
-      }
-    ]
-  ]
+  "embedding": {
+    "baseURL": "https://api.openai.com/v1",
+    "apiKeyEnv": "OPENAI_API_KEY",
+    "model": "text-embedding-3-small"
+  },
+  "hyde": {
+    "baseURL": "https://openrouter.ai/api/v1",
+    "apiKeyEnv": "OPENROUTER_API_KEY",
+    "model": "openai/gpt-4o-mini",
+    "threshold": 0.35
+  }
 }
 ```
 
-Restart opencode after rebuilding the plugin or changing plugin config. The package root intentionally exports only the default plugin function so opencode does not confuse internal helper functions for plugin exports.
+## Commands
 
-## Acknowledgements
+- `/semsearch-refresh` — force-refresh the pi-semsearch index for the current project.
 
-This implementation is based on ideas from:
+## Notes
 
-Zhang et al., “cAST: Enhancing Code Retrieval-Augmented Generation with Structural Chunking via Abstract Syntax Tree,” arXiv:2506.15655, 2025.  
-https://arxiv.org/abs/2506.15655
-
-This repository is an independent implementation and is not affiliated with the original authors.
+Runtime code uses Pi's extension API (`pi.registerTool`, `pi.registerCommand`, and lifecycle events) and Node file APIs so it can run under Pi's extension loader.

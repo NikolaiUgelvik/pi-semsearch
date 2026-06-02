@@ -29,20 +29,24 @@ function extractSymbolRecords(input) {
     while (stack.length > 0) {
         const { node, parentSymbolId } = stack.pop();
         const symbol = symbolForNode(indexedInput, node, parentSymbolId);
-        if (symbol) {
-            symbols.push(symbol);
-            if (parentSymbolId) {
-                const children = childrenByParentId[parentSymbolId] ?? [];
-                children.push(symbol.id);
-                childrenByParentId[parentSymbolId] = children;
-            }
-        }
-        const childParentSymbolId = symbol?.id ?? parentSymbolId;
-        for (let index = node.children.length - 1; index >= 0; index -= 1) {
-            stack.push({ node: node.children[index], parentSymbolId: childParentSymbolId });
-        }
+        registerExtractedSymbol(symbol, parentSymbolId, symbols, childrenByParentId);
+        pushChildSymbolNodes(stack, node, symbol?.id ?? parentSymbolId);
     }
     return symbols.map((symbol) => ({ ...symbol, childSymbolIds: childrenByParentId[symbol.id] ?? [] }));
+}
+function registerExtractedSymbol(symbol, parentSymbolId, symbols, childrenByParentId) {
+    if (!symbol) {
+        return;
+    }
+    symbols.push(symbol);
+    if (parentSymbolId) {
+        childrenByParentId[parentSymbolId] = [...(childrenByParentId[parentSymbolId] ?? []), symbol.id];
+    }
+}
+function pushChildSymbolNodes(stack, node, parentSymbolId) {
+    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+        stack.push({ node: node.children[index], parentSymbolId });
+    }
 }
 function symbolForNode(input, node, parentSymbolId) {
     const kind = symbolKindFor(input.sourceIndex, node);

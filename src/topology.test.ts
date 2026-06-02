@@ -543,7 +543,7 @@ describe("topology", () => {
       id: "sym:function:store",
       name: "store",
       kind: "function",
-      filePath: "src/plugin.ts",
+      filePath: "src/extension.ts",
       range: { byteStart: 0, byteEnd: 200, lineStart: 1, lineEnd: 10 },
       childSymbolIds: [],
     }
@@ -646,7 +646,7 @@ describe("topology", () => {
     const propertyStart = source.indexOf("semantic_search_code")
     const propertyEnd = source.indexOf("  }),") + "  })".length
     const symbols = extractSymbols({
-      filePath: "src/plugin.ts",
+      filePath: "src/extension.ts",
       source,
       nodes: [{ type: "pair", startIndex: propertyStart, endIndex: propertyEnd, children: [] }],
     })

@@ -1,8 +1,8 @@
-import { Database } from "bun:sqlite"
 import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
+import BetterSqlite3 from "better-sqlite3"
 import { load as loadSqliteVec } from "sqlite-vec"
 import { tokenizeCodeText } from "./lexical.js"
 import { type CompiledPathFilters, compilePathFilters } from "./path-filter.js"
@@ -75,6 +75,41 @@ interface SourceHydrationContext {
 }
 
 type SourceReadResult = { ok: true; bytes: Buffer } | { ok: false }
+
+type SqliteParameters = unknown[]
+
+class Database {
+  private readonly db: BetterSqlite3.Database
+
+  constructor(db: BetterSqlite3.Database) {
+    this.db = db
+  }
+
+  query(sql: string) {
+    const statement = this.db.prepare(sql)
+    return {
+      get: (...params: SqliteParameters) => statement.get(...normalizeSqliteParams(params)),
+      all: (...params: SqliteParameters) => statement.all(...normalizeSqliteParams(params)),
+      run: (...params: SqliteParameters) => statement.run(...normalizeSqliteParams(params)),
+    }
+  }
+
+  run(sql: string, params: SqliteParameters = []) {
+    return this.db.prepare(sql).run(...params)
+  }
+
+  transaction<T extends (...args: never[]) => unknown>(fn: T): T {
+    return this.db.transaction(fn) as unknown as T
+  }
+
+  close() {
+    this.db.close()
+  }
+}
+
+function normalizeSqliteParams(params: SqliteParameters) {
+  return params.length === 1 && Array.isArray(params[0]) ? (params[0] as SqliteParameters) : params
+}
 
 function chunkForStorage(chunk: ChunkRecord): StoredChunkRecord {
   const { text: _text, embedding: _embedding, ...storedChunk } = chunk
@@ -214,9 +249,10 @@ function createSqliteIndexStore(cacheDir: string, cacheKey: string, embeddingDim
 
 async function openSqliteIndex(file: string, embeddingDimensions?: number) {
   await mkdir(path.dirname(file), { recursive: true })
-  const db = new Database(file)
+  const rawDb = new BetterSqlite3(file)
+  const db = new Database(rawDb)
   try {
-    loadSqliteVec(db)
+    loadSqliteVec(rawDb)
     initializeSchema(db, embeddingDimensions)
     return db
   } catch (error) {
@@ -1018,39 +1054,62 @@ function searchSqliteVectorCandidates(db: Database, queryEmbedding: number[], to
     return []
   }
 
+  const result = collectSqliteVectorCandidates(db, queryEmbedding, pathFilters, search)
+  return vectorCandidateSearchResult(sortVectorCandidates(result.candidates, search.target), {
+    incomplete: result.incomplete,
+  })
+}
+
+function collectSqliteVectorCandidates(
+  db: Database,
+  queryEmbedding: number[],
+  pathFilters: CompiledPathFilters,
+  search: NonNullable<ReturnType<typeof sqliteVectorSearchInput>>,
+) {
   const limits = sqliteVectorLimits(search.vectorCount, search.target, search.hasPathFilters)
-  let currentK = limits.initial
   const candidates: Array<{ id: string; score: number }> = []
   const seen = new Set<string>()
-  let incomplete = false
+  let currentK = limits.initial
 
-  while (true) {
-    const rows = safeQuerySqliteVectorCandidates({
-      db,
-      runId: search.activeRunId,
-      queryEmbedding,
-      topK: currentK,
-      pathFilter: search.pathFilter,
-    })
+  while (currentK <= limits.max) {
+    const rows = querySqliteVectorCandidateRows(db, search, queryEmbedding, currentK)
     appendMatchingSqliteVectorCandidates(candidates, seen, rows, pathFilters)
-
     if (candidates.length >= search.target || currentK >= limits.max) {
-      incomplete =
-        search.hasPathFilters &&
-        candidates.length < search.target &&
-        rows.length >= currentK &&
-        currentK < search.vectorCount
-      break
+      return { candidates, incomplete: sqliteVectorSearchIncomplete(search, candidates.length, rows.length, currentK) }
     }
     currentK = Math.min(limits.max, currentK * 2)
   }
+  return { candidates, incomplete: false }
+}
 
-  return vectorCandidateSearchResult(
-    candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, search.target),
-    {
-      incomplete,
-    },
+function querySqliteVectorCandidateRows(
+  db: Database,
+  search: NonNullable<ReturnType<typeof sqliteVectorSearchInput>>,
+  queryEmbedding: number[],
+  currentK: number,
+) {
+  return safeQuerySqliteVectorCandidates({
+    db,
+    runId: search.activeRunId,
+    queryEmbedding,
+    topK: currentK,
+    pathFilter: search.pathFilter,
+  })
+}
+
+function sqliteVectorSearchIncomplete(
+  search: NonNullable<ReturnType<typeof sqliteVectorSearchInput>>,
+  candidateCount: number,
+  rowCount: number,
+  currentK: number,
+) {
+  return (
+    search.hasPathFilters && candidateCount < search.target && rowCount >= currentK && currentK < search.vectorCount
   )
+}
+
+function sortVectorCandidates(candidates: RankedChunkCandidate[], target: number) {
+  return candidates.sort((left, right) => bScoreThenId(left, right)).slice(0, target)
 }
 
 function vectorCandidateSearchResult(
@@ -1707,17 +1766,23 @@ function isChunkingOptions(value: unknown): value is ChunkingOptions {
 }
 
 function isFileRecord(value: unknown) {
+  return isObject(value) && hasFileRecordStrings(value) && hasFileRecordMetadata(value) && hasFileRecordArrays(value)
+}
+
+function hasFileRecordStrings(value: Record<string, unknown>) {
+  return typeof value.path === "string" && typeof value.language === "string" && typeof value.fingerprint === "string"
+}
+
+function hasFileRecordMetadata(value: Record<string, unknown>) {
   return (
-    isObject(value) &&
-    typeof value.path === "string" &&
-    typeof value.language === "string" &&
-    typeof value.fingerprint === "string" &&
     isOptionalNonnegativeNumber(value.sizeBytes) &&
     isOptionalNonnegativeNumber(value.mtimeMs) &&
-    isOptionalNonnegativeNumber(value.ctimeMs) &&
-    isStringArray(value.chunkIds) &&
-    isStringArray(value.diagnostics)
+    isOptionalNonnegativeNumber(value.ctimeMs)
   )
+}
+
+function hasFileRecordArrays(value: Record<string, unknown>) {
+  return isStringArray(value.chunkIds) && isStringArray(value.diagnostics)
 }
 
 function isChunkRecord(value: unknown) {

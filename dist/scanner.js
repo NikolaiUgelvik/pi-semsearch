@@ -33,65 +33,19 @@ export function createIndexer(input) {
             const store = input.store;
             const index = await store.read();
             signal?.throwIfAborted();
-            const canReuseExistingRecords = index.metadata.maxChunkNonWhitespaceChars === input.options.maxChunkNonWhitespaceChars &&
-                sameChunkingOptions(index.metadata.chunking, input.options.chunking);
-            const runConfigHash = indexRunConfigHash(index, input.worktree, input.options);
             const runStore = hasRunStore(store) ? store : undefined;
-            const files = scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs);
-            const groupedSymbols = symbolsByFilePath(index.symbols);
-            const nextFiles = {};
-            const nextChunks = {};
-            const nextSymbols = {};
-            const metadataDiagnostics = [];
-            const metadataDiagnosticDetails = [];
+            const state = createRefreshState(index, input);
+            const runController = createIndexRunController(index, input, runStore);
             const embeddingBatcher = createEmbeddingBatcher(input, signal);
-            const fileResultWriter = createFileResultWriter({ runStore, run: () => run });
-            let changed = false;
-            const state = {
-                nextFiles,
-                nextChunks,
-                nextSymbols,
-                symbolsByFilePath: groupedSymbols,
-                metadataDiagnostics,
-                metadataDiagnosticDetails,
-                reusedFileResults: [],
-                canReuseExistingRecords,
-                reusedRecordsChanged: false,
-                changed,
-            };
-            let run;
-            let runPromise;
-            const markIndexing = () => {
-                index.metadata.status = "indexing";
-                index.metadata.worktree = input.worktree;
-                index.metadata.maxFileBytes = input.options.maxFileBytes;
-                index.metadata.includeGlobs = input.options.includeGlobs;
-                index.metadata.excludeGlobs = input.options.excludeGlobs;
-                index.metadata.maxChunkNonWhitespaceChars = input.options.maxChunkNonWhitespaceChars;
-                index.metadata.chunking = input.options.chunking;
-            };
-            const ensureRun = async () => {
-                if (!runStore) {
-                    return;
-                }
-                if (run) {
-                    return run;
-                }
-                if (!runPromise) {
-                    markIndexing();
-                    runPromise = runStore.beginIndexRun({ configHash: runConfigHash, metadata: index.metadata });
-                }
-                run = await runPromise;
-                return run;
-            };
-            changed = await processScannedFiles({
-                files,
+            const fileResultWriter = createFileResultWriter({ runStore, run: runController.run });
+            const changed = await processScannedFiles({
+                files: scanFiles(input.worktree, input.options.includeGlobs, input.options.excludeGlobs),
                 input,
                 index,
                 state,
                 runStore,
-                run: () => run,
-                ensureRun,
+                run: runController.run,
+                ensureRun: runController.ensureRun,
                 embeddingBatcher,
                 fileResultWriter,
                 signal,
@@ -100,27 +54,27 @@ export function createIndexer(input) {
             await embeddingBatcher.drain();
             signal?.throwIfAborted();
             await fileResultWriter.flush();
-            metadataDiagnostics.sort();
-            const lexicalIndex = buildLexicalIndex(nextChunks, nextSymbols);
-            const hasFileSetChange = !sameStringArray(Object.keys(index.files).sort(), Object.keys(nextFiles).sort());
-            const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, metadataDiagnostics);
-            const hasDiagnosticDetailsChange = stableStringify(index.metadata.diagnosticDetails ?? []) !== stableStringify(metadataDiagnosticDetails);
+            state.metadataDiagnostics.sort();
+            const lexicalIndex = buildLexicalIndex(state.nextChunks, state.nextSymbols);
+            const hasFileSetChange = !sameStringArray(Object.keys(index.files).sort(), Object.keys(state.nextFiles).sort());
+            const hasDiagnosticsChange = !sameStringArray(index.metadata.diagnostics, state.metadataDiagnostics);
+            const hasDiagnosticDetailsChange = stableStringify(index.metadata.diagnosticDetails ?? []) !== stableStringify(state.metadataDiagnosticDetails);
             const hasScannerOptionsChange = !sameScannerOptions(index.metadata, input.options);
-            if (canSkipRefresh(index, input.worktree, changed || state.reusedRecordsChanged, canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange || hasDiagnosticDetailsChange || hasScannerOptionsChange)) {
+            if (canSkipRefresh(index, input.worktree, changed || state.reusedRecordsChanged, state.canReuseExistingRecords, hasFileSetChange, hasDiagnosticsChange || hasDiagnosticDetailsChange || hasScannerOptionsChange)) {
                 return index;
             }
             await flushQueuedReusedFileResults({
                 state,
                 runStore,
-                run: () => run,
-                ensureRun,
+                run: runController.run,
+                ensureRun: runController.ensureRun,
                 fileResultWriter,
             });
             await fileResultWriter.flush();
             signal?.throwIfAborted();
-            index.files = nextFiles;
+            index.files = state.nextFiles;
             index.chunks = lexicalIndex.chunks;
-            index.symbols = nextSymbols;
+            index.symbols = state.nextSymbols;
             index.lexical = lexicalIndex.lexical;
             index.metadata.worktree = input.worktree;
             index.metadata.maxFileBytes = input.options.maxFileBytes;
@@ -128,14 +82,71 @@ export function createIndexer(input) {
             index.metadata.excludeGlobs = input.options.excludeGlobs;
             index.metadata.maxChunkNonWhitespaceChars = input.options.maxChunkNonWhitespaceChars;
             index.metadata.chunking = input.options.chunking;
-            index.metadata.diagnostics = metadataDiagnostics;
-            index.metadata.diagnosticDetails = metadataDiagnosticDetails;
+            index.metadata.diagnostics = state.metadataDiagnostics;
+            index.metadata.diagnosticDetails = state.metadataDiagnosticDetails;
             index.metadata.status = "ready";
             index.metadata.updatedAt = Date.now();
-            await persistRefreshedIndex({ index, store, runStore, run: () => run, ensureRun });
+            await persistRefreshedIndex({
+                index,
+                store,
+                runStore,
+                run: runController.run,
+                ensureRun: runController.ensureRun,
+            });
             return index;
         },
     };
+}
+function createRefreshState(index, input) {
+    return {
+        nextFiles: {},
+        nextChunks: {},
+        nextSymbols: {},
+        symbolsByFilePath: symbolsByFilePath(index.symbols),
+        metadataDiagnostics: [],
+        metadataDiagnosticDetails: [],
+        reusedFileResults: [],
+        canReuseExistingRecords: canReuseExistingIndexRecords(index, input),
+        reusedRecordsChanged: false,
+        changed: false,
+    };
+}
+function canReuseExistingIndexRecords(index, input) {
+    return (index.metadata.maxChunkNonWhitespaceChars === input.options.maxChunkNonWhitespaceChars &&
+        sameChunkingOptions(index.metadata.chunking, input.options.chunking));
+}
+function createIndexRunController(index, input, runStore) {
+    let run;
+    let runPromise;
+    return {
+        run: () => run,
+        ensureRun: async () => {
+            if (!runStore) {
+                return;
+            }
+            if (!runPromise) {
+                markIndexing(index, input);
+                runPromise = runStore.beginIndexRun({
+                    configHash: indexRunConfigHash(index, input.worktree, input.options),
+                    metadata: index.metadata,
+                });
+            }
+            run = run ?? (await runPromise);
+            return run;
+        },
+    };
+}
+function markIndexing(index, input) {
+    index.metadata.status = "indexing";
+    applyScannerMetadata(index, input);
+}
+function applyScannerMetadata(index, input) {
+    index.metadata.worktree = input.worktree;
+    index.metadata.maxFileBytes = input.options.maxFileBytes;
+    index.metadata.includeGlobs = input.options.includeGlobs;
+    index.metadata.excludeGlobs = input.options.excludeGlobs;
+    index.metadata.maxChunkNonWhitespaceChars = input.options.maxChunkNonWhitespaceChars;
+    index.metadata.chunking = input.options.chunking;
 }
 async function processScannedFiles(input) {
     const inFlight = new Set();
@@ -224,38 +235,65 @@ async function processScannedFile(input) {
     const absolutePath = path.join(input.input.worktree, input.relativePath);
     const fileStat = await statFileForIndexing(absolutePath);
     const previousFile = input.index.files[input.relativePath];
-    const canRead = fileStat ? await canReadFile(absolutePath) : false;
-    if (fileStat &&
-        fileStat.sizeBytes <= input.input.options.maxFileBytes &&
-        (!canRead || statIsOlderThanIndex(fileStat, input.index.metadata.updatedAt)) &&
-        canReuseFileWithStat(input.index, input.state.symbolsByFilePath, previousFile, input.relativePath, fileStat, input.state.canReuseExistingRecords)) {
-        await reuseScannedFile(input, previousFile);
+    if (await reuseReadableStatFile(input, absolutePath, fileStat, previousFile)) {
         return input.state.changed;
     }
-    const file = Bun.file(absolutePath);
-    const skipDiagnostic = await skipFileDiagnostic(input.relativePath, file, input.input.options.maxFileBytes);
-    if (skipDiagnostic) {
-        input.state.metadataDiagnostics.push(skipDiagnostic.message);
-        input.state.metadataDiagnosticDetails.push(skipDiagnostic);
+    if (await recordSkippedFile(input, absolutePath, fileStat)) {
         return input.state.changed;
     }
     const loaded = await loadTextFileForIndexing(absolutePath);
     input.signal?.throwIfAborted();
-    const currentFingerprint = loaded.fingerprint;
-    if (canReuseFile(input.index, input.state.symbolsByFilePath, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords)) {
-        await reuseScannedFile(input, previousFile);
+    if (await reuseLoadedFile(input, previousFile, loaded.fingerprint)) {
         return input.state.changed;
     }
+    if (await reuseCompletedFileResult(input, loaded.fingerprint)) {
+        return true;
+    }
+    await indexFile({ ...input, absolutePath, currentFingerprint: loaded.fingerprint, fileStat, text: loaded.text });
+    return true;
+}
+async function reuseReadableStatFile(input, absolutePath, fileStat, previousFile) {
+    if (!fileStat || fileStat.sizeBytes > input.input.options.maxFileBytes) {
+        return false;
+    }
+    const canRead = await canReadFile(absolutePath);
+    if (canRead && !statIsOlderThanIndex(fileStat, input.index.metadata.updatedAt)) {
+        return false;
+    }
+    if (!(previousFile &&
+        canReuseFileWithStat(input.index, input.state.symbolsByFilePath, previousFile, input.relativePath, fileStat, input.state.canReuseExistingRecords))) {
+        return false;
+    }
+    await reuseScannedFile(input, previousFile);
+    return true;
+}
+async function recordSkippedFile(input, absolutePath, fileStat) {
+    const skipDiagnostic = await skipFileDiagnostic(input.relativePath, absolutePath, fileStat, input.input.options.maxFileBytes);
+    if (!skipDiagnostic) {
+        return false;
+    }
+    input.state.metadataDiagnostics.push(skipDiagnostic.message);
+    input.state.metadataDiagnosticDetails.push(skipDiagnostic);
+    return true;
+}
+async function reuseLoadedFile(input, previousFile, currentFingerprint) {
+    if (!(previousFile &&
+        canReuseFile(input.index, input.state.symbolsByFilePath, previousFile, input.relativePath, currentFingerprint, input.state.canReuseExistingRecords))) {
+        return false;
+    }
+    await reuseScannedFile(input, previousFile);
+    return true;
+}
+async function reuseCompletedFileResult(input, currentFingerprint) {
     const activeRun = await input.ensureRun();
     await flushQueuedReusedFileResults(input);
     const completed = activeRun
         ? await completedFileResult(input.runStore, activeRun.runId, input.relativePath, currentFingerprint)
         : undefined;
-    if (completed && canReuseCompletedFile(input.index, completed, input.relativePath, currentFingerprint)) {
-        reuseCompletedFileRecords(completed, input.state);
-        return true;
+    if (!(completed && canReuseCompletedFile(input.index, completed, input.relativePath, currentFingerprint))) {
+        return false;
     }
-    await indexFile({ ...input, absolutePath, currentFingerprint, fileStat, text: loaded.text });
+    reuseCompletedFileRecords(completed, input.state);
     return true;
 }
 async function reuseScannedFile(input, previousFile) {
@@ -365,7 +403,16 @@ async function indexFile(input) {
     input.signal?.throwIfAborted();
     const language = parsed.language;
     const root = parsed.root;
-    const rawChunks = root
+    const rawChunks = rawChunksForParsedFile(input, sourceIndex, language, root);
+    const symbols = symbolsForParsedFile(input, sourceIndex, root);
+    const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]));
+    const chunks = attachTopology(assignSymbolsToChunks(rawChunks, symbolsById), symbolsById);
+    const fileDiagnostics = "diagnostic" in parsed ? [String(parsed.diagnostic)] : [];
+    const fileChunks = await embedChunks({ ...input, parsed: { language }, chunks, symbolsById, fileDiagnostics });
+    await recordIndexedFile(input, language, symbols, chunks, fileChunks, fileDiagnostics);
+}
+function rawChunksForParsedFile(input, sourceIndex, language, root) {
+    return root
         ? castChunks({
             filePath: input.relativePath,
             language,
@@ -382,18 +429,27 @@ async function indexFile(input) {
             maxNonWhitespaceChars: input.input.options.maxChunkNonWhitespaceChars,
             sourceIndex,
         });
-    const symbols = root
+}
+function symbolsForParsedFile(input, sourceIndex, root) {
+    return root
         ? extractSymbols({ filePath: input.relativePath, source: input.text, sourceIndex, nodes: root.children })
         : [];
-    const symbolsById = Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol]));
-    const chunks = attachTopology(assignSymbolsToChunks(rawChunks, symbolsById), symbolsById);
-    const fileDiagnostics = "diagnostic" in parsed ? [String(parsed.diagnostic)] : [];
-    const fileChunks = await embedChunks({ ...input, parsed: { language }, chunks, symbolsById, fileDiagnostics });
+}
+function recordIndexedFile(input, language, symbols, chunks, fileChunks, fileDiagnostics) {
     Object.assign(input.state.nextChunks, fileChunks);
     for (const symbol of symbols) {
         input.state.nextSymbols[symbol.id] = symbol;
     }
-    const fileRecord = {
+    const fileRecord = indexedFileRecord(input, language, chunks, fileDiagnostics);
+    input.state.nextFiles[input.relativePath] = fileRecord;
+    return input.fileResultWriter.add({
+        file: fileRecord,
+        chunks: fileChunks,
+        symbols: Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol])),
+    });
+}
+function indexedFileRecord(input, language, chunks, fileDiagnostics) {
+    return {
         path: input.relativePath,
         language,
         fingerprint: input.currentFingerprint,
@@ -403,12 +459,6 @@ async function indexFile(input) {
         chunkIds: chunks.map((chunk) => chunk.id),
         diagnostics: fileDiagnostics,
     };
-    input.state.nextFiles[input.relativePath] = fileRecord;
-    await input.fileResultWriter.add({
-        file: fileRecord,
-        chunks: fileChunks,
-        symbols: Object.fromEntries(symbols.map((symbol) => [symbol.id, symbol])),
-    });
 }
 function createFileResultWriter(input) {
     const pending = [];
@@ -641,15 +691,18 @@ function stableStringify(value) {
     }
     return JSON.stringify(value);
 }
-async function skipFileDiagnostic(relativePath, file, maxFileBytes) {
-    if (file.size > maxFileBytes) {
+async function skipFileDiagnostic(relativePath, filePath, fileStat, maxFileBytes) {
+    if (!fileStat) {
+        return;
+    }
+    if (fileStat.sizeBytes > maxFileBytes) {
         return {
             code: "index.skipped_file",
-            message: `${relativePath}: skipped file over maxFileBytes (${file.size} > ${maxFileBytes})`,
+            message: `${relativePath}: skipped file over maxFileBytes (${fileStat.sizeBytes} > ${maxFileBytes})`,
             filePath: relativePath,
         };
     }
-    const sample = new Uint8Array(await file.slice(0, Math.min(file.size, BINARY_SAMPLE_BYTES)).arrayBuffer());
+    const sample = new Uint8Array((await readFile(filePath)).subarray(0, Math.min(fileStat.sizeBytes, BINARY_SAMPLE_BYTES)));
     if (isProbablyBinary(sample)) {
         return { code: "index.skipped_file", message: `${relativePath}: skipped binary file`, filePath: relativePath };
     }
@@ -818,22 +871,33 @@ async function* walk(root, predicates) {
         if (!directory) {
             continue;
         }
-        const entries = (await readdir(path.join(root, directory.prefix), { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name));
-        const localGitignore = await loadGitignore(root, directory.prefix);
-        const gitignores = localGitignore ? [...directory.gitignores, localGitignore] : directory.gitignores;
-        for (const entry of entries) {
+        for (const entry of await walkEntries(root, directory)) {
             const relative = path.join(directory.prefix, entry.name);
-            if (DEFAULT_IGNORED_DIRECTORIES.has(entry.name) || entry.isSymbolicLink() || isGitignored(relative, gitignores)) {
+            if (shouldSkipWalkEntry(entry, relative, entry.gitignores)) {
                 continue;
             }
             if (entry.isDirectory()) {
-                if (!predicates.excludesDirectory(relative)) {
-                    queue.push({ prefix: relative, gitignores });
-                }
+                enqueueWalkDirectory(queue, relative, entry.gitignores, predicates);
                 continue;
             }
             yield relative;
         }
+    }
+}
+async function walkEntries(root, directory) {
+    const entries = await readdir(path.join(root, directory.prefix), { withFileTypes: true });
+    const localGitignore = await loadGitignore(root, directory.prefix);
+    const gitignores = localGitignore ? [...directory.gitignores, localGitignore] : directory.gitignores;
+    return entries
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .map((entry) => Object.assign(entry, { gitignores }));
+}
+function shouldSkipWalkEntry(entry, relative, gitignores) {
+    return DEFAULT_IGNORED_DIRECTORIES.has(entry.name) || entry.isSymbolicLink() || isGitignored(relative, gitignores);
+}
+function enqueueWalkDirectory(queue, relative, gitignores, predicates) {
+    if (!predicates.excludesDirectory(relative)) {
+        queue.push({ prefix: relative, gitignores });
     }
 }
 function isGitignored(relativePath, gitignores) {
@@ -848,7 +912,7 @@ function toGitignorePath(relativePath) {
     return relativePath.split(path.sep).join("/");
 }
 async function loadTextFileForIndexing(filePath) {
-    const bytes = Buffer.from(await Bun.file(filePath).arrayBuffer());
+    const bytes = await readFile(filePath);
     return {
         fingerprint: fingerprintBytes(bytes),
         text: new TextDecoder().decode(bytes),

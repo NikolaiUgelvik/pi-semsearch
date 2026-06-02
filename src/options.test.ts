@@ -28,12 +28,12 @@ describe("parseOptions", () => {
       timeoutMs: 30_000,
     })
     expect(options.hyde).toEqual({
-      mode: "opencode",
+      mode: "disabled",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.42,
-      enabled: true,
+      enabled: false,
       timeoutMs: 30_000,
     })
     expect(options.maxChunkNonWhitespaceChars).toBe(2000)
@@ -400,7 +400,7 @@ describe("parseOptions", () => {
     expect(options.diagnostics).toContain("embedding.baseURL is required")
   })
 
-  test("defaults hyde to opencode fallback when embedding is configured", () => {
+  test("disables hyde by default when no chat provider is configured", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -413,12 +413,12 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "opencode",
+      mode: "disabled",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.35,
-      enabled: true,
+      enabled: false,
       timeoutMs: 30_000,
     })
   })
@@ -439,7 +439,7 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "opencode",
+      mode: "disabled",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
@@ -449,7 +449,7 @@ describe("parseOptions", () => {
     })
   })
 
-  test("uses opencode fallback for threshold-only hyde config", () => {
+  test("keeps hyde disabled for threshold-only config", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -465,17 +465,17 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "opencode",
+      mode: "disabled",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.6,
-      enabled: true,
+      enabled: false,
       timeoutMs: 30_000,
     })
   })
 
-  test("uses opencode fallback for partial hyde config", () => {
+  test("keeps hyde disabled for partial config", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -493,12 +493,12 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "opencode",
+      mode: "disabled",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.2,
-      enabled: true,
+      enabled: false,
       timeoutMs: 30_000,
     })
   })
@@ -532,7 +532,7 @@ describe("parseOptions", () => {
     })
   })
 
-  test("uses OPENCODE_CAST_CACHE_DIR before xdg fallback", () => {
+  test("uses PI_SEMSEARCH_CACHE_DIR before xdg fallback", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -541,10 +541,10 @@ describe("parseOptions", () => {
           model: "text-embedding-3-small",
         },
       },
-      { OPENCODE_CAST_CACHE_DIR: "/tmp/cast-cache" },
+      { PI_SEMSEARCH_CACHE_DIR: "/tmp/semsearch-cache" },
     )
 
-    expect(options.cacheDir).toBe("/tmp/cast-cache")
+    expect(options.cacheDir).toBe("/tmp/semsearch-cache")
   })
 
   test("preserves valid embedding when optional fields are invalid", () => {
@@ -637,7 +637,7 @@ describe("parseOptions", () => {
     expect(options.diagnostics).not.toContain("embedding.model is required")
   })
 
-  test("reports invalid hyde fields while preserving opencode fallback", () => {
+  test("reports invalid hyde fields while disabling HyDE fallback", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -655,12 +655,12 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "opencode",
+      mode: "disabled",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.35,
-      enabled: true,
+      enabled: false,
       timeoutMs: 30_000,
     })
     expect(options.diagnostics.some((diagnostic) => diagnostic.startsWith("hyde.baseURL:"))).toBe(true)

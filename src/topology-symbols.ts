@@ -40,22 +40,36 @@ function extractSymbolRecords(input: {
   while (stack.length > 0) {
     const { node, parentSymbolId } = stack.pop() as { node: SyntaxNode; parentSymbolId: string | undefined }
     const symbol = symbolForNode(indexedInput, node, parentSymbolId)
-    if (symbol) {
-      symbols.push(symbol)
-      if (parentSymbolId) {
-        const children = childrenByParentId[parentSymbolId] ?? []
-        children.push(symbol.id)
-        childrenByParentId[parentSymbolId] = children
-      }
-    }
-
-    const childParentSymbolId = symbol?.id ?? parentSymbolId
-    for (let index = node.children.length - 1; index >= 0; index -= 1) {
-      stack.push({ node: node.children[index], parentSymbolId: childParentSymbolId })
-    }
+    registerExtractedSymbol(symbol, parentSymbolId, symbols, childrenByParentId)
+    pushChildSymbolNodes(stack, node, symbol?.id ?? parentSymbolId)
   }
 
   return symbols.map((symbol) => ({ ...symbol, childSymbolIds: childrenByParentId[symbol.id] ?? [] }))
+}
+
+function registerExtractedSymbol(
+  symbol: SymbolRecord | undefined,
+  parentSymbolId: string | undefined,
+  symbols: SymbolRecord[],
+  childrenByParentId: Record<string, string[]>,
+) {
+  if (!symbol) {
+    return
+  }
+  symbols.push(symbol)
+  if (parentSymbolId) {
+    childrenByParentId[parentSymbolId] = [...(childrenByParentId[parentSymbolId] ?? []), symbol.id]
+  }
+}
+
+function pushChildSymbolNodes(
+  stack: Array<{ node: SyntaxNode; parentSymbolId: string | undefined }>,
+  node: SyntaxNode,
+  parentSymbolId: string | undefined,
+) {
+  for (let index = node.children.length - 1; index >= 0; index -= 1) {
+    stack.push({ node: node.children[index], parentSymbolId })
+  }
 }
 
 function symbolForNode(

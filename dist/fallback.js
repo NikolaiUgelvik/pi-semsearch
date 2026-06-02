@@ -5,35 +5,54 @@ const WHITESPACE_PATTERN = /\s/;
 export function fallbackChunks(input) {
     const sourceIndex = input.sourceIndex ?? createSourceIndex(input.text);
     const byteOffset = input.byteOffset ?? 0;
-    const chunks = [];
-    let byteStart = byteOffset;
-    let pending = "";
-    let pendingStart = byteOffset;
-    let pendingNonWhitespaceChars = 0;
+    const state = fallbackChunkState(byteOffset);
     for (const line of input.text.matchAll(LINE_PATTERN)) {
-        if (!line[0]) {
-            continue;
-        }
-        for (const part of splitByNonWhitespaceBudget(line[0], input.maxNonWhitespaceChars)) {
-            if (pending && pendingNonWhitespaceChars + part.nonWhitespaceChars > input.maxNonWhitespaceChars) {
-                chunks.push(makeFallbackChunk(input.filePath, input.language, sourceIndex, pendingStart, byteStart, pending));
-                pending = "";
-                pendingStart = byteStart;
-                pendingNonWhitespaceChars = 0;
-            }
-            pending += part.text;
-            pendingNonWhitespaceChars += part.nonWhitespaceChars;
-            byteStart += part.byteLength;
-        }
+        appendFallbackLine(state, line[0], input.maxNonWhitespaceChars, {
+            filePath: input.filePath,
+            language: input.language,
+            sourceIndex,
+        });
     }
-    if (pending) {
-        chunks.push(makeFallbackChunk(input.filePath, input.language, sourceIndex, pendingStart, byteStart, pending));
-    }
-    return chunks.map((chunk, index) => ({
+    flushFallbackPending(state, input.filePath, input.language, sourceIndex);
+    return state.chunks.map((chunk, index) => ({
         ...chunk,
-        previousSiblingChunkId: chunks[index - 1]?.id,
-        nextSiblingChunkId: chunks[index + 1]?.id,
+        previousSiblingChunkId: state.chunks[index - 1]?.id,
+        nextSiblingChunkId: state.chunks[index + 1]?.id,
     }));
+}
+function fallbackChunkState(byteOffset) {
+    return {
+        chunks: [],
+        byteStart: byteOffset,
+        pending: "",
+        pendingStart: byteOffset,
+        pendingNonWhitespaceChars: 0,
+    };
+}
+function appendFallbackLine(state, line, maxNonWhitespaceChars, chunkInput) {
+    if (!line) {
+        return;
+    }
+    for (const part of splitByNonWhitespaceBudget(line, maxNonWhitespaceChars)) {
+        appendFallbackPart(state, part, maxNonWhitespaceChars, chunkInput);
+    }
+}
+function appendFallbackPart(state, part, maxNonWhitespaceChars, chunkInput) {
+    if (state.pending && state.pendingNonWhitespaceChars + part.nonWhitespaceChars > maxNonWhitespaceChars) {
+        flushFallbackPending(state, chunkInput.filePath, chunkInput.language, chunkInput.sourceIndex);
+    }
+    state.pending += part.text;
+    state.pendingNonWhitespaceChars += part.nonWhitespaceChars;
+    state.byteStart += part.byteLength;
+}
+function flushFallbackPending(state, filePath, language, sourceIndex) {
+    if (!state.pending) {
+        return;
+    }
+    state.chunks.push(makeFallbackChunk(filePath, language, sourceIndex, state.pendingStart, state.byteStart, state.pending));
+    state.pending = "";
+    state.pendingStart = state.byteStart;
+    state.pendingNonWhitespaceChars = 0;
 }
 function makeFallbackChunk(filePath, language, sourceIndex, byteStart, byteEnd, text) {
     return {

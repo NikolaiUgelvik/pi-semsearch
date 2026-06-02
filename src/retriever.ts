@@ -423,20 +423,7 @@ async function outputResult(
     return []
   }
   if (input.input.input.includeParents !== true) {
-    return [
-      {
-        filePath: chunk.filePath,
-        language: chunk.language,
-        range: chunk.range,
-        score: input.initialScores[result.id] ?? result.score,
-        finalScore: result.score,
-        kind: chunk.kind,
-        breadcrumbs: chunkBreadcrumbs(chunk, input.input.index.symbols),
-        text: chunk.text,
-        topology: summarizeTopology(chunk, input.chunksById, input.input.index.symbols),
-        retrieval: input.retrieval.get(result.id),
-      },
-    ]
+    return [baseOutputResult(input, result, chunk)]
   }
   const source = await sourceForChunk({
     input: input.input,
@@ -461,22 +448,38 @@ async function outputResult(
     source,
     symbols: input.input.index.symbols,
   })
-  return [
-    {
-      filePath: chunk.filePath,
-      language: chunk.language,
-      range: chunk.range,
-      score: input.initialScores[result.id] ?? result.score,
-      finalScore: result.score,
-      kind: chunk.kind,
-      breadcrumbs: context.breadcrumbs,
-      text: sourceMatches ? chunk.text : "",
-      parentText: context.parentText,
-      parentRange: context.parentRange,
-      topology: summarizeTopology(chunk, input.chunksById, input.input.index.symbols),
-      retrieval: input.retrieval.get(result.id),
-    },
-  ]
+  return [parentOutputResult({ input, result, chunk, context, sourceMatches })]
+}
+
+function baseOutputResult(input: Parameters<typeof outputResults>[0], result: RankedResult, chunk: ChunkRecord) {
+  return {
+    filePath: chunk.filePath,
+    language: chunk.language,
+    range: chunk.range,
+    score: input.initialScores[result.id] ?? result.score,
+    finalScore: result.score,
+    kind: chunk.kind,
+    breadcrumbs: chunkBreadcrumbs(chunk, input.input.index.symbols),
+    text: chunk.text,
+    topology: summarizeTopology(chunk, input.chunksById, input.input.index.symbols),
+    retrieval: input.retrieval.get(result.id),
+  }
+}
+
+function parentOutputResult(input: {
+  input: Parameters<typeof outputResults>[0]
+  result: RankedResult
+  chunk: ChunkRecord
+  context: ReturnType<typeof parentContext>
+  sourceMatches: boolean
+}) {
+  return {
+    ...baseOutputResult(input.input, input.result, input.chunk),
+    breadcrumbs: input.context.breadcrumbs,
+    text: input.sourceMatches ? input.chunk.text : "",
+    parentText: input.context.parentText,
+    parentRange: input.context.parentRange,
+  }
 }
 
 function sourceForChunk(input: {

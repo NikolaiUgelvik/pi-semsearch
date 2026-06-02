@@ -1,1 +1,1 @@
-export { castPlugin as default } from "./plugin.js";
+export { piSemsearchExtension as default } from "./extension.js";

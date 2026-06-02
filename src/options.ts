@@ -292,7 +292,7 @@ function withDefault<T>(value: T | undefined, defaultValue: T) {
 }
 
 function cacheDirOption(cacheDir: string | undefined, env: Record<string, string | undefined>) {
-  return cacheDir ?? env.OPENCODE_CAST_CACHE_DIR ?? path.join(cacheBaseDir(env), "opencode", "cast")
+  return cacheDir ?? env.PI_SEMSEARCH_CACHE_DIR ?? path.join(cacheBaseDir(env), "pi", "semsearch")
 }
 
 function cacheBaseDir(env: Record<string, string | undefined>) {
@@ -324,14 +324,32 @@ function hydeOptions(
 ): HydeOptions {
   const api = openAiCompatibleConfig(raw)
   return {
-    mode: api ? "openai-compatible" : "opencode",
+    ...hydeProviderOptions(api, raw, env),
+    threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
+    enabled: hydeEnabled(api, raw?.enabled, hasEmbeddingConfig),
+    timeoutMs: raw?.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
+  }
+}
+
+function hydeProviderOptions(
+  api: { baseURL: string; model: string } | undefined,
+  raw: ReturnType<typeof rawOptions>["hyde"],
+  env: Record<string, string | undefined>,
+) {
+  return {
+    mode: api ? ("openai-compatible" as const) : ("disabled" as const),
     baseURL: api?.baseURL,
     apiKey: apiKeyForOpenAiHyde(api, raw, env),
     model: api?.model,
-    threshold: withDefault(raw?.threshold, DEFAULT_HYDE_THRESHOLD),
-    enabled: withDefault(raw?.enabled, hasEmbeddingConfig),
-    timeoutMs: raw?.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS,
   }
+}
+
+function hydeEnabled(
+  api: { baseURL: string; model: string } | undefined,
+  enabled: boolean | undefined,
+  hasEmbeddingConfig: boolean,
+) {
+  return Boolean(api) && withDefault(enabled, hasEmbeddingConfig)
 }
 
 function apiKeyForOpenAiHyde(
@@ -436,14 +454,19 @@ function parseRerankConfig(input: unknown) {
     return
   }
 
-  const api = parseApiConfig(input)
+  return {
+    ...rerankApiFields(parseApiConfig(input)),
+    candidateMultiplier: safeField(RerankFields.candidateMultiplier, inputRecord.data.candidateMultiplier),
+  }
+}
+
+function rerankApiFields(api: ReturnType<typeof parseApiConfig>) {
   return {
     baseURL: api?.baseURL,
     apiKey: api?.apiKey,
     apiKeyEnv: api?.apiKeyEnv,
     model: api?.model,
     timeoutMs: api?.timeoutMs,
-    candidateMultiplier: safeField(RerankFields.candidateMultiplier, inputRecord.data.candidateMultiplier),
   }
 }
 

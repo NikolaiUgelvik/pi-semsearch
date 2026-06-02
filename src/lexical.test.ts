@@ -14,7 +14,7 @@ const baseChunk: Omit<ChunkRecord, "id" | "filePath" | "text" | "range"> = {
 describe("lexical retrieval", () => {
   test("tokenizes code identifiers, env vars, and paths", () => {
     expect(
-      tokenizeCodeText("src/retriever.test.ts semantic_get_chunk semanticGetChunk OPENCODE_CAST_CACHE_DIR"),
+      tokenizeCodeText("src/retriever.test.ts semantic_get_chunk semanticGetChunk PI_SEMSEARCH_CACHE_DIR"),
     ).toEqual(
       expect.arrayContaining([
         "src",
@@ -26,9 +26,9 @@ describe("lexical retrieval", () => {
         "get",
         "chunk",
         "semanticgetchunk",
-        "opencode_cast_cache_dir",
-        "opencode",
-        "cast",
+        "pi_semsearch_cache_dir",
+        "pi",
+        "semsearch",
         "cache",
         "dir",
       ]),
@@ -53,7 +53,7 @@ describe("lexical retrieval", () => {
   test("builds lexical stats from chunks, paths, symbols, kind, and node types", () => {
     const chunks = {
       a: chunk("a", "src/retriever.ts", "export function retrieveSemanticChunk() {}", ["s1"]),
-      b: chunk("b", "src/options.ts", "const cacheDir = process.env.OPENCODE_CAST_CACHE_DIR", []),
+      b: chunk("b", "src/options.ts", "const cacheDir = process.env.PI_SEMSEARCH_CACHE_DIR", []),
     }
     const symbols: Record<string, SymbolRecord> = {
       s1: symbol("s1", "retrieveSemanticChunk", "function", "src/retriever.ts"),
@@ -73,13 +73,13 @@ describe("lexical retrieval", () => {
     expect(indexed.chunks.a.lexical?.termFrequencies.retrieve).toBeGreaterThan(0)
     expect(indexed.chunks.a.lexical?.termFrequencies.retriever).toBeGreaterThan(0)
     expect(indexed.chunks.a.lexical?.termFrequencies.function_declaration).toBe(1)
-    expect(indexed.chunks.b.lexical?.termFrequencies.opencode_cast_cache_dir).toBe(1)
+    expect(indexed.chunks.b.lexical?.termFrequencies.pi_semsearch_cache_dir).toBe(1)
   })
 
   test("counts prototype property names as numeric lexical terms", () => {
     const { lexical, chunks } = buildLexicalIndex(
       {
-        a: chunk("a", "src/plugin.ts", "class IndexUnavailableError { constructor(message: string) {} }", []),
+        a: chunk("a", "src/extension.ts", "class IndexUnavailableError { constructor(message: string) {} }", []),
       },
       {},
     )

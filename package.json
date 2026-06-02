@@ -1,25 +1,26 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "opencode-plugin-cast",
+  "name": "pi-semsearch",
   "version": "0.1.0",
-  "description": "Unofficial cAST semantic code search plugin for opencode.",
+  "description": "Semantic code search extension for Pi.",
   "type": "module",
   "license": "MIT",
   "packageManager": "bun@1.3.14",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NikolaiUgelvik/opencode-plugin-cast.git"
+    "url": "git+https://github.com/NikolaiUgelvik/pi-semsearch.git"
   },
   "bugs": {
-    "url": "https://github.com/NikolaiUgelvik/opencode-plugin-cast/issues"
+    "url": "https://github.com/NikolaiUgelvik/pi-semsearch/issues"
   },
-  "homepage": "https://github.com/NikolaiUgelvik/opencode-plugin-cast#readme",
+  "homepage": "https://github.com/NikolaiUgelvik/pi-semsearch#readme",
   "keywords": [
-    "opencode",
-    "plugin",
+    "pi-package",
+    "pi",
+    "extension",
     "semantic-search",
     "code-search",
-    "cast"
+    "semsearch"
   ],
   "scripts": {
     "format": "biome check --write .",
@@ -31,6 +32,11 @@
     "build": "tsc",
     "prepack": "bun run check && bun run typecheck && bun run build"
   },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -41,12 +47,13 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
+    "src",
     "dist",
     "README.md",
     "LICENSE"
   ],
   "dependencies": {
-    "@opencode-ai/plugin": "1.15.12",
+    "better-sqlite3": "^12.10.0",
     "ignore": "7.0.5",
     "minimatch": "10.0.3",
     "sqlite-vec": "^0.1.9",
@@ -63,13 +70,20 @@
     "web-tree-sitter": "0.25.10",
     "zod": "4.1.8"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
     "@tsconfig/node22": "22.0.2",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/bun": "1.3.13",
     "@types/node": "24.12.2",
     "@typescript/native-preview": "7.0.0-dev.20251207.1",
     "fallow": "2.84.0",
+    "typebox": "^1.0.68",
     "typescript": "5.8.2"
   },
   "trustedDependencies": [
