@@ -11,6 +11,8 @@ import { retrieveFromStore } from "./retriever.js";
 import { createIndexer } from "./scanner.js";
 import { createIndexStore } from "./store.js";
 const COMPACTION_DIAGNOSTIC = "output compacted to fit opencode tool_output limits; use semantic_get_chunk for more context";
+const INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC = "index refresh in progress; results may be stale";
+const INITIAL_INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC = "index refresh in progress; no searchable active index is available yet";
 const LOOKUP_COMPACTION_DIAGNOSTIC = "output compacted to fit opencode tool_output limits; narrow semantic_get_chunk args, page children, reduce included relations, or increase opencode tool_output limits";
 const LONG_COMPACT_TEXT_LENGTH = 200;
 const MEDIUM_COMPACT_TEXT_LENGTH = 80;
@@ -268,9 +270,9 @@ export function createCastPluginForTest(dependencies = {}) {
             if (!embedding) {
                 throw new Error("embedding dependency unavailable");
             }
-            await ensureSearchIndexReady(args.refresh === true, queueRefresh, () => refresh, () => storeError);
+            const readiness = await ensureSearchIndexReady(args.refresh === true, queueRefresh, () => refresh, () => storeError);
             try {
-                return await (dependencies.retrieve ?? retrieveFromStore)({
+                const output = await (dependencies.retrieve ?? retrieveFromStore)({
                     input: args,
                     options: { ...options, hybrid: options.retrieval.hybrid, rerank: options.rerank },
                     embed: (text) => client.embed({ ...embedding, input: text }),
@@ -279,6 +281,9 @@ export function createCastPluginForTest(dependencies = {}) {
                     readSource: async (filePath) => Bun.file(await resolveWorktreePath(input.worktree, filePath)).text(),
                     indexStore: retrievalIndexStore(),
                 });
+                return readiness.refreshInProgress
+                    ? appendSearchDiagnostic(output, INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC)
+                    : output;
             }
             catch (error) {
                 if (!(error instanceof IndexUnavailableError)) {
@@ -344,7 +349,7 @@ This tool searches syntax-aware code chunks such as functions, classes, methods,
                             if (!(error instanceof IndexUnavailableError)) {
                                 throw error;
                             }
-                            return unavailableToolResult("Semantic code search index unavailable", storeError);
+                            return unavailableToolResult("Semantic code search index unavailable", refresh ? INITIAL_INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC : storeError);
                         }
                     },
                 }),
@@ -587,11 +592,28 @@ async function ensureSearchIndexReady(shouldRefresh, queueRefresh, currentRefres
     if (shouldRefresh) {
         await queueRefresh();
     }
-    await currentRefresh();
+    const refreshInProgress = currentRefresh() !== undefined;
+    if (shouldRefresh) {
+        await currentRefresh();
+    }
     const storeError = currentStoreError();
     if (storeError) {
         throw new IndexUnavailableError(storeError);
     }
+    return { refreshInProgress };
+}
+function appendSearchDiagnostic(output, diagnostic) {
+    return {
+        ...output,
+        status: {
+            ...output.status,
+            diagnostics: diagnosticsWithAppendedMessage(output.status.diagnostics, diagnostic),
+        },
+        diagnostics: diagnosticsWithAppendedMessage(output.diagnostics, diagnostic),
+    };
+}
+function diagnosticsWithAppendedMessage(diagnostics, diagnostic) {
+    return diagnostics.includes(diagnostic) ? diagnostics : [...diagnostics, diagnostic];
 }
 function generateHydeText(input) {
     const openAiHyde = openAiHydeInput(input.query, input.hyde);

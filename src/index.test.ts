@@ -61,7 +61,11 @@ describe("cast plugin", () => {
     const diagnostic = "output compacted to fit opencode tool_output limits; use semantic_get_chunk for more context"
     const plugin = createCastPluginForTest({
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
-      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      createStore: () => ({
+        readMetadata: async () => emptyReadyIndex().metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
       retrieve: async () => ({
         status: searchStatus(),
         results: [
@@ -132,7 +136,11 @@ describe("cast plugin", () => {
     ]
     const plugin = createCastPluginForTest({
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
-      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      createStore: () => ({
+        readMetadata: async () => emptyReadyIndex().metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
       retrieve: async () => ({
         status: { ...searchStatus(), diagnostics, diagnosticDetails },
         results: [
@@ -190,7 +198,11 @@ describe("cast plugin", () => {
     ]
     const plugin = createCastPluginForTest({
       createIndexer: () => ({ refresh: async () => emptyReadyIndex() }),
-      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      createStore: () => ({
+        readMetadata: async () => emptyReadyIndex().metadata,
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
       retrieve: async () => ({
         status: { ...searchStatus(), diagnostics, diagnosticDetails },
         results: [],
@@ -1173,7 +1185,7 @@ describe("cast plugin", () => {
       })
 
       const result = await semanticSearchTool(hooks).execute(
-        { query: "session", topK: 1, includeParents: false, paths: ["code.ts"] },
+        { query: "session", topK: 1, includeParents: false, paths: ["code.ts"], refresh: true },
         { worktree: dir, directory: dir } as never,
       )
 
@@ -1492,6 +1504,117 @@ describe("cast plugin", () => {
 
     expect(typeof result).toBe("object")
     expect(refreshes).toBe(0)
+  })
+
+  test("normal search does not wait for background startup refresh", async () => {
+    let resolveStartupRefresh: (() => void) | undefined
+    const events: string[] = []
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: () =>
+          new Promise((resolve) => {
+            events.push("startup started")
+            resolveStartupRefresh = () => {
+              events.push("startup finished")
+              resolve(emptyReadyIndex())
+            }
+          }),
+      }),
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => {
+        events.push("retrieve")
+        return {
+          status: searchStatus(),
+          results: [],
+          diagnostics: [],
+        }
+      },
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const result = await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    expect(events).toEqual(["startup started", "retrieve"])
+    resolveStartupRefresh?.()
+  })
+
+  test("normal search during background refresh reports stale active index", async () => {
+    let resolveStartupRefresh: (() => void) | undefined
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: () =>
+          new Promise((resolve) => {
+            resolveStartupRefresh = () => resolve(emptyReadyIndex())
+          }),
+      }),
+      createStore: () => ({ read: async () => emptyReadyIndex(), write: async () => undefined }),
+      retrieve: async () => ({
+        status: searchStatus(),
+        results: [],
+        diagnostics: [],
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const result = await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(JSON.parse(result.output).diagnostics).toContain("index refresh in progress; results may be stale")
+    resolveStartupRefresh?.()
+  })
+
+  test("normal search returns immediately when only initial indexing is available", async () => {
+    let resolveStartupRefresh: (() => void) | undefined
+    const events: string[] = []
+    const plugin = createCastPluginForTest({
+      createIndexer: () => ({
+        refresh: () =>
+          new Promise((resolve) => {
+            events.push("startup started")
+            resolveStartupRefresh = () => {
+              events.push("startup finished")
+              resolve(emptyReadyIndex())
+            }
+          }),
+      }),
+      createStore: () => ({
+        readMetadata: async () => {
+          throw new Error("index unavailable")
+        },
+        read: async () => emptyReadyIndex(),
+        write: async () => undefined,
+      }),
+    })
+    const hooks = await plugin(input as never, {
+      embedding: { baseURL: "https://example.test/v1", apiKey: "key", model: "embed" },
+    })
+
+    const result = await semanticSearchTool(hooks).execute({ query: "session" }, {
+      worktree: "/repo",
+      directory: "/repo",
+    } as never)
+
+    expect(typeof result).toBe("object")
+    if (typeof result === "string") {
+      throw new Error("expected object tool result")
+    }
+    expect(result.output).toContain("index refresh in progress; no searchable active index is available yet")
+    expect(events).toEqual(["startup started"])
+    resolveStartupRefresh?.()
   })
 
   test("ready metadata with mismatched scanner options skips startup refresh", async () => {
