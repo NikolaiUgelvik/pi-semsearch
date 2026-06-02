@@ -492,7 +492,9 @@ function registerChunkLookupTool(pi, runtimeFor) {
         description: "Fetch an indexed semantic code chunk by a topology node ID returned from semantic_search_code, with optional parent, sibling, and child topology context.",
         promptSnippet: "Fetch exact semantic chunk context by topology node ID from semantic_search_code.",
         parameters: Type.Object({
-            id: Type.String({ description: "A topology node id returned from semantic_search_code, such as topology.current.id, topology.parent.id, a sibling id, or a child id." }),
+            id: Type.String({
+                description: "A topology node id returned from semantic_search_code, such as topology.current.id, topology.parent.id, a sibling id, or a child id.",
+            }),
             includeParents: Type.Optional(Type.Boolean()),
             includeSiblings: Type.Optional(Type.Boolean()),
             includeChildren: Type.Optional(Type.Boolean()),

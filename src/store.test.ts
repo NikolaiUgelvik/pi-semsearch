@@ -114,6 +114,15 @@ async function fileExists(filePath: string) {
   }
 }
 
+function readSqliteFreelistCount(filePath: string) {
+  const db = new Database(filePath)
+  try {
+    return (db.query("pragma freelist_count").get() as { freelist_count: number }).freelist_count
+  } finally {
+    db.close()
+  }
+}
+
 describe("index store", () => {
   test("does not persist chunk source text in SQLite record JSON", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
@@ -518,6 +527,70 @@ describe("index store", () => {
       } finally {
         db.close()
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("vacuums SQLite freelist after pruning a large superseded run", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-store-"))
+    try {
+      const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
+      const oldIndex = createEmptyIndex({
+        projectId: "p",
+        worktree: "/repo",
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      oldIndex.metadata.status = "ready"
+      oldIndex.metadata.embeddingDimensions = 2
+      const oldChunkIds = Array.from({ length: 384 }, (_, index) => `old-${index}`)
+      oldIndex.files["old.ts"] = {
+        path: "old.ts",
+        language: "typescript",
+        fingerprint: "old",
+        chunkIds: oldChunkIds,
+        diagnostics: [],
+      }
+      for (const [index, id] of oldChunkIds.entries()) {
+        const text = Array.from({ length: 128 }, (_, line) => `const value_${index}_${line} = ${line}`).join("\n")
+        oldIndex.chunks[id] = {
+          ...chunk(id, "old.ts", [1, 0]),
+          text,
+          nonWhitespaceChars: text.replace(/\s/g, "").length,
+        }
+      }
+      await store.write(oldIndex)
+
+      const newIndex = createEmptyIndex({
+        projectId: "p",
+        worktree: "/repo",
+        cacheKey: "project",
+        maxChunkNonWhitespaceChars: 2000,
+      })
+      newIndex.metadata.status = "ready"
+      newIndex.metadata.embeddingDimensions = 2
+      newIndex.files["new.ts"] = {
+        path: "new.ts",
+        language: "typescript",
+        fingerprint: "new",
+        chunkIds: ["new"],
+        diagnostics: [],
+      }
+      newIndex.chunks.new = chunk("new", "new.ts", [0, 1])
+      const { runId } = await store.beginIndexRun({
+        configHash: "same-config",
+        metadata: { ...newIndex.metadata, status: "indexing" },
+      })
+      await store.writeFileResult(runId, {
+        file: newIndex.files["new.ts"],
+        chunks: { new: newIndex.chunks.new },
+        symbols: {},
+      })
+
+      await store.activateRun(runId, newIndex)
+
+      expect(readSqliteFreelistCount(path.join(dir, "project", "index.sqlite"))).toBe(0)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

@@ -29,6 +29,8 @@ const SQLITE_VECTOR_PATH_FILTER_MAX_K = SQLITE_VECTOR_MAX_K
 const SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER = 10
 const SQLITE_LEXICAL_PATH_FILTER_MAX_K = 1000
 const SQLITE_LEXICAL_FALLBACK_QUERY_TERMS = 16
+const SQLITE_VACUUM_MIN_FREE_PAGES = 256
+const SQLITE_VACUUM_MIN_FREE_RATIO = 0.2
 const INDEX_STATUSES: readonly unknown[] = ["empty", "indexing", "ready", "stale", "error"]
 const CHUNK_KINDS: readonly unknown[] = ["file", "class", "function", "method", "block", "fallback"]
 const SYMBOL_KINDS: readonly unknown[] = ["module", "class", "function", "method", "interface"]
@@ -880,6 +882,29 @@ function writeSqliteIndex(db: Database, index: CastIndex) {
   })
 
   write(index)
+  vacuumSqliteIndexIfNeeded(db)
+}
+
+function vacuumSqliteIndexIfNeeded(db: Database) {
+  const pageCount = readSqlitePragmaNumber(db, "page_count")
+  const freePages = readSqlitePragmaNumber(db, "freelist_count")
+  if (pageCount === 0 || freePages < SQLITE_VACUUM_MIN_FREE_PAGES) {
+    return
+  }
+  if (freePages / pageCount < SQLITE_VACUUM_MIN_FREE_RATIO) {
+    return
+  }
+  try {
+    db.run("vacuum")
+  } catch {
+    // Optional maintenance; keep the index usable even if compaction is blocked by another connection.
+  }
+}
+
+function readSqlitePragmaNumber(db: Database, name: "page_count" | "freelist_count") {
+  const row = db.query(`pragma ${name}`).get() as Record<string, unknown> | null
+  const value = row?.[name]
+  return typeof value === "number" ? value : 0
 }
 
 function beginSqliteIndexRun(db: Database, configHash: string, metadata: CastIndex["metadata"]) {
@@ -1008,6 +1033,7 @@ function activateSqliteRun(db: Database, runId: string, index: CastIndex) {
     pruneSupersededRuns(db, runId)
   })
   activate(index)
+  vacuumSqliteIndexIfNeeded(db)
 }
 
 function updateRunChunkLexicalStats(db: Database, runId: string, chunks: CastIndex["chunks"]) {

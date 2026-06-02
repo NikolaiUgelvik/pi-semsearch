@@ -15,6 +15,8 @@ const SQLITE_VECTOR_PATH_FILTER_MAX_K = SQLITE_VECTOR_MAX_K;
 const SQLITE_LEXICAL_PATH_FILTER_MULTIPLIER = 10;
 const SQLITE_LEXICAL_PATH_FILTER_MAX_K = 1000;
 const SQLITE_LEXICAL_FALLBACK_QUERY_TERMS = 16;
+const SQLITE_VACUUM_MIN_FREE_PAGES = 256;
+const SQLITE_VACUUM_MIN_FREE_RATIO = 0.2;
 const INDEX_STATUSES = ["empty", "indexing", "ready", "stale", "error"];
 const CHUNK_KINDS = ["file", "class", "function", "method", "block", "fallback"];
 const SYMBOL_KINDS = ["module", "class", "function", "method", "interface"];
@@ -684,6 +686,28 @@ function writeSqliteIndex(db, index) {
         db.run("insert or replace into meta (key, value) values ('active_run_id', ?)", [runId]);
     });
     write(index);
+    vacuumSqliteIndexIfNeeded(db);
+}
+function vacuumSqliteIndexIfNeeded(db) {
+    const pageCount = readSqlitePragmaNumber(db, "page_count");
+    const freePages = readSqlitePragmaNumber(db, "freelist_count");
+    if (pageCount === 0 || freePages < SQLITE_VACUUM_MIN_FREE_PAGES) {
+        return;
+    }
+    if (freePages / pageCount < SQLITE_VACUUM_MIN_FREE_RATIO) {
+        return;
+    }
+    try {
+        db.run("vacuum");
+    }
+    catch {
+        // Optional maintenance; keep the index usable even if compaction is blocked by another connection.
+    }
+}
+function readSqlitePragmaNumber(db, name) {
+    const row = db.query(`pragma ${name}`).get();
+    const value = row?.[name];
+    return typeof value === "number" ? value : 0;
 }
 function beginSqliteIndexRun(db, configHash, metadata) {
     const existing = db
@@ -786,6 +810,7 @@ function activateSqliteRun(db, runId, index) {
         pruneSupersededRuns(db, runId);
     });
     activate(index);
+    vacuumSqliteIndexIfNeeded(db);
 }
 function updateRunChunkLexicalStats(db, runId, chunks) {
     const select = db.query("select record_json as recordJson from chunks where run_id = ? and id = ?");
