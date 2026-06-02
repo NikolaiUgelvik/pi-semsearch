@@ -1,3 +1,6 @@
+# Archived
+Moving away from opencode. This will be deleted shortly.
+
 # opencode-plugin-cast
 
 Semantic code search plugin for opencode using code retrieval-augmented generation with structural chunking via abstract syntax tree.
