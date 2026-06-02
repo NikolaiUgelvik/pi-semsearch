@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test } from "vitest"
 import { buildLexicalIndex, reciprocalRankFusion, tokenizeCodeText } from "./lexical.js"
 import type { ChunkRecord, SymbolRecord } from "./types.js"
 

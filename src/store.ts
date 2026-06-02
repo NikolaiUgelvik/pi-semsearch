@@ -1566,7 +1566,7 @@ function insertChunksWithVectorRowids(db: Database, runId: string, chunks: Chunk
     ])
     if (chunk.embedding) {
       db.run("insert into chunk_vectors (rowid, embedding) values (?, ?)", [
-        vectorRowid,
+        sqliteVecRowid(vectorRowid),
         JSON.stringify(chunk.embedding),
       ])
       db.run("insert into chunk_rowids (run_id, chunk_id, rowid) values (?, ?, ?)", [runId, chunk.id, vectorRowid])
@@ -1581,6 +1581,10 @@ function nextVectorRowid(db: Database) {
   return row.rowid
 }
 
+function sqliteVecRowid(rowid: number) {
+  return BigInt(rowid)
+}
+
 function deleteRunFile(db: Database, runId: string, filePath: string) {
   const rows = db
     .query(
@@ -1589,7 +1593,7 @@ function deleteRunFile(db: Database, runId: string, filePath: string) {
     .all(runId, filePath) as Array<{ rowid: number }>
   if (tableExists(db, "chunk_vectors")) {
     for (const row of rows) {
-      db.run("delete from chunk_vectors where rowid = ?", [row.rowid])
+      db.run("delete from chunk_vectors where rowid = ?", [sqliteVecRowid(row.rowid)])
     }
   }
   db.run(
@@ -1609,7 +1613,7 @@ function deleteRunRecords(db: Database, runId: string) {
   const rows = db.query("select rowid from chunk_rowids where run_id = ?").all(runId) as Array<{ rowid: number }>
   if (tableExists(db, "chunk_vectors")) {
     for (const row of rows) {
-      db.run("delete from chunk_vectors where rowid = ?", [row.rowid])
+      db.run("delete from chunk_vectors where rowid = ?", [sqliteVecRowid(row.rowid)])
     }
   }
   db.run("delete from chunk_rowids where run_id = ?", [runId])

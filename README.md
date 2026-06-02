@@ -12,14 +12,12 @@ The extension registers two Pi tools:
 From a local checkout while developing:
 
 ```bash
-pi -e /home/nikolai/git/pi-semsearch
+pi -e ./pi-semsearch
 ```
 
-Or install as a Pi package:
+Or install from GitHub as a Pi package:
 
 ```bash
-pi install /home/nikolai/git/pi-semsearch
-# or, once pushed:
 pi install git:github.com/NikolaiUgelvik/pi-semsearch
 ```
 
@@ -52,7 +50,18 @@ export PI_SEMSEARCH_EMBEDDING_MODEL=text-embedding-3-small
 export PI_SEMSEARCH_EMBEDDING_BASE_URL=https://api.openai.com/v1
 ```
 
-HyDE is disabled by default for Pi unless configured with an OpenAI-compatible chat provider:
+HyDE is disabled by default. Enable it to use Pi's active model for query expansion:
+
+```json
+{
+  "hyde": {
+    "enabled": true,
+    "threshold": 0.35
+  }
+}
+```
+
+You can also pin HyDE to an explicit OpenAI-compatible chat provider:
 
 ```json
 {
@@ -76,4 +85,4 @@ HyDE is disabled by default for Pi unless configured with an OpenAI-compatible c
 
 ## Notes
 
-Runtime code uses Pi's extension API (`pi.registerTool`, `pi.registerCommand`, and lifecycle events) and Node file APIs so it can run under Pi's extension loader.
+The Pi package manifest loads extensions from `extensions/`; `extensions/pi-semsearch.ts` delegates to the implementation in `src/`. Runtime code uses Pi's extension API (`pi.registerTool`, `pi.registerCommand`, and lifecycle events) and Node file APIs so it can run under Pi's extension loader.

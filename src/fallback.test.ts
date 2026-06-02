@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test } from "vitest"
 import { fallbackChunks } from "./fallback.js"
 import { createSourceIndex, nonWhitespaceLength, rangeForSlice } from "./range.js"
 

@@ -2,12 +2,12 @@
 
 ## Commands
 
-- Use Bun `1.3.14`; the README uses `npm exec --yes bun@1.3.14 -- <cmd>` when the local Bun version is not guaranteed.
-- Install deps with `npm_config_nodedir=/usr npm exec --yes bun@1.3.14 -- install`; Tree-sitter deps are trusted in `package.json`.
-- Full verification before packaging: `bun run check && bun run typecheck && bun run build`; `prepack` runs exactly that order.
-- Usual local verification: `bun run lint`, `bun run typecheck`, `bun test --timeout 30000`, `bun run build`.
-- Focused test: `bun test --timeout 30000 src/options.test.ts` or add `-t "test name"`.
-- `bun run format` is the only mutating formatter command; `lint`/`check` are non-mutating Biome checks.
+- Use Node `24.x` and npm `11.x`.
+- Install deps with `npm install`; Tree-sitter deps are trusted in `package.json`. On Node 24, use `CXXFLAGS='-std=c++20' npm install` if native `tree-sitter` needs to build from source.
+- Full verification before packaging: `npm run check && npm run typecheck && npm run build`; `prepack` runs exactly that order.
+- Usual local verification: `npm run lint`, `npm run typecheck`, `npm test`, `npm run build`.
+- Focused test: `npm test -- src/options.test.ts` or add `-t "test name"`.
+- `npm run format` is the only mutating formatter command; `lint`/`check` are non-mutating Biome checks.
 
 ## Architecture
 
@@ -22,5 +22,6 @@
 
 - TypeScript builds with `tsc` to `dist/`; tests are excluded from `tsconfig.json` build input.
 - Imports in source use `.js` extensions because `module`/`moduleResolution` are `nodenext`.
-- Biome is strict: 2-space indentation, double quotes, no semicolons, trailing commas, line width 120; prefer small targeted rule overrides only when a rule conflicts with a valid Bun/Pi pattern.
+- Tests run with Vitest under Node.
+- Biome is strict: 2-space indentation, double quotes, no semicolons, trailing commas, line width 120; prefer small targeted rule overrides only when necessary.
 - Keep Pi config examples as extension entries; after changing extension config or rebuilding a local `dist/index.js`, Pi must be restarted if the extension is already loaded.

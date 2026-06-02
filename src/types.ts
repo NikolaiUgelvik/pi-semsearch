@@ -26,7 +26,7 @@ export type RerankOptions = {
 }
 
 export type HydeOptions = {
-  mode: "openai-compatible" | "disabled"
+  mode: "openai-compatible" | "pi-active" | "disabled"
   // biome-ignore lint/style/useNamingConvention: Matches the existing plugin option name.
   baseURL?: string
   apiKey?: string

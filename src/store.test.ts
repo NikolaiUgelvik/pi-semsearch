@@ -1,9 +1,10 @@
-import { Database } from "bun:sqlite"
-import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import BetterSqlite3 from "better-sqlite3"
 import { load as loadSqliteVec } from "sqlite-vec"
+import { describe, expect, test } from "vitest"
 import { cosineSimilarity, createEmptyIndex, createIndexStore, searchVectors } from "./store.js"
 import type { CastIndex, ChunkRecord, FileRecord, LexicalChunkCandidate, SymbolRecord } from "./types.js"
 
@@ -52,6 +53,36 @@ type BatchResumableStore = ResumableStore & {
 
 const MISSING_CHUNK_RECORD_COLUMN_PATTERN = /record_json|no such column/
 
+type SqliteParameter = string | number | bigint | null | Buffer
+
+class Database {
+  private readonly db: BetterSqlite3.Database
+
+  constructor(file: string) {
+    this.db = new BetterSqlite3(file)
+  }
+
+  query(sql: string) {
+    const statement = this.db.prepare(sql)
+    return {
+      get: (...params: SqliteParameter[]) => statement.get(...params),
+      all: (...params: SqliteParameter[]) => statement.all(...params),
+    }
+  }
+
+  run(sql: string, params: SqliteParameter[] = []) {
+    return this.db.prepare(sql).run(...params)
+  }
+
+  close() {
+    this.db.close()
+  }
+
+  raw() {
+    return this.db
+  }
+}
+
 function chunk(id: string, filePath: string, embedding: number[]): ChunkRecord {
   return {
     id,
@@ -69,10 +100,18 @@ function chunk(id: string, filePath: string, embedding: number[]): ChunkRecord {
 }
 
 async function testFingerprint(filePath: string) {
-  const bytes = new Uint8Array(await Bun.file(filePath).arrayBuffer())
-  const hash = new Bun.CryptoHasher("sha256")
-  hash.update(bytes)
-  return hash.digest("hex")
+  return createHash("sha256")
+    .update(await readFile(filePath))
+    .digest("hex")
+}
+
+async function fileExists(filePath: string) {
+  try {
+    await access(filePath)
+    return true
+  } catch {
+    return false
+  }
 }
 
 describe("index store", () => {
@@ -82,7 +121,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       await mkdir(worktree, { recursive: true })
       const sourcePath = path.join(worktree, "src.ts")
-      await Bun.write(sourcePath, "function hello() {}\n")
+      await writeFile(sourcePath, "function hello() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -136,7 +175,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(sourcePath, "function hello() {}\n")
+      await writeFile(sourcePath, "function hello() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -173,7 +212,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(sourcePath, "function hello() {}\n")
+      await writeFile(sourcePath, "function hello() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -204,7 +243,7 @@ describe("index store", () => {
         embedding: [1, 0],
       }
       await store.write(index)
-      await Bun.write(sourcePath, "function changed() {}\n")
+      await writeFile(sourcePath, "function changed() {}\n")
 
       const cached = await store.read()
 
@@ -221,7 +260,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(sourcePath, "function hello() {}\n")
+      await writeFile(sourcePath, "function hello() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -269,7 +308,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(sourcePath, "function hello() {}\n")
+      await writeFile(sourcePath, "function hello() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -470,7 +509,7 @@ describe("index store", () => {
 
       const db = new Database(path.join(dir, "project", "index.sqlite"))
       try {
-        loadSqliteVec(db)
+        loadSqliteVec(db.raw())
         expect(db.query("select count(*) as count from runs").get()).toEqual({ count: 1 })
         expect(db.query("select count(*) as count from chunks").get()).toEqual({ count: 1 })
         expect(db.query("select count(*) as count from chunk_rowids").get()).toEqual({ count: 1 })
@@ -532,7 +571,7 @@ describe("index store", () => {
       const db = new Database(dbPath)
       let expectedVectorRow: { vectorRowid: number; embeddingJson: string }
       try {
-        loadSqliteVec(db)
+        loadSqliteVec(db.raw())
         const chunkRow = db
           .query("select record_json as recordJson from chunks where run_id = ? and id = ?")
           .get(runId, "a") as {
@@ -575,7 +614,7 @@ describe("index store", () => {
 
       const reopened = new Database(dbPath)
       try {
-        loadSqliteVec(reopened)
+        loadSqliteVec(reopened.raw())
         const row = reopened
           .query(
             `select chunks.record_json as chunkJson,
@@ -650,7 +689,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src/a.ts")
       await mkdir(path.dirname(sourcePath), { recursive: true })
-      await Bun.write(sourcePath, "function a() {}\n")
+      await writeFile(sourcePath, "function a() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
       const index = createEmptyIndex({
         projectId: "p",
@@ -688,8 +727,8 @@ describe("index store", () => {
       const aPath = path.join(worktree, "src/a.ts")
       const bPath = path.join(worktree, "src/b.ts")
       await mkdir(path.dirname(aPath), { recursive: true })
-      await Bun.write(aPath, "function a() {}\n")
-      await Bun.write(bPath, "function b() {}\n")
+      await writeFile(aPath, "function a() {}\n")
+      await writeFile(bPath, "function b() {}\n")
       const store = createIndexStore({
         cacheDir: dir,
         cacheKey: "project",
@@ -742,7 +781,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src/a.ts")
       await mkdir(path.dirname(sourcePath), { recursive: true })
-      await Bun.write(sourcePath, "const before = 1\nfunction alpha() {}\n")
+      await writeFile(sourcePath, "const before = 1\nfunction alpha() {}\n")
       const sourceText = "function alpha() {}"
       const byteStart = "const before = 1\n".length
       const byteEnd = byteStart + sourceText.length
@@ -793,8 +832,8 @@ describe("index store", () => {
       const firstPath = path.join(worktree, "src/a.ts")
       const secondPath = path.join(worktree, "src/b.ts")
       await mkdir(path.dirname(firstPath), { recursive: true })
-      await Bun.write(firstPath, "function alpha() {}\n")
-      await Bun.write(secondPath, "function beta() {}\n")
+      await writeFile(firstPath, "function alpha() {}\n")
+      await writeFile(secondPath, "function beta() {}\n")
       const firstFingerprint = await testFingerprint(firstPath)
       const secondFingerprint = await testFingerprint(secondPath)
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
@@ -879,7 +918,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src/a.ts")
       await mkdir(path.dirname(sourcePath), { recursive: true })
-      await Bun.write(sourcePath, "function alpha() {}\n")
+      await writeFile(sourcePath, "function alpha() {}\n")
       const fingerprint = await testFingerprint(sourcePath)
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
       const index = createEmptyIndex({
@@ -910,7 +949,7 @@ describe("index store", () => {
         },
         symbols: {},
       })
-      await Bun.write(sourcePath, "function changed() {}\n")
+      await writeFile(sourcePath, "function changed() {}\n")
 
       const completed = await store.getCompletedFile(runId, "src/a.ts", fingerprint)
 
@@ -926,7 +965,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src/a.ts")
       await mkdir(path.dirname(sourcePath), { recursive: true })
-      await Bun.write(sourcePath, "function alpha() {}\n")
+      await writeFile(sourcePath, "function alpha() {}\n")
       const fingerprint = await testFingerprint(sourcePath)
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
       const index = createEmptyIndex({
@@ -973,7 +1012,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src/a.ts")
       await mkdir(path.dirname(sourcePath), { recursive: true })
-      await Bun.write(sourcePath, "function alpha() {}\n")
+      await writeFile(sourcePath, "function alpha() {}\n")
       const fingerprint = await testFingerprint(sourcePath)
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 }) as ResumableStore
       const index = createEmptyIndex({
@@ -1290,7 +1329,7 @@ describe("index store", () => {
 
       const results = await (store as VectorSearchStore).searchVectorCandidates?.([1, 0], 2, ["**/allowed.ts"])
 
-      expect(results).toEqual([])
+      expect([...results]).toEqual([])
       expect((results as typeof results & { incomplete?: boolean })?.incomplete).toBe(true)
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -1538,8 +1577,8 @@ describe("index store", () => {
       expect(index.files).toEqual({})
       expect(index.chunks).toEqual({})
       expect(index.symbols).toEqual({})
-      expect(await Bun.file(path.join(dir, "project", "index.sqlite")).exists()).toBe(true)
-      expect(await Bun.file(path.join(dir, "project", "index.json")).exists()).toBe(false)
+      expect(await fileExists(path.join(dir, "project", "index.sqlite"))).toBe(true)
+      expect(await fileExists(path.join(dir, "project", "index.json"))).toBe(false)
       const db = new Database(path.join(dir, "project", "index.sqlite"))
       try {
         expect(db.query("select value from meta where key = 'schema_version'").get()).toEqual({ value: "4" })
@@ -1570,14 +1609,14 @@ describe("index store", () => {
       }
       oldIndex.chunks.old = chunk("old", "old.ts", [1, 0, 0, 0])
       await mkdir(path.join(dir, "project"), { recursive: true })
-      await Bun.write(path.join(dir, "project", "index.json"), JSON.stringify(oldIndex))
+      await writeFile(path.join(dir, "project", "index.json"), JSON.stringify(oldIndex))
 
       const cached = await createIndexStore({ cacheDir: dir, cacheKey: "project" }).read()
 
       expect(cached.metadata.status).toBe("empty")
       expect(cached.files).toEqual({})
       expect(cached.chunks).toEqual({})
-      expect(await Bun.file(path.join(dir, "project", "index.sqlite")).exists()).toBe(true)
+      expect(await fileExists(path.join(dir, "project", "index.sqlite"))).toBe(true)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -1589,7 +1628,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src/a.ts")
       await mkdir(path.dirname(sourcePath), { recursive: true })
-      await Bun.write(sourcePath, "\nfunction alpha() {}\n")
+      await writeFile(sourcePath, "\nfunction alpha() {}\n")
       const index: CastIndex = createEmptyIndex({
         projectId: "p",
         worktree,
@@ -1657,7 +1696,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       await mkdir(worktree, { recursive: true })
       const sourcePath = path.join(worktree, "src.ts")
-      await Bun.write(sourcePath, "function alpha() {}\nfunction beta() {}\n")
+      await writeFile(sourcePath, "function alpha() {}\nfunction beta() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -1742,8 +1781,8 @@ describe("index store", () => {
       const alphaPath = path.join(worktree, "src/a.ts")
       const betaPath = path.join(worktree, "src/b.ts")
       await mkdir(path.dirname(alphaPath), { recursive: true })
-      await Bun.write(alphaPath, "function alpha() {}\n")
-      await Bun.write(betaPath, "function beta() {}\n")
+      await writeFile(alphaPath, "function alpha() {}\n")
+      await writeFile(betaPath, "function beta() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -1827,7 +1866,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "a.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(
+      await writeFile(
         sourcePath,
         "function before() {}\nfunction parent() {\n  function child() {}\n}\nfunction after() {}\n",
       )
@@ -1891,7 +1930,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(sourcePath, "function alpha() {}\nfunction beta() {}\n")
+      await writeFile(sourcePath, "function alpha() {}\nfunction beta() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -1932,7 +1971,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(sourcePath, "function alpha() {}\n")
+      await writeFile(sourcePath, "function alpha() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",
@@ -1977,7 +2016,7 @@ describe("index store", () => {
       const worktree = path.join(dir, "worktree")
       const sourcePath = path.join(worktree, "src.ts")
       await mkdir(worktree, { recursive: true })
-      await Bun.write(sourcePath, "function alpha() {}\nfunction unrelated() {}\n")
+      await writeFile(sourcePath, "function alpha() {}\nfunction unrelated() {}\n")
       const store = createIndexStore({ cacheDir: dir, cacheKey: "project", embeddingDimensions: 2 })
       const index = createEmptyIndex({
         projectId: "p",

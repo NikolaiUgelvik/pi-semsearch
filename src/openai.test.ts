@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test } from "vitest"
 import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
 import { createOpenAIClient } from "./openai.js"
 

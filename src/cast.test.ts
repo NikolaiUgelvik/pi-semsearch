@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test } from "vitest"
 import { castChunks, type SyntaxNode } from "./cast.js"
 
 const IDENTIFIER_PATTERN = /[A-Za-z_$][\w$]*/
@@ -226,7 +226,7 @@ describe("castChunks", () => {
     })
 
     expect(chunks.map((chunk) => chunk.text)).not.toContain("describe")
-    expect(chunks[0].text).toStartWith("describe(")
+    expect(chunks[0].text.startsWith("describe(")).toBe(true)
   })
 
   test("defaults to no overlap", () => {

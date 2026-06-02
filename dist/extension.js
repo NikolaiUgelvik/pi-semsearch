@@ -3,8 +3,10 @@ import { readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { env } from "node:process";
+import { complete } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getChunkById } from "./chunk-lookup.js";
+import { HYDE_SYSTEM_PROMPT } from "./hyde.js";
 import { parseSource } from "./language.js";
 import { createOpenAIClient } from "./openai.js";
 import { parseOptions } from "./options.js";
@@ -15,6 +17,7 @@ const COMPACTION_DIAGNOSTIC = "output compacted; use semantic_get_chunk for more
 const INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC = "index refresh in progress; results may be stale";
 const INITIAL_INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC = "index refresh in progress; no searchable active index is available yet";
 const LOOKUP_COMPACTION_DIAGNOSTIC = "output compacted; narrow semantic_get_chunk args, page children, or reduce included relations";
+const HYDE_PROVIDER_ERROR = "pi-semsearch HyDE requires either an active Pi model or explicit hyde.baseURL and hyde.model; set hyde.enabled=false to disable HyDE";
 const LONG_COMPACT_TEXT_LENGTH = 200;
 const MEDIUM_COMPACT_TEXT_LENGTH = 80;
 const SHORT_COMPACT_TEXT_LENGTH = 20;
@@ -148,7 +151,7 @@ class SemsearchRuntime {
         this.refreshTail = nextRefresh.then(() => undefined, () => undefined);
         return nextRefresh;
     }
-    async semanticSearchOutput(args, signal) {
+    async semanticSearchOutput(args, signal, ctx) {
         const embedding = this.options.embedding;
         if (!embedding) {
             throw new Error("embedding dependency unavailable");
@@ -165,7 +168,7 @@ class SemsearchRuntime {
                     maxRerankCandidates: this.options.retrieval.maxRerankCandidates,
                 },
                 embed: (text) => this.client.embed({ ...embedding, input: text, signal }),
-                generateHyde: (query) => this.generateHydeText(query, signal),
+                generateHyde: (query) => this.generateHydeText(query, signal, ctx),
                 rerank: (query, documents) => rerankDocuments({ query, documents, rerank: this.options.rerank, client: this.client, signal }),
                 readSource: async (filePath) => readFile(await resolveWorktreePath(this.worktree, filePath), "utf8"),
                 indexStore: this.retrievalIndexStore(),
@@ -348,7 +351,7 @@ class SemsearchRuntime {
         }
         return wrapped;
     }
-    generateHydeText(query, signal) {
+    generateHydeText(query, signal, ctx) {
         signal?.throwIfAborted();
         const hyde = this.options.hyde;
         if (hyde.mode === "openai-compatible" && hyde.baseURL && hyde.model) {
@@ -361,7 +364,32 @@ class SemsearchRuntime {
                 signal,
             });
         }
-        throw new Error("pi-semsearch HyDE requires hyde.baseURL and hyde.model; set hyde.enabled=false to disable HyDE");
+        if (hyde.mode === "pi-active") {
+            return this.generatePiHydeText(query, signal, ctx);
+        }
+        throw new Error(HYDE_PROVIDER_ERROR);
+    }
+    async generatePiHydeText(query, signal, ctx) {
+        if (!ctx?.model) {
+            throw new Error(HYDE_PROVIDER_ERROR);
+        }
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+        if (!auth.ok) {
+            throw new Error(auth.error);
+        }
+        const userMessage = {
+            role: "user",
+            content: [{ type: "text", text: query }],
+            timestamp: Date.now(),
+        };
+        const response = await (this.dependencies.complete ?? complete)(ctx.model, { systemPrompt: HYDE_SYSTEM_PROMPT, messages: [userMessage] }, { apiKey: auth.apiKey, headers: auth.headers, signal, timeoutMs: this.options.hyde.timeoutMs });
+        if (response.stopReason !== "stop") {
+            throw new Error(response.errorMessage ?? `Pi active model HyDE stopped with ${response.stopReason}`);
+        }
+        return response.content
+            .filter((content) => content.type === "text")
+            .map((content) => content.text)
+            .join("\n");
     }
 }
 function createPiSemsearchExtensionForTest(dependencies = {}) {
@@ -445,7 +473,7 @@ Use grep only when you need exhaustive literal matching, occurrence counts, mech
             }
             onUpdate?.({ content: [{ type: "text", text: "Searching semantic code index..." }], details: {} });
             try {
-                const output = await runtime.semanticSearchOutput(params, signal);
+                const output = await runtime.semanticSearchOutput(params, signal, ctx);
                 return piToolResult(runtime.searchToolResult(params.query, output));
             }
             catch (error) {
@@ -495,13 +523,13 @@ function withPiHydeDefaults(config) {
     if (!isRecord(config)) {
         return config;
     }
-    return hasConfiguredHydeProvider(config.hyde) ? config : { ...config, hyde: disabledHydeConfig(config.hyde) };
+    return hasConfiguredHyde(config.hyde) ? config : { ...config, hyde: disabledHydeConfig(config.hyde) };
 }
 function isRecord(value) {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
-function hasConfiguredHydeProvider(hyde) {
-    return isRecord(hyde) && typeof hyde.baseURL === "string" && typeof hyde.model === "string";
+function hasConfiguredHyde(hyde) {
+    return (isRecord(hyde) && (hyde.enabled === true || (typeof hyde.baseURL === "string" && typeof hyde.model === "string")));
 }
 function disabledHydeConfig(hyde) {
     return isRecord(hyde) ? { ...hyde, enabled: false } : { enabled: false };

@@ -5,7 +5,7 @@
   "description": "Semantic code search extension for Pi.",
   "type": "module",
   "license": "MIT",
-  "packageManager": "bun@1.3.14",
+  "packageManager": "npm@11.12.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/NikolaiUgelvik/pi-semsearch.git"
@@ -25,16 +25,16 @@
   "scripts": {
     "format": "biome check --write .",
     "lint": "biome check .",
-    "check": "biome ci . && bun run fallow",
+    "check": "biome ci . && npm run fallow",
     "fallow": "fallow --ci --fail-on-issues",
-    "test": "bun test --timeout 30000",
+    "test": "vitest run",
     "typecheck": "tsgo --noEmit",
     "build": "tsc",
-    "prepack": "bun run check && bun run typecheck && bun run build"
+    "prepack": "npm run check && npm run typecheck && npm run build"
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./extensions"
     ]
   },
   "exports": {
@@ -47,6 +47,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
+    "extensions",
     "src",
     "dist",
     "README.md",
@@ -57,6 +58,7 @@
     "ignore": "7.0.5",
     "minimatch": "10.0.3",
     "sqlite-vec": "^0.1.9",
+    "tree-sitter": "^0.25.0",
     "tree-sitter-bash": "0.25.0",
     "tree-sitter-go": "0.25.0",
     "tree-sitter-html": "0.23.2",
@@ -67,24 +69,25 @@
     "tree-sitter-ruby": "0.23.1",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
-    "web-tree-sitter": "0.25.10",
     "zod": "4.1.8"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
+    "@earendil-works/pi-ai": "^0.78.0",
     "@earendil-works/pi-coding-agent": "^0.78.0",
     "@tsconfig/node22": "22.0.2",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/bun": "1.3.13",
     "@types/node": "24.12.2",
     "@typescript/native-preview": "7.0.0-dev.20251207.1",
     "fallow": "2.84.0",
     "typebox": "^1.0.68",
-    "typescript": "5.8.2"
+    "typescript": "5.8.2",
+    "vitest": "^4.0.14"
   },
   "trustedDependencies": [
     "tree-sitter",
@@ -97,7 +100,6 @@
     "tree-sitter-python",
     "tree-sitter-ruby",
     "tree-sitter-rust",
-    "tree-sitter-typescript",
-    "web-tree-sitter"
+    "tree-sitter-typescript"
   ]
 }

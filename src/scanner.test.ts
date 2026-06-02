@@ -1,8 +1,9 @@
-import { Database } from "bun:sqlite"
-import { describe, expect, test } from "bun:test"
-import { chmod, mkdir, mkdtemp, rm, stat, symlink, utimes } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import BetterSqlite3 from "better-sqlite3"
+import { describe, expect, test } from "vitest"
 import { parseOptions } from "./options.js"
 import { createIndexer as createScannerIndexer } from "./scanner.js"
 import { createEmptyIndex, createIndexStore } from "./store.js"
@@ -10,6 +11,32 @@ import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, SymbolRecord 
 
 const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 }
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+type SqliteParameter = string | number | bigint | null | Buffer
+
+class Database {
+  private readonly db: BetterSqlite3.Database
+
+  constructor(file: string) {
+    this.db = new BetterSqlite3(file)
+  }
+
+  query(sql: string) {
+    const statement = this.db.prepare(sql)
+    return {
+      get: (...params: SqliteParameter[]) => statement.get(...params),
+      all: (...params: SqliteParameter[]) => statement.all(...params),
+    }
+  }
+
+  run(sql: string, params: SqliteParameter[] = []) {
+    return this.db.prepare(sql).run(...params)
+  }
+
+  close() {
+    this.db.close()
+  }
+}
 type CreateIndexerInput = Parameters<typeof createScannerIndexer>[0]
 type TestCreateIndexerInput = Omit<CreateIndexerInput, "options"> & {
   options: Omit<CreateIndexerInput["options"], "chunking" | "maxFileBytes"> & {
@@ -53,10 +80,9 @@ function readActiveRunId(cacheDir: string) {
 }
 
 async function testFingerprint(filePath: string) {
-  const bytes = new Uint8Array(await Bun.file(filePath).arrayBuffer())
-  const hash = new Bun.CryptoHasher("sha256")
-  hash.update(bytes)
-  return hash.digest("hex")
+  return createHash("sha256")
+    .update(await readFile(filePath))
+    .digest("hex")
 }
 
 function createMemoryStore(initial?: CastIndex): CreateIndexerInput["store"] {
@@ -86,8 +112,8 @@ describe("createIndexer", () => {
   test("batches embeddings across files", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       const batches: string[][] = []
       const indexer = createIndexer({
         worktree: dir,
@@ -124,7 +150,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const source = "export function example() { return 1 }\n"
-      await Bun.write(path.join(dir, "example.ts"), source)
+      await writeFile(path.join(dir, "example.ts"), source)
       let rootReads = 0
       const root = {
         type: "program",
@@ -171,7 +197,7 @@ describe("createIndexer", () => {
   test("aborts before embedding batches after parsing", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "example.ts"), "export const example = 1\n")
+      await writeFile(path.join(dir, "example.ts"), "export const example = 1\n")
       const controller = new AbortController()
       let embedBatchCalled = false
       const indexer = createIndexer({
@@ -207,7 +233,7 @@ describe("createIndexer", () => {
   test("limits in-flight embedding batches", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(
+      await writeFile(
         path.join(dir, "source.txt"),
         Array.from({ length: 8 }, (_, index) => `chunk ${index}`).join("\n\n"),
       )
@@ -248,7 +274,7 @@ describe("createIndexer", () => {
   test("limits embedding batches to configured concurrency", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "many.txt"), Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n"))
+      await writeFile(path.join(dir, "many.txt"), Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n"))
       let active = 0
       let maxActive = 0
 
@@ -285,8 +311,8 @@ describe("createIndexer", () => {
   test("processes independent files concurrently", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       let activeParses = 0
       let maxActiveParses = 0
       let releaseImmediately = false
@@ -343,8 +369,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a-slow.ts"), "export const slow = 1\n")
-      await Bun.write(path.join(dir, "b-fail.ts"), "export const fail = 2\n")
+      await writeFile(path.join(dir, "a-slow.ts"), "export const slow = 1\n")
+      await writeFile(path.join(dir, "b-fail.ts"), "export const fail = 2\n")
       let releaseSlowParse: (() => void) | undefined
       let writeFailureStarted: (() => void) | undefined
       const writeFailure = new Promise<void>((resolve) => {
@@ -406,7 +432,7 @@ describe("createIndexer", () => {
     try {
       const filePath = path.join(dir, "a.ts")
       const fileText = "export const a = 1\n"
-      await Bun.write(filePath, fileText)
+      await writeFile(filePath, fileText)
       let parseSource = ""
       const index = await createIndexer({
         worktree: dir,
@@ -437,8 +463,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       let parseCalls = 0
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
@@ -494,8 +520,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
       const originalWriteFileResults = store.writeFileResults.bind(store)
       let batchWrites = 0
@@ -536,8 +562,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       let aEmbedded: (() => void) | undefined
       const aEmbeddedPromise = new Promise<void>((resolve) => {
         aEmbedded = resolve
@@ -600,8 +626,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       let aEmbedded: (() => void) | undefined
       const aEmbeddedPromise = new Promise<void>((resolve) => {
         aEmbedded = resolve
@@ -663,7 +689,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
       const originalWriteFileResult = store.writeFileResult.bind(store)
       disableBatchFileResultWrites(store)
@@ -699,8 +725,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
       const originalWriteFileResult = store.writeFileResult.bind(store)
       disableBatchFileResultWrites(store)
@@ -742,7 +768,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 })
       const indexer = createIndexer({
@@ -778,7 +804,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const filePath = path.join(dir, "a.ts")
-      await Bun.write(filePath, "export const a = 1\n")
+      await writeFile(filePath, "export const a = 1\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -815,7 +841,7 @@ describe("createIndexer", () => {
       const refreshed = await indexer.refresh()
 
       expect(refreshed.files["a.ts"]?.sizeBytes).toBeGreaterThan(0)
-      expect(refreshed.files["a.ts"]?.mtimeMs).toBeNumber()
+      expect(refreshed.files["a.ts"]?.mtimeMs).toBeTypeOf("number")
       expect(parseCalls).toBe(1)
       expect(embedCalls).toBe(1)
     } finally {
@@ -829,8 +855,8 @@ describe("createIndexer", () => {
     try {
       const unchangedPath = path.join(dir, "unchanged.ts")
       const changedPath = path.join(dir, "changed.ts")
-      await Bun.write(unchangedPath, "export const unchanged = 1\n")
-      await Bun.write(changedPath, "export const changed = 1\n")
+      await writeFile(unchangedPath, "export const unchanged = 1\n")
+      await writeFile(changedPath, "export const changed = 1\n")
       const parsedFiles: string[] = []
       const embeddedTexts: string[] = []
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -869,7 +895,7 @@ describe("createIndexer", () => {
       const unreadableStat = await stat(unchangedPath)
       index.files["unchanged.ts"].ctimeMs = unreadableStat.ctimeMs
       index.metadata.updatedAt = unreadableStat.ctimeMs + 2000
-      await Bun.write(changedPath, "export const changed = 200\n")
+      await writeFile(changedPath, "export const changed = 200\n")
 
       await indexer.refresh()
 
@@ -887,7 +913,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const filePath = path.join(dir, "a.ts")
-      await Bun.write(filePath, "export const a = 1\n")
+      await writeFile(filePath, "export const a = 1\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const indexer = createIndexer({
         worktree: dir,
@@ -910,7 +936,7 @@ describe("createIndexer", () => {
 
       await indexer.refresh()
       const previousMtime = new Date(index.files["a.ts"].mtimeMs ?? 0)
-      await Bun.write(filePath, "export const b = 2\n")
+      await writeFile(filePath, "export const b = 2\n")
       await utimes(filePath, previousMtime, previousMtime)
       await chmod(filePath, 0)
       const changedStat = await stat(filePath)
@@ -929,7 +955,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const filePath = path.join(dir, "a.ts")
-      await Bun.write(filePath, "export const a = 1\n")
+      await writeFile(filePath, "export const a = 1\n")
       const fingerprint = await testFingerprint(filePath)
       let index = createEmptyIndex({
         projectId: "p",
@@ -993,7 +1019,7 @@ describe("createIndexer", () => {
     try {
       const filePath = path.join(dir, "src", "a.ts")
       await mkdir(path.dirname(filePath), { recursive: true })
-      await Bun.write(filePath, "export const a = 1\n")
+      await writeFile(filePath, "export const a = 1\n")
       const fingerprint = await testFingerprint(filePath)
       let index = createEmptyIndex({
         projectId: "p",
@@ -1061,8 +1087,8 @@ describe("createIndexer", () => {
   test("reuses file symbols through a per-file symbol index", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function alpha() { return 1 }\n")
-      await Bun.write(path.join(dir, "b.ts"), "export function beta() { return 2 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function alpha() { return 1 }\n")
+      await writeFile(path.join(dir, "b.ts"), "export function beta() { return 2 }\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const parseCalls: string[] = []
       const indexer = createIndexer({
@@ -1110,7 +1136,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       let beginRuns = 0
       let writes = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ReturnType<
@@ -1143,7 +1169,7 @@ describe("createIndexer", () => {
       })
 
       await indexer.refresh()
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 2\n")
       await indexer.refresh()
 
       expect(beginRuns).toBe(2)
@@ -1158,8 +1184,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 1\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 })
       const indexer = createIndexer({
         worktree: dir,
@@ -1176,7 +1202,7 @@ describe("createIndexer", () => {
       })
 
       await indexer.refresh()
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 2\n")
       const refreshed = await indexer.refresh()
 
       expect(Object.keys(refreshed.files).sort()).toEqual(["a.ts", "b.ts"])
@@ -1193,7 +1219,7 @@ describe("createIndexer", () => {
     try {
       await Promise.all(
         ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"].map((fileName) =>
-          Bun.write(path.join(dir, fileName), `export const ${fileName[0]} = 1\n`),
+          writeFile(path.join(dir, fileName), `export const ${fileName[0]} = 1\n`),
         ),
       )
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
@@ -1227,7 +1253,7 @@ describe("createIndexer", () => {
       await indexer.refresh()
       firstRefreshComplete = true
       batchWrites.length = 0
-      await Bun.write(path.join(dir, "e.ts"), "export const e = 2\n")
+      await writeFile(path.join(dir, "e.ts"), "export const e = 2\n")
 
       await indexer.refresh()
 
@@ -1244,7 +1270,7 @@ describe("createIndexer", () => {
     try {
       await Promise.all(
         Array.from({ length: 257 }, (_, index) => `${String(index).padStart(3, "0")}.ts`).map((fileName) =>
-          Bun.write(path.join(dir, fileName), `export const value${fileName.replace(/\W/g, "")} = 1\n`),
+          writeFile(path.join(dir, fileName), `export const value${fileName.replace(/\W/g, "")} = 1\n`),
         ),
       )
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as BatchResumableStore
@@ -1283,7 +1309,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const filePath = path.join(dir, "a.ts")
-      await Bun.write(filePath, "export function used() { return 1 }\n")
+      await writeFile(filePath, "export function used() { return 1 }\n")
       const fingerprint = await testFingerprint(filePath)
       const usedSymbol: SymbolRecord = {
         id: "a.ts:function:used",
@@ -1363,7 +1389,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const filePath = path.join(dir, "a.ts")
-      await Bun.write(filePath, "export class Used { method() { return 1 } }\n")
+      await writeFile(filePath, "export class Used { method() { return 1 } }\n")
       const fingerprint = await testFingerprint(filePath)
       const parentSymbol: SymbolRecord = {
         id: "a.ts:class:Used",
@@ -1446,8 +1472,8 @@ describe("createIndexer", () => {
     const secondDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-b-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(firstDir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(secondDir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(firstDir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(secondDir, "a.ts"), "export const a = 1\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
       disableBatchFileResultWrites(store)
       const originalWriteFileResult = store.writeFileResult.bind(store)
@@ -1505,7 +1531,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       let parseCalls = 0
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
@@ -1569,7 +1595,7 @@ describe("createIndexer", () => {
     try {
       const sourcePath = path.join(dir, "src/a.ts")
       await mkdir(path.dirname(sourcePath), { recursive: true })
-      await Bun.write(sourcePath, "export const a = 1\n")
+      await writeFile(sourcePath, "export const a = 1\n")
       let parseCalls = 0
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
@@ -1640,7 +1666,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "old.ts"), "export const old = true\n")
+      await writeFile(path.join(dir, "old.ts"), "export const old = true\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 }) as ResumableStore
       const oldIndex = createEmptyIndex({
         projectId: "p",
@@ -1671,7 +1697,7 @@ describe("createIndexer", () => {
         embedding: [1, 0],
       }
       await store.write(oldIndex)
-      await Bun.write(path.join(dir, "old.ts"), "export const old = false\n")
+      await writeFile(path.join(dir, "old.ts"), "export const old = false\n")
       store.activateRun = async () => {
         throw new Error("simulated ready refresh activation failure")
       }
@@ -1705,7 +1731,7 @@ describe("createIndexer", () => {
   test("indexes changed files and removes deleted files", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       const writes: unknown[] = []
       let index = createEmptyIndex({
         projectId: "p",
@@ -1751,7 +1777,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const outside = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-outside-"))
     try {
-      await Bun.write(path.join(outside, "secret.ts"), "export const secret = 'outside'\n")
+      await writeFile(path.join(outside, "secret.ts"), "export const secret = 'outside'\n")
       await symlink(path.join(outside, "secret.ts"), path.join(dir, "secret.ts"))
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const embeddedTexts: string[] = []
@@ -1790,15 +1816,15 @@ describe("createIndexer", () => {
   test("skips files ignored by gitignore", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, ".gitignore"), "ignored.ts\nnested/\n")
-      await Bun.write(path.join(dir, "kept.ts"), "export const kept = true\n")
-      await Bun.write(path.join(dir, "ignored.ts"), "export const ignored = true\n")
+      await writeFile(path.join(dir, ".gitignore"), "ignored.ts\nnested/\n")
+      await writeFile(path.join(dir, "kept.ts"), "export const kept = true\n")
+      await writeFile(path.join(dir, "ignored.ts"), "export const ignored = true\n")
       await mkdir(path.join(dir, "nested"))
-      await Bun.write(path.join(dir, "nested", "ignored.ts"), "export const nestedIgnored = true\n")
+      await writeFile(path.join(dir, "nested", "ignored.ts"), "export const nestedIgnored = true\n")
       await mkdir(path.join(dir, "subdir"))
-      await Bun.write(path.join(dir, "subdir", ".gitignore"), "local-ignored.ts\n")
-      await Bun.write(path.join(dir, "subdir", "kept.ts"), "export const nestedKept = true\n")
-      await Bun.write(path.join(dir, "subdir", "local-ignored.ts"), "export const localIgnored = true\n")
+      await writeFile(path.join(dir, "subdir", ".gitignore"), "local-ignored.ts\n")
+      await writeFile(path.join(dir, "subdir", "kept.ts"), "export const nestedKept = true\n")
+      await writeFile(path.join(dir, "subdir", "local-ignored.ts"), "export const localIgnored = true\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const indexer = createIndexer({
         worktree: dir,
@@ -1830,9 +1856,9 @@ describe("createIndexer", () => {
   test("matches dotfiles and dot directories with scanner globs", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, ".hidden.ts"), "export const hidden = true\n")
+      await writeFile(path.join(dir, ".hidden.ts"), "export const hidden = true\n")
       await mkdir(path.join(dir, ".config"))
-      await Bun.write(path.join(dir, ".config", "tool.ts"), "export const tool = true\n")
+      await writeFile(path.join(dir, ".config", "tool.ts"), "export const tool = true\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const indexer = createIndexer({
         worktree: dir,
@@ -1865,9 +1891,9 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const excludedDir = path.join(dir, "excluded")
     try {
-      await Bun.write(path.join(dir, "kept.ts"), "export const kept = true\n")
+      await writeFile(path.join(dir, "kept.ts"), "export const kept = true\n")
       await mkdir(excludedDir)
-      await Bun.write(path.join(excludedDir, "hidden.ts"), "export const hidden = true\n")
+      await writeFile(path.join(excludedDir, "hidden.ts"), "export const hidden = true\n")
       await chmod(excludedDir, 0)
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const indexer = createIndexer({
@@ -1904,9 +1930,9 @@ describe("createIndexer", () => {
       const deepPathSegments = Array.from({ length: 40 }, (_, index) => `level-${index}`)
       const current = path.join(dir, ...deepPathSegments)
       await mkdir(current, { recursive: true })
-      await Bun.write(path.join(current, "deep.ts"), "export const deepValue = 1\n")
+      await writeFile(path.join(current, "deep.ts"), "export const deepValue = 1\n")
       await mkdir(path.join(dir, "ignored", "nested"), { recursive: true })
-      await Bun.write(path.join(dir, "ignored", "nested", "skip.ts"), "export const skipped = 1\n")
+      await writeFile(path.join(dir, "ignored", "nested", "skip.ts"), "export const skipped = 1\n")
 
       const index = await createIndexer({
         worktree: dir,
@@ -1933,9 +1959,9 @@ describe("createIndexer", () => {
     try {
       await mkdir(path.join(dir, "src"), { recursive: true })
       await mkdir(path.join(dir, "vendor"), { recursive: true })
-      await Bun.write(path.join(dir, "src", "keep.ts"), "export const keep = 1\n")
-      await Bun.write(path.join(dir, "src", "drop.map"), "{}\n")
-      await Bun.write(path.join(dir, "vendor", "skip.ts"), "export const skip = 1\n")
+      await writeFile(path.join(dir, "src", "keep.ts"), "export const keep = 1\n")
+      await writeFile(path.join(dir, "src", "drop.map"), "{}\n")
+      await writeFile(path.join(dir, "vendor", "skip.ts"), "export const skip = 1\n")
 
       const index = await createIndexer({
         worktree: dir,
@@ -1961,8 +1987,8 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       await mkdir(path.join(dir, "foo", "bar"), { recursive: true })
-      await Bun.write(path.join(dir, "foo", "drop.ts"), "export const drop = 1\n")
-      await Bun.write(path.join(dir, "foo", "bar", "keep.ts"), "export const keep = 1\n")
+      await writeFile(path.join(dir, "foo", "drop.ts"), "export const drop = 1\n")
+      await writeFile(path.join(dir, "foo", "bar", "keep.ts"), "export const keep = 1\n")
 
       const index = await createIndexer({
         worktree: dir,
@@ -1988,7 +2014,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const unreadableDir = path.join(dir, "z-unreadable")
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       await mkdir(unreadableDir)
       await chmod(unreadableDir, 0)
       const parsedPaths: string[] = []
@@ -2023,9 +2049,9 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const pycacheDir = path.join(dir, "__pycache__")
     try {
-      await Bun.write(path.join(dir, "kept.py"), "def kept():\n    return True\n")
+      await writeFile(path.join(dir, "kept.py"), "def kept():\n    return True\n")
       await mkdir(pycacheDir)
-      await Bun.write(path.join(pycacheDir, "kept.cpython-312.pyc"), new Uint8Array([1, 2, 3]))
+      await writeFile(path.join(pycacheDir, "kept.cpython-312.pyc"), new Uint8Array([1, 2, 3]))
       await chmod(pycacheDir, 0)
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const options = parseOptions({})
@@ -2060,8 +2086,8 @@ describe("createIndexer", () => {
   test("skips binary files and reports a diagnostic", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "source.ts"), "export const source = true\n")
-      await Bun.write(path.join(dir, "image.bin"), new Uint8Array([0, 159, 146, 150]))
+      await writeFile(path.join(dir, "source.ts"), "export const source = true\n")
+      await writeFile(path.join(dir, "image.bin"), new Uint8Array([0, 159, 146, 150]))
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const parsedPaths: string[] = []
       const indexer = createIndexer({
@@ -2100,8 +2126,8 @@ describe("createIndexer", () => {
   test("skips files over maxFileBytes and reports a diagnostic", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "source.ts"), "export const source = true\n")
-      await Bun.write(path.join(dir, "large.txt"), "x".repeat(200))
+      await writeFile(path.join(dir, "source.ts"), "export const source = true\n")
+      await writeFile(path.join(dir, "large.txt"), "x".repeat(200))
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const parsedPaths: string[] = []
       const indexer = createIndexer({
@@ -2141,7 +2167,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key" })
       const indexer = createIndexer({
         worktree: dir,
@@ -2171,7 +2197,7 @@ describe("createIndexer", () => {
   test("preserves unchanged file chunks and symbols without parsing or embedding again", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2229,7 +2255,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 })
       const makeIndexer = (maxFileBytes: number) =>
         createIndexer({
@@ -2262,7 +2288,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     const cacheDir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-cache-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       let parseCalls = 0
       let embedCalls = 0
       const store = createIndexStore({ cacheDir, cacheKey: "key", embeddingDimensions: 2 })
@@ -2322,7 +2348,7 @@ describe("createIndexer", () => {
   test("reindexes unchanged files when chunking options change", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({
@@ -2383,7 +2409,7 @@ describe("createIndexer", () => {
     try {
       const file = path.join(dir, "a.ts")
       const fixedTime = new Date(1_700_000_000_000)
-      await Bun.write(file, "export const a = 1\n")
+      await writeFile(file, "export const a = 1\n")
       await utimes(file, fixedTime, fixedTime)
       let parseCalls = 0
       let embedCalls = 0
@@ -2414,7 +2440,7 @@ describe("createIndexer", () => {
       })
 
       await indexer.refresh()
-      await Bun.write(file, "export const b = 2\n")
+      await writeFile(file, "export const b = 2\n")
       await utimes(file, fixedTime, fixedTime)
       await indexer.refresh()
 
@@ -2428,7 +2454,7 @@ describe("createIndexer", () => {
   test("rebuilds unchanged file records that reference missing chunks", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2472,7 +2498,7 @@ describe("createIndexer", () => {
   test("rebuilds unchanged file records with dangling chunk topology references", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2520,8 +2546,8 @@ describe("createIndexer", () => {
   test("rebuilds unchanged files with topology references to pruned files", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2571,8 +2597,8 @@ describe("createIndexer", () => {
   test("rebuilds reused files with references to included files that are rebuilt", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 2\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2603,7 +2629,7 @@ describe("createIndexer", () => {
 
       await indexer.refresh()
       index.chunks[index.files["a.ts"].chunkIds[0]].childChunkIds = [index.files["b.ts"].chunkIds[0]]
-      await Bun.write(path.join(dir, "b.ts"), "export const b = 3\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 3\n")
       await indexer.refresh()
 
       expect(parseCalls).toBe(4)
@@ -2621,7 +2647,7 @@ describe("createIndexer", () => {
   test("rebuilds unchanged file records with mismatched file or chunk paths", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2671,7 +2697,7 @@ describe("createIndexer", () => {
   test("rebuilds unchanged file records with mismatched chunk map keys", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2715,7 +2741,7 @@ describe("createIndexer", () => {
   test("rebuilds unchanged file records with mismatched symbol map keys", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2771,7 +2797,7 @@ describe("createIndexer", () => {
   test("embeds path language symbol breadcrumbs and chunk text", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       const embeddedTexts: string[] = []
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const indexer = createIndexer({
@@ -2819,7 +2845,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const source = "export function findWidget() { return 1 }\n"
-      await Bun.write(path.join(dir, "nested.ts"), source)
+      await writeFile(path.join(dir, "nested.ts"), source)
       let index = createEmptyIndex({
         projectId: "p",
         worktree: dir,
@@ -2875,7 +2901,7 @@ describe("createIndexer", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
       const source = "const a = 1\nconst b = 2\n"
-      await Bun.write(path.join(dir, "multi.ts"), source)
+      await writeFile(path.join(dir, "multi.ts"), source)
       let index = createEmptyIndex({
         projectId: "p",
         worktree: dir,
@@ -2922,7 +2948,7 @@ describe("createIndexer", () => {
   test("retries unchanged chunks with embedding errors and clears the stale error", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -2971,7 +2997,7 @@ describe("createIndexer", () => {
   test("rebuilds unchanged file records with dangling chunk symbol references", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
+      await writeFile(path.join(dir, "a.ts"), "export function a() { return 1 }\n")
       let parseCalls = 0
       let embedCalls = 0
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
@@ -3027,7 +3053,7 @@ describe("createIndexer", () => {
   test("records embedding failures on chunks and still writes the index", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "ab\n")
+      await writeFile(path.join(dir, "a.ts"), "ab\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 })
       let writes = 0
       let embedCalls = 0
@@ -3072,7 +3098,7 @@ describe("createIndexer", () => {
   test("embeds changed chunks in configured batches and flushes partial batches", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "abcde\n")
+      await writeFile(path.join(dir, "a.ts"), "abcde\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 })
       const batches: string[][] = []
       const indexer = createIndexer({
@@ -3121,7 +3147,7 @@ describe("createIndexer", () => {
   test("uses configured concurrency for embedding batches", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.txt"), "abcdef\n")
+      await writeFile(path.join(dir, "a.txt"), "abcdef\n")
       let active = 0
       let maxActive = 0
       const store = createMemoryStore(
@@ -3166,7 +3192,7 @@ describe("createIndexer", () => {
   test("records synchronous batch embedding failures without hanging workers", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "ab\n")
+      await writeFile(path.join(dir, "a.ts"), "ab\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 })
       const indexer = createIndexer({
         worktree: dir,
@@ -3213,7 +3239,7 @@ describe("createIndexer", () => {
   test("records synchronous single embedding failures without hanging workers", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "a.ts"), "ab\n")
+      await writeFile(path.join(dir, "a.ts"), "ab\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 1 })
       const indexer = createIndexer({
         worktree: dir,
@@ -3257,7 +3283,7 @@ describe("createIndexer", () => {
   test("persists lexical stats from chunk text and code metadata despite embedding failures", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {
-      await Bun.write(path.join(dir, "nested.ts"), "export function findWidget() { return 1 }\n")
+      await writeFile(path.join(dir, "nested.ts"), "export function findWidget() { return 1 }\n")
       let index = createEmptyIndex({ projectId: "p", worktree: dir, cacheKey: "key", maxChunkNonWhitespaceChars: 2000 })
       const indexer = createIndexer({
         worktree: dir,

@@ -21,7 +21,7 @@ export type RerankOptions = {
     timeoutMs: number;
 };
 export type HydeOptions = {
-    mode: "openai-compatible" | "disabled";
+    mode: "openai-compatible" | "pi-active" | "disabled";
     baseURL?: string;
     apiKey?: string;
     model?: string;

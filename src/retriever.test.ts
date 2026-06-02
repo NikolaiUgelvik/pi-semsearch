@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test"
 import { minimatch } from "minimatch"
+import { describe, expect, test } from "vitest"
 import { buildLexicalIndex, tokenizeCodeText } from "./lexical.js"
 import { type RetrievalIndexStore, type RetrieveFromStoreInput, retrieveFromStore } from "./retriever.js"
 import { createEmptyIndex, searchVectors } from "./store.js"

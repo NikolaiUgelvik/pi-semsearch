@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test } from "vitest"
 import { languageForPath, parseSource } from "./language.js"
 
 function syntaxTypes(node: { type: string; children: Array<{ type: string; children: unknown[] }> } | undefined) {

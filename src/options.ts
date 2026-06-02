@@ -337,11 +337,18 @@ function hydeProviderOptions(
   env: Record<string, string | undefined>,
 ) {
   return {
-    mode: api ? ("openai-compatible" as const) : ("disabled" as const),
+    mode: hydeMode(api, raw?.enabled),
     baseURL: api?.baseURL,
     apiKey: apiKeyForOpenAiHyde(api, raw, env),
     model: api?.model,
   }
+}
+
+function hydeMode(api: { baseURL: string; model: string } | undefined, enabled: boolean | undefined) {
+  if (api) {
+    return "openai-compatible" as const
+  }
+  return enabled === true ? ("pi-active" as const) : ("disabled" as const)
 }
 
 function hydeEnabled(
@@ -349,7 +356,7 @@ function hydeEnabled(
   enabled: boolean | undefined,
   hasEmbeddingConfig: boolean,
 ) {
-  return Boolean(api) && withDefault(enabled, hasEmbeddingConfig)
+  return (Boolean(api) || enabled === true) && withDefault(enabled, hasEmbeddingConfig)
 }
 
 function apiKeyForOpenAiHyde(

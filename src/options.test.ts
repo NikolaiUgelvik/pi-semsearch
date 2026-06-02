@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test } from "vitest"
 import { parseOptions } from "./options.js"
 
 describe("parseOptions", () => {
@@ -475,7 +475,7 @@ describe("parseOptions", () => {
     })
   })
 
-  test("keeps hyde disabled for partial config", () => {
+  test("uses Pi active model HyDE when explicitly enabled without an OpenAI-compatible provider", () => {
     const options = parseOptions(
       {
         embedding: {
@@ -493,12 +493,12 @@ describe("parseOptions", () => {
     )
 
     expect(options.hyde).toEqual({
-      mode: "disabled",
+      mode: "pi-active",
       baseURL: undefined,
       apiKey: undefined,
       model: undefined,
       threshold: 0.2,
-      enabled: false,
+      enabled: true,
       timeoutMs: 30_000,
     })
   })

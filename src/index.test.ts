@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { afterEach, describe, expect, test } from "vitest"
+import packagedSemsearchExtension from "../extensions/pi-semsearch.ts"
 import { createPiSemsearchExtensionForTest } from "./extension.js"
 import semsearchExtension from "./index.js"
 import { createEmptyIndex } from "./store.js"
@@ -18,7 +19,11 @@ describe("pi-semsearch extension", () => {
     const entrypoint = await import("./index.js")
 
     expect(Object.keys(entrypoint)).toEqual(["default"])
-    expect(entrypoint.default).toBeFunction()
+    expect(entrypoint.default).toBeTypeOf("function")
+  })
+
+  test("package extension entry delegates to the root extension", () => {
+    expect(packagedSemsearchExtension).toBe(semsearchExtension)
   })
 
   test("registers Pi tools and command", () => {
@@ -122,7 +127,7 @@ describe("pi-semsearch extension", () => {
     expect(result.details).toEqual({ found: true })
   })
 
-  test("HyDE requires an OpenAI-compatible chat provider in Pi", async () => {
+  test("HyDE requires an active Pi model or explicit OpenAI-compatible provider", async () => {
     const worktree = await tempWorktree({ embedding: configuredEmbedding(), hyde: { enabled: true, threshold: 1 } })
     const index = readyIndex(worktree)
     let errorMessage = ""
@@ -143,8 +148,43 @@ describe("pi-semsearch extension", () => {
     await executeTool(harness, "semantic_search_code", { query: "session" }, worktree)
 
     expect(errorMessage).toBe(
-      "pi-semsearch HyDE requires hyde.baseURL and hyde.model; set hyde.enabled=false to disable HyDE",
+      "pi-semsearch HyDE requires either an active Pi model or explicit hyde.baseURL and hyde.model; set hyde.enabled=false to disable HyDE",
     )
+  })
+
+  test("HyDE can use Pi's active model", async () => {
+    const worktree = await tempWorktree({ embedding: configuredEmbedding(), hyde: { enabled: true, threshold: 1 } })
+    const index = readyIndex(worktree)
+    let hydeText = ""
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => readyStore(index),
+        complete: async () => ({
+          role: "assistant",
+          content: [{ type: "text", text: "session lifecycle\nconversation state\nmessage branch" }],
+          api: "test",
+          provider: "test",
+          model: "active-model",
+          usage: testUsage(),
+          stopReason: "stop",
+          timestamp: Date.now(),
+        }),
+        retrieve: async ({ generateHyde }) => {
+          hydeText = await generateHyde("session")
+          return searchOutput(index.metadata, "session")
+        },
+      }),
+    )
+
+    await harness.tools.semantic_search_code.execute(
+      "tool-call",
+      { query: "session" },
+      new AbortController().signal,
+      undefined,
+      ctx(worktree, [], { activeModel: true }),
+    )
+
+    expect(hydeText).toBe("session lifecycle\nconversation state\nmessage branch")
   })
 })
 
@@ -199,12 +239,20 @@ async function executeTool(
   return harness.tools[name].execute("tool-call", params, new AbortController().signal, undefined, ctx(worktree))
 }
 
-function ctx(worktree: string, notifications: string[] = []) {
+interface CtxOptions {
+  activeModel?: boolean
+}
+
+function ctx(worktree: string, notifications: string[] = [], options: CtxOptions = {}) {
   return {
     cwd: worktree,
     ui: {
       setStatus: () => undefined,
       notify: (message: string, level: string) => notifications.push(`${message}:${level}`),
+    },
+    model: options.activeModel ? { id: "active-model", provider: "test" } : undefined,
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "active-key", headers: { "x-test": "1" } }),
     },
   }
 }
@@ -275,6 +323,17 @@ function searchOutput(metadata: IndexMetadata, query: string): SearchOutput {
       },
     ],
     diagnostics: [],
+  }
+}
+
+function testUsage() {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   }
 }
 

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test } from "vitest"
 import { getChunkById } from "./chunk-lookup.js"
 import { createEmptyIndex } from "./store.js"
 
@@ -130,7 +130,7 @@ describe("chunk lookup", () => {
         childrenPage: { offset: 0, limit: 20, total: 1, hasMore: false },
       },
     })
-    expect(output.chunk?.parentText).toStartWith("class Parser")
+    expect(output.chunk?.parentText?.startsWith("class Parser")).toBe(true)
   })
 
   test("paginates related children and reports child page metadata", async () => {

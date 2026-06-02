@@ -288,14 +288,20 @@ function hydeOptions(raw, hasEmbeddingConfig, env) {
 }
 function hydeProviderOptions(api, raw, env) {
     return {
-        mode: api ? "openai-compatible" : "disabled",
+        mode: hydeMode(api, raw?.enabled),
         baseURL: api?.baseURL,
         apiKey: apiKeyForOpenAiHyde(api, raw, env),
         model: api?.model,
     };
 }
+function hydeMode(api, enabled) {
+    if (api) {
+        return "openai-compatible";
+    }
+    return enabled === true ? "pi-active" : "disabled";
+}
 function hydeEnabled(api, enabled, hasEmbeddingConfig) {
-    return Boolean(api) && withDefault(enabled, hasEmbeddingConfig);
+    return (Boolean(api) || enabled === true) && withDefault(enabled, hasEmbeddingConfig);
 }
 function apiKeyForOpenAiHyde(api, raw, env) {
     return api ? resolveSecret(raw?.apiKey, raw?.apiKeyEnv, env) : undefined;

@@ -1,126 +1,118 @@
-import { Language, Parser } from "web-tree-sitter";
+import Parser from "tree-sitter";
+import Bash from "tree-sitter-bash";
+import Go from "tree-sitter-go";
+import Html from "tree-sitter-html";
+import Java from "tree-sitter-java";
+import JavaScript from "tree-sitter-javascript";
+import Php from "tree-sitter-php";
+import Python from "tree-sitter-python";
+import Ruby from "tree-sitter-ruby";
+import Rust from "tree-sitter-rust";
+import TypeScript from "tree-sitter-typescript";
 const entries = [
     {
         id: "bash",
         extensions: [".sh", ".bash"],
         filenames: [".bashrc", ".bash_profile"],
-        wasm: async () => (await import("tree-sitter-bash/tree-sitter-bash.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Bash),
     },
     {
         id: "go",
         extensions: [".go"],
-        wasm: async () => (await import("tree-sitter-go/tree-sitter-go.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Go),
     },
     {
         id: "html",
         extensions: [".html", ".htm"],
-        wasm: async () => (await import("tree-sitter-html/tree-sitter-html.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Html),
     },
     {
         id: "java",
         extensions: [".java"],
-        wasm: async () => (await import("tree-sitter-java/tree-sitter-java.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Java),
     },
     {
         id: "javascript",
         extensions: [".js", ".jsx", ".mjs", ".cjs"],
-        wasm: async () => (await import("tree-sitter-javascript/tree-sitter-javascript.wasm", { with: { type: "wasm" } }))
-            .default,
+        language: nativeLanguage(JavaScript),
     },
     {
         id: "php",
         extensions: [".php", ".phtml", ".php3", ".php4", ".php5"],
-        wasm: async () => (await import("tree-sitter-php/tree-sitter-php.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Php.php),
     },
     {
         id: "python",
         extensions: [".py"],
-        wasm: async () => (await import("tree-sitter-python/tree-sitter-python.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Python),
     },
     {
         id: "ruby",
         extensions: [".rb"],
-        wasm: async () => (await import("tree-sitter-ruby/tree-sitter-ruby.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Ruby),
     },
     {
         id: "rust",
         extensions: [".rs"],
-        wasm: async () => (await import("tree-sitter-rust/tree-sitter-rust.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(Rust),
     },
     {
         id: "typescript",
         extensions: [".ts"],
-        wasm: async () => (await import("tree-sitter-typescript/tree-sitter-typescript.wasm", { with: { type: "wasm" } }))
-            .default,
+        language: nativeLanguage(TypeScript.typescript),
     },
     {
         id: "tsx",
         extensions: [".tsx"],
-        wasm: async () => (await import("tree-sitter-typescript/tree-sitter-tsx.wasm", { with: { type: "wasm" } })).default,
+        language: nativeLanguage(TypeScript.tsx),
     },
 ];
 const PATH_SEPARATOR_PATTERN = /[\\/]/;
-let init;
 const parsers = new Map();
 export function languageForPath(filePath) {
     const filename = filePath.split(PATH_SEPARATOR_PATTERN).at(-1) ?? filePath;
     const lowerFilePath = filePath.toLowerCase();
     return entries.find((entry) => entry.filenames?.includes(filename) || entry.extensions.some((extension) => lowerFilePath.endsWith(extension)));
 }
-export async function parseSource(filePath, source) {
+export function parseSource(filePath, source) {
     const entry = languageForPath(filePath);
     if (!entry) {
-        return { language: "text", root: undefined };
+        return Promise.resolve({ language: "text", root: undefined });
     }
-    const parser = await parserFor(entry);
+    const parser = parserFor(entry);
     const tree = parser.parse(source);
     if (!tree) {
-        return { language: entry.id, root: undefined };
+        return Promise.resolve({ language: entry.id, root: undefined });
     }
     try {
-        return { language: entry.id, root: adaptNode(tree.rootNode) };
+        return Promise.resolve({ language: entry.id, root: adaptNode(tree.rootNode) });
     }
     finally {
-        tree.delete();
+        deleteTree(tree);
     }
+}
+function nativeLanguage(language) {
+    return language;
 }
 function parserFor(entry) {
     const cached = parsers.get(entry.id);
     if (cached) {
         return cached;
     }
-    const loading = createParser(entry).catch((error) => {
-        parsers.delete(entry.id);
-        throw error;
-    });
-    parsers.set(entry.id, loading);
-    return loading;
-}
-function initializeParser() {
-    if (!init) {
-        init = import("web-tree-sitter/tree-sitter.wasm", { with: { type: "wasm" } })
-            .then((module) => Parser.init({ locateFile: () => resolveWasm(module.default) }))
-            .catch((error) => {
-            init = undefined;
-            throw error;
-        });
-    }
-    return init;
-}
-async function createParser(entry) {
-    await initializeParser();
     const parser = new Parser();
-    parser.setLanguage(await Language.load(resolveWasm(await entry.wasm())));
+    parser.setLanguage(entry.language);
+    parsers.set(entry.id, parser);
     return parser;
+}
+function deleteTree(tree) {
+    const maybeTree = tree;
+    maybeTree.delete?.();
 }
 function adaptNode(node) {
     return {
         type: node.type,
         startIndex: node.startIndex,
         endIndex: node.endIndex,
-        children: node.namedChildren.filter((child) => child !== null).map(adaptNode),
+        children: node.namedChildren.map(adaptNode),
     };
-}
-function resolveWasm(input) {
-    return input.startsWith("file://") ? new URL(input).pathname : input;
 }

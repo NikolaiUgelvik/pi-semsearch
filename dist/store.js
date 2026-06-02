@@ -1170,7 +1170,7 @@ function insertChunksWithVectorRowids(db, runId, chunks, initialVectorRowid) {
         ]);
         if (chunk.embedding) {
             db.run("insert into chunk_vectors (rowid, embedding) values (?, ?)", [
-                vectorRowid,
+                sqliteVecRowid(vectorRowid),
                 JSON.stringify(chunk.embedding),
             ]);
             db.run("insert into chunk_rowids (run_id, chunk_id, rowid) values (?, ?, ?)", [runId, chunk.id, vectorRowid]);
@@ -1183,13 +1183,16 @@ function nextVectorRowid(db) {
     const row = db.query("select coalesce(max(rowid), 0) + 1 as rowid from chunk_rowids").get();
     return row.rowid;
 }
+function sqliteVecRowid(rowid) {
+    return BigInt(rowid);
+}
 function deleteRunFile(db, runId, filePath) {
     const rows = db
         .query("select chunk_rowids.rowid from chunk_rowids inner join chunks on chunks.run_id = chunk_rowids.run_id and chunks.id = chunk_rowids.chunk_id where chunks.run_id = ? and chunks.file_path = ?")
         .all(runId, filePath);
     if (tableExists(db, "chunk_vectors")) {
         for (const row of rows) {
-            db.run("delete from chunk_vectors where rowid = ?", [row.rowid]);
+            db.run("delete from chunk_vectors where rowid = ?", [sqliteVecRowid(row.rowid)]);
         }
     }
     db.run("delete from chunk_rowids where run_id = ? and chunk_id in (select id from chunks where run_id = ? and file_path = ?)", [runId, runId, filePath]);
@@ -1202,7 +1205,7 @@ function deleteRunRecords(db, runId) {
     const rows = db.query("select rowid from chunk_rowids where run_id = ?").all(runId);
     if (tableExists(db, "chunk_vectors")) {
         for (const row of rows) {
-            db.run("delete from chunk_vectors where rowid = ?", [row.rowid]);
+            db.run("delete from chunk_vectors where rowid = ?", [sqliteVecRowid(row.rowid)]);
         }
     }
     db.run("delete from chunk_rowids where run_id = ?", [runId]);

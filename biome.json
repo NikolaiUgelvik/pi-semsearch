@@ -18,7 +18,6 @@
     "lineWidth": 120
   },
   "javascript": {
-    "globals": ["Bun"],
     "formatter": {
       "quoteStyle": "double",
       "semicolons": "asNeeded",
@@ -59,7 +58,7 @@
       }
     },
     {
-      "includes": ["src/index.ts"],
+      "includes": ["src/index.ts", "extensions/pi-semsearch.ts", "vitest.config.ts"],
       "linter": {
         "rules": {
           "performance": {
