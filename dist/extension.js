@@ -254,6 +254,12 @@ class SemsearchRuntime {
             },
         };
     }
+    refreshAfterWrite(filePath) {
+        if (this.semanticSearchUnavailable() || !isWorktreePath(this.worktree, filePath)) {
+            return;
+        }
+        return this.queueRefresh({ background: true });
+    }
     clearRefresh(refresh) {
         if (this.refresh === refresh) {
             this.refresh = undefined;
@@ -398,6 +404,7 @@ function createPiSemsearchExtensionForTest(dependencies = {}) {
         const runtimeFor = createRuntimeResolver(runtimes, dependencies);
         registerLifecycle(pi, runtimes, runtimeFor);
         registerRefreshCommand(pi, runtimeFor);
+        registerWriteToolIndexHook(pi, runtimeFor);
         registerSearchTool(pi, runtimeFor);
         registerChunkLookupTool(pi, runtimeFor);
     };
@@ -437,6 +444,18 @@ function registerRefreshCommand(pi, runtimeFor) {
             await runtime.queueRefresh({ forced: true });
             ctx.ui.notify("pi-semsearch index refreshed", "info");
         },
+    });
+}
+function registerWriteToolIndexHook(pi, runtimeFor) {
+    pi.on("tool_result", async (event, ctx) => {
+        if (!isSuccessfulWriteToolResult(event)) {
+            return;
+        }
+        const runtime = await runtimeFor(ctx);
+        const refresh = runtime.refreshAfterWrite(event.input.path);
+        if (refresh) {
+            ctx.ui.setStatus("semsearch", "pi-semsearch indexing");
+        }
     });
 }
 function registerSearchTool(pi, runtimeFor) {
@@ -990,6 +1009,20 @@ function isStoreUnavailableError(error) {
 }
 function formatThrownError(error) {
     return error instanceof Error ? error.message : String(error);
+}
+function isSuccessfulWriteToolResult(event) {
+    return (event.toolName === "write" &&
+        event.isError !== true &&
+        typeof event.input === "object" &&
+        event.input !== null &&
+        "path" in event.input &&
+        typeof event.input.path === "string");
+}
+function isWorktreePath(worktree, filePath) {
+    const root = path.resolve(worktree);
+    const resolved = path.resolve(root, filePath);
+    const relative = path.relative(root, resolved);
+    return !(relative.startsWith("..") || path.isAbsolute(relative));
 }
 async function resolveWorktreePath(worktree, filePath) {
     const root = path.resolve(worktree);

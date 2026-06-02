@@ -56,10 +56,10 @@
   "dependencies": {
     "better-sqlite3": "^12.10.0",
     "ignore": "7.0.5",
-    "minimatch": "10.0.3",
+    "minimatch": "^10.2.5",
     "sqlite-vec": "^0.1.9",
     "tree-sitter": "^0.25.0",
-    "tree-sitter-bash": "0.25.0",
+    "tree-sitter-bash": "^0.25.1",
     "tree-sitter-go": "0.25.0",
     "tree-sitter-html": "0.23.2",
     "tree-sitter-java": "0.23.5",
@@ -69,7 +69,7 @@
     "tree-sitter-ruby": "0.23.1",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
-    "zod": "4.1.8"
+    "zod": "^4.4.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -80,13 +80,13 @@
     "@biomejs/biome": "2.4.16",
     "@earendil-works/pi-ai": "^0.78.0",
     "@earendil-works/pi-coding-agent": "^0.78.0",
-    "@tsconfig/node22": "22.0.2",
+    "@tsconfig/node24": "^24.0.4",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "24.12.2",
-    "@typescript/native-preview": "7.0.0-dev.20251207.1",
-    "fallow": "2.84.0",
+    "@types/node": "^24.12.4",
+    "@typescript/native-preview": "^7.0.0-dev.20260602.1",
+    "fallow": "^2.86.0",
     "typebox": "^1.0.68",
-    "typescript": "5.8.2",
+    "typescript": "^6.0.3",
     "vitest": "^4.0.14"
   },
   "trustedDependencies": [
