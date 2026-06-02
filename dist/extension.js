@@ -13,6 +13,8 @@ import { parseOptions } from "./options.js";
 import { retrieveFromStore } from "./retriever.js";
 import { createIndexer } from "./scanner.js";
 import { createIndexStore } from "./store.js";
+const SEMSEARCH_STATUS_KEY = "semsearch";
+const SEMSEARCH_INDEXING_STATUS = "pi-semsearch indexing";
 const COMPACTION_DIAGNOSTIC = "output compacted; use semantic_get_chunk for more context";
 const INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC = "index refresh in progress; results may be stale";
 const INITIAL_INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC = "index refresh in progress; no searchable active index is available yet";
@@ -260,6 +262,9 @@ class SemsearchRuntime {
         }
         return this.queueRefresh({ background: true });
     }
+    currentRefresh() {
+        return this.refresh;
+    }
     clearRefresh(refresh) {
         if (this.refresh === refresh) {
             this.refresh = undefined;
@@ -425,9 +430,7 @@ function createRuntimeResolver(runtimes, dependencies) {
 function registerLifecycle(pi, runtimes, runtimeFor) {
     pi.on("session_start", async (_event, ctx) => {
         const runtime = await runtimeFor(ctx);
-        if (!runtime.semanticSearchUnavailable()) {
-            ctx.ui.setStatus("semsearch", "pi-semsearch indexing");
-        }
+        trackIndexingStatus(ctx, runtime, runtime.currentRefresh());
     });
     pi.on("session_shutdown", () => {
         for (const runtime of runtimes.values()) {
@@ -441,7 +444,9 @@ function registerRefreshCommand(pi, runtimeFor) {
         description: "Refresh the pi-semsearch code index for the current project",
         handler: async (_args, ctx) => {
             const runtime = await runtimeFor(ctx);
-            await runtime.queueRefresh({ forced: true });
+            const refresh = runtime.queueRefresh({ forced: true });
+            trackIndexingStatus(ctx, runtime, refresh);
+            await refresh;
             ctx.ui.notify("pi-semsearch index refreshed", "info");
         },
     });
@@ -452,11 +457,21 @@ function registerWriteToolIndexHook(pi, runtimeFor) {
             return;
         }
         const runtime = await runtimeFor(ctx);
-        const refresh = runtime.refreshAfterWrite(event.input.path);
-        if (refresh) {
-            ctx.ui.setStatus("semsearch", "pi-semsearch indexing");
-        }
+        trackIndexingStatus(ctx, runtime, runtime.refreshAfterWrite(event.input.path));
     });
+}
+function trackIndexingStatus(ctx, runtime, refresh) {
+    if (!refresh) {
+        return;
+    }
+    ctx.ui.setStatus(SEMSEARCH_STATUS_KEY, SEMSEARCH_INDEXING_STATUS);
+    refresh
+        .finally(() => {
+        if (!runtime.currentRefresh()) {
+            ctx.ui.setStatus(SEMSEARCH_STATUS_KEY, undefined);
+        }
+    })
+        .catch(() => undefined);
 }
 function registerSearchTool(pi, runtimeFor) {
     pi.registerTool({

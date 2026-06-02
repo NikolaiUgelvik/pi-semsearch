@@ -39,9 +39,10 @@ describe("pi-semsearch extension", () => {
     expect(harness.commands["semsearch-refresh"].description).toContain("Refresh the pi-semsearch code index")
   })
 
-  test("session lifecycle starts indexing and disposes runtimes", async () => {
+  test("session lifecycle starts indexing, updates status, and disposes runtimes", async () => {
     const worktree = await tempWorktree({ embedding: configuredEmbedding() })
     let refreshes = 0
+    const statuses: string[] = []
     const harness = installExtension(
       createPiSemsearchExtensionForTest({
         createStore: () => staleMetadataStore(worktree),
@@ -53,21 +54,39 @@ describe("pi-semsearch extension", () => {
       }),
     )
 
-    await harness.events.session_start?.({}, ctx(worktree))
+    await harness.events.session_start?.({}, ctx(worktree, [], { statuses }))
+    expect(statuses).toContain("semsearch:pi-semsearch indexing")
     await eventually(() => expect(refreshes).toBe(1))
+    await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 
-    await harness.commands["semsearch-refresh"].handler({}, ctx(worktree, harness.notifications))
+    await harness.commands["semsearch-refresh"].handler({}, ctx(worktree, harness.notifications, { statuses }))
     expect(refreshes).toBe(2)
     expect(harness.notifications).toContain("pi-semsearch index refreshed:info")
+    await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 
     await harness.events.session_shutdown?.({})
-    await harness.events.session_start?.({}, ctx(worktree))
+    await harness.events.session_start?.({}, ctx(worktree, [], { statuses }))
     await eventually(() => expect(refreshes).toBe(3))
+  })
+
+  test("session lifecycle does not show indexing status when ready index is reusable", async () => {
+    const worktree = await tempWorktree({ embedding: configuredEmbedding() })
+    const statuses: string[] = []
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => readyStore(readyIndex(worktree)),
+      }),
+    )
+
+    await harness.events.session_start?.({}, ctx(worktree, [], { statuses }))
+
+    expect(statuses).toEqual([])
   })
 
   test("write tool results queue a background index refresh for worktree paths", async () => {
     const worktree = await tempWorktree({ embedding: configuredEmbedding() })
     let refreshes = 0
+    const statuses: string[] = []
     const harness = installExtension(
       createPiSemsearchExtensionForTest({
         createStore: () => readyStore(readyIndex(worktree)),
@@ -79,8 +98,10 @@ describe("pi-semsearch extension", () => {
       }),
     )
 
-    await harness.events.tool_result?.(successfulWriteResult("src/new.ts"), ctx(worktree))
+    await harness.events.tool_result?.(successfulWriteResult("src/new.ts"), ctx(worktree, [], { statuses }))
+    expect(statuses).toContain("semsearch:pi-semsearch indexing")
     await eventually(() => expect(refreshes).toBe(1))
+    await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 
     await harness.events.tool_result?.({ ...successfulWriteResult("src/failed.ts"), isError: true }, ctx(worktree))
     await harness.events.tool_result?.(
@@ -279,6 +300,7 @@ async function executeTool(
 
 interface CtxOptions {
   activeModel?: boolean
+  statuses?: string[]
 }
 
 function successfulWriteResult(filePath: string): TestToolResultEvent {
@@ -289,7 +311,7 @@ function ctx(worktree: string, notifications: string[] = [], options: CtxOptions
   return {
     cwd: worktree,
     ui: {
-      setStatus: () => undefined,
+      setStatus: (key: string, text: string | undefined) => options.statuses?.push(`${key}:${text ?? "<clear>"}`),
       notify: (message: string, level: string) => notifications.push(`${message}:${level}`),
     },
     model: options.activeModel ? { id: "active-model", provider: "test" } : undefined,
