@@ -154,7 +154,7 @@ class SemsearchRuntime {
     this.refreshTail = Promise.resolve()
   }
 
-  queueRefresh(refreshInput: { background?: boolean; forced?: boolean } = {}) {
+  queueRefresh(refreshInput: { background?: boolean; forced?: boolean; filePath?: string } = {}) {
     const embedding = this.options.embedding
     if (!(embedding && this.store) || this.storeError) {
       return Promise.resolve()
@@ -170,7 +170,7 @@ class SemsearchRuntime {
           return
         }
         const indexingStore = this.wrapIndexingStore(indexStore)
-        return (this.dependencies.createIndexer ?? createIndexer)({
+        const indexer = (this.dependencies.createIndexer ?? createIndexer)({
           worktree: this.worktree,
           options: {
             maxChunkNonWhitespaceChars: this.options.maxChunkNonWhitespaceChars,
@@ -185,7 +185,10 @@ class SemsearchRuntime {
           parse: parseSource,
           embed: (text, signal) => this.client.embed({ ...embedding, input: text, signal }),
           embedBatch: (texts, signal) => this.client.embedBatch({ ...embedding, input: texts, signal }),
-        }).refresh(this.lifecycle.signal)
+        })
+        return refreshInput.filePath
+          ? indexer.refreshFile(refreshInput.filePath, this.lifecycle.signal)
+          : indexer.refresh(this.lifecycle.signal)
       })
       .catch((error) => {
         if (error instanceof IndexUnavailableError) {
@@ -327,10 +330,11 @@ class SemsearchRuntime {
   }
 
   refreshAfterWrite(filePath: string) {
-    if (this.semanticSearchUnavailable() || !isWorktreePath(this.worktree, filePath)) {
+    const relativePath = worktreeRelativePath(this.worktree, filePath)
+    if (this.semanticSearchUnavailable() || !relativePath) {
       return
     }
-    return this.queueRefresh({ background: true })
+    return this.queueRefresh({ background: true, filePath: relativePath })
   }
 
   currentRefresh() {
@@ -1274,11 +1278,14 @@ function isSuccessfulWriteToolResult(event: { toolName?: unknown; input?: unknow
   )
 }
 
-function isWorktreePath(worktree: string, filePath: string) {
+function worktreeRelativePath(worktree: string, filePath: string) {
   const root = path.resolve(worktree)
   const resolved = path.resolve(root, filePath)
   const relative = path.relative(root, resolved)
-  return !(relative.startsWith("..") || path.isAbsolute(relative))
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return
+  }
+  return relative
 }
 
 async function resolveWorktreePath(worktree: string, filePath: string) {

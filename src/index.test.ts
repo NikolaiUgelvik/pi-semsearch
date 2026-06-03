@@ -51,6 +51,9 @@ describe("pi-semsearch extension", () => {
           refresh: async () => {
             refreshes += 1
           },
+          refreshFile: async () => {
+            throw new Error("write refresh should not run during lifecycle refresh")
+          },
         }),
       }),
     )
@@ -84,16 +87,20 @@ describe("pi-semsearch extension", () => {
     expect(statuses).toEqual([])
   })
 
-  test("write tool results queue a background index refresh for worktree paths", async () => {
+  test("write tool results queue a single-file background index refresh for worktree paths", async () => {
     const worktree = await tempWorktree({ embedding: configuredEmbedding() })
-    let refreshes = 0
+    let fullRefreshes = 0
+    const fileRefreshes: string[] = []
     const statuses: string[] = []
     const harness = installExtension(
       createPiSemsearchExtensionForTest({
         createStore: () => readyStore(readyIndex(worktree)),
         createIndexer: () => ({
           refresh: async () => {
-            refreshes += 1
+            fullRefreshes += 1
+          },
+          refreshFile: async (filePath) => {
+            fileRefreshes.push(filePath)
           },
         }),
       }),
@@ -101,7 +108,7 @@ describe("pi-semsearch extension", () => {
 
     await harness.events.tool_result?.(successfulWriteResult("src/new.ts"), ctx(worktree, [], { statuses }))
     expect(statuses).toContain("semsearch:pi-semsearch indexing")
-    await eventually(() => expect(refreshes).toBe(1))
+    await eventually(() => expect(fileRefreshes).toEqual(["src/new.ts"]))
     await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 
     await harness.events.tool_result?.({ ...successfulWriteResult("src/failed.ts"), isError: true }, ctx(worktree))
@@ -115,7 +122,8 @@ describe("pi-semsearch extension", () => {
     )
     await waitForEventLoop()
 
-    expect(refreshes).toBe(1)
+    expect(fileRefreshes).toEqual(["src/new.ts"])
+    expect(fullRefreshes).toBe(0)
   })
 
   test("semantic_search_code reports missing embedding configuration without breaking Pi startup", async () => {

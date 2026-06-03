@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, readdir, readFile, stat } from "node:fs/promises";
+import { access, lstat, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import ignore from "ignore";
 import { Minimatch } from "minimatch";
@@ -72,26 +72,67 @@ export function createIndexer(input) {
             });
             await fileResultWriter.flush();
             signal?.throwIfAborted();
-            index.files = state.nextFiles;
-            index.chunks = lexicalIndex.chunks;
-            index.symbols = state.nextSymbols;
-            index.lexical = lexicalIndex.lexical;
-            index.metadata.worktree = input.worktree;
-            index.metadata.maxFileBytes = input.options.maxFileBytes;
-            index.metadata.includeGlobs = input.options.includeGlobs;
-            index.metadata.excludeGlobs = input.options.excludeGlobs;
-            index.metadata.maxChunkNonWhitespaceChars = input.options.maxChunkNonWhitespaceChars;
-            index.metadata.chunking = input.options.chunking;
-            index.metadata.diagnostics = state.metadataDiagnostics;
-            index.metadata.diagnosticDetails = state.metadataDiagnosticDetails;
-            index.metadata.status = "ready";
-            index.metadata.updatedAt = Date.now();
-            await persistRefreshedIndex({
+            await persistRefreshState({
                 index,
                 store,
                 runStore,
                 run: runController.run,
                 ensureRun: runController.ensureRun,
+                scannerInput: input,
+                state,
+                lexicalIndex,
+            });
+            return index;
+        },
+        async refreshFile(filePath, signal) {
+            signal?.throwIfAborted();
+            const store = input.store;
+            const index = await store.read();
+            signal?.throwIfAborted();
+            if (!canSingleFileRefresh(index, input)) {
+                return this.refresh(signal);
+            }
+            const relativePath = worktreeRelativePath(input.worktree, filePath);
+            if (!relativePath) {
+                return index;
+            }
+            const previousState = singleFileStateSnapshot(index, relativePath);
+            const state = createSingleFileRefreshState(index, input, relativePath);
+            const shouldIndex = await shouldIndexSingleFile(input, relativePath);
+            const absolutePath = path.join(input.worktree, relativePath);
+            const fileStat = shouldIndex ? await statFileForIndexing(absolutePath) : undefined;
+            if (fileStat) {
+                const embeddingBatcher = createEmbeddingBatcher(input, signal);
+                await processScannedFile({
+                    input,
+                    index,
+                    state,
+                    relativePath,
+                    runStore: undefined,
+                    run: () => undefined,
+                    ensureRun: async () => undefined,
+                    embeddingBatcher,
+                    fileResultWriter: createFileResultWriter({ runStore: undefined, run: () => undefined }),
+                    signal,
+                });
+                signal?.throwIfAborted();
+                await embeddingBatcher.drain();
+            }
+            signal?.throwIfAborted();
+            state.metadataDiagnostics.sort();
+            const lexicalIndex = buildSingleFileLexicalIndex(state, relativePath);
+            if (!singleFileRefreshChanged(index, relativePath, state, lexicalIndex, previousState)) {
+                return index;
+            }
+            await persistRefreshState({
+                index,
+                store,
+                runStore: undefined,
+                run: () => undefined,
+                ensureRun: async () => undefined,
+                scannerInput: input,
+                state,
+                lexicalIndex,
             });
             return index;
         },
@@ -114,6 +155,84 @@ function createRefreshState(index, input) {
 function canReuseExistingIndexRecords(index, input) {
     return (index.metadata.maxChunkNonWhitespaceChars === input.options.maxChunkNonWhitespaceChars &&
         sameChunkingOptions(index.metadata.chunking, input.options.chunking));
+}
+function canSingleFileRefresh(index, input) {
+    return (index.metadata.status === "ready" &&
+        index.metadata.worktree === input.worktree &&
+        sameScannerOptions(index.metadata, input.options) &&
+        canReuseExistingIndexRecords(index, input));
+}
+function createSingleFileRefreshState(index, input, relativePath) {
+    const state = createRefreshState(index, input);
+    state.nextFiles = { ...index.files };
+    state.nextChunks = { ...index.chunks };
+    state.nextSymbols = { ...index.symbols };
+    state.metadataDiagnostics = (index.metadata.diagnostics ?? []).filter((diagnostic) => !diagnosticBelongsToFile(diagnostic, relativePath));
+    state.metadataDiagnosticDetails = (index.metadata.diagnosticDetails ?? []).filter((diagnostic) => diagnostic.filePath !== relativePath);
+    removeFileRecordsFromState(state, relativePath);
+    return state;
+}
+function removeFileRecordsFromState(state, relativePath) {
+    delete state.nextFiles[relativePath];
+    for (const [chunkId, chunk] of Object.entries(state.nextChunks)) {
+        if (chunk.filePath === relativePath) {
+            delete state.nextChunks[chunkId];
+        }
+    }
+    for (const [symbolId, symbol] of Object.entries(state.nextSymbols)) {
+        if (symbol.filePath === relativePath) {
+            delete state.nextSymbols[symbolId];
+        }
+    }
+}
+function diagnosticBelongsToFile(diagnostic, relativePath) {
+    return diagnostic === relativePath || diagnostic.startsWith(`${relativePath}:`);
+}
+function singleFileStateSnapshot(index, relativePath) {
+    return stableStringify({
+        file: index.files[relativePath],
+        chunks: Object.fromEntries(Object.entries(index.chunks).filter(([, chunk]) => chunk.filePath === relativePath)),
+        symbols: Object.fromEntries(Object.entries(index.symbols).filter(([, symbol]) => symbol.filePath === relativePath)),
+        diagnostics: index.metadata.diagnostics ?? [],
+        diagnosticDetails: index.metadata.diagnosticDetails ?? [],
+    });
+}
+function buildSingleFileLexicalIndex(state, relativePath) {
+    const changedChunks = Object.fromEntries(Object.entries(state.nextChunks).filter(([, chunk]) => chunk.filePath === relativePath));
+    const indexedChangedChunks = buildLexicalIndex(changedChunks, state.nextSymbols).chunks;
+    const chunks = { ...state.nextChunks, ...indexedChangedChunks };
+    return { lexical: lexicalIndexFromChunks(chunks), chunks };
+}
+function lexicalIndexFromChunks(chunks) {
+    const documentFrequencies = Object.create(null);
+    let documentCount = 0;
+    let totalLength = 0;
+    for (const chunk of Object.values(chunks)) {
+        const lexical = chunk.lexical;
+        if (!lexical) {
+            continue;
+        }
+        documentCount += 1;
+        totalLength += lexical.length;
+        for (const term of Object.keys(lexical.termFrequencies)) {
+            documentFrequencies[term] = (documentFrequencies[term] ?? 0) + 1;
+        }
+    }
+    return {
+        documentCount,
+        averageDocumentLength: documentCount === 0 ? 0 : totalLength / documentCount,
+        documentFrequencies,
+    };
+}
+function singleFileRefreshChanged(index, relativePath, state, lexicalIndex, previousState) {
+    const nextState = stableStringify({
+        file: state.nextFiles[relativePath],
+        chunks: Object.fromEntries(Object.entries(lexicalIndex.chunks).filter(([, chunk]) => chunk.filePath === relativePath)),
+        symbols: Object.fromEntries(Object.entries(state.nextSymbols).filter(([, symbol]) => symbol.filePath === relativePath)),
+        diagnostics: state.metadataDiagnostics,
+        diagnosticDetails: state.metadataDiagnosticDetails,
+    });
+    return previousState !== nextState || Object.keys(index.files).length !== Object.keys(state.nextFiles).length;
 }
 function createIndexRunController(index, input, runStore) {
     let run;
@@ -221,6 +340,18 @@ function sameScannerOptions(metadata, options) {
     return (metadata.maxFileBytes === options.maxFileBytes &&
         sameStringArray(metadata.includeGlobs, options.includeGlobs) &&
         sameStringArray(metadata.excludeGlobs, options.excludeGlobs));
+}
+async function persistRefreshState(input) {
+    input.index.files = input.state.nextFiles;
+    input.index.chunks = input.lexicalIndex.chunks;
+    input.index.symbols = input.state.nextSymbols;
+    input.index.lexical = input.lexicalIndex.lexical;
+    applyScannerMetadata(input.index, input.scannerInput);
+    input.index.metadata.diagnostics = input.state.metadataDiagnostics;
+    input.index.metadata.diagnosticDetails = input.state.metadataDiagnosticDetails;
+    input.index.metadata.status = "ready";
+    input.index.metadata.updatedAt = Date.now();
+    await persistRefreshedIndex(input);
 }
 async function persistRefreshedIndex(input) {
     const run = input.run() ?? (input.runStore ? await input.ensureRun() : undefined);
@@ -820,6 +951,74 @@ function embeddingText(filePath, language, chunk, symbols, expansion) {
         .join("\n")}`);
     fields.push(`text:\n${chunk.text}`);
     return fields.join("\n");
+}
+async function shouldIndexSingleFile(input, relativePath) {
+    const predicates = createScanPredicates(input.options.includeGlobs, input.options.excludeGlobs);
+    return (predicates.includes(relativePath) &&
+        !predicates.excludes(relativePath) &&
+        !hasExcludedDirectoryAncestor(relativePath, predicates) &&
+        !hasDefaultIgnoredPathPart(relativePath) &&
+        !(await hasSymlinkPathComponent(input.worktree, relativePath)) &&
+        !(await isGitignoredPath(input.worktree, relativePath)));
+}
+function hasExcludedDirectoryAncestor(relativePath, predicates) {
+    return ancestorDirectories(relativePath).some((directory) => predicates.excludesDirectory(directory));
+}
+function ancestorDirectories(relativePath) {
+    const dirname = path.dirname(relativePath);
+    if (dirname === ".") {
+        return [];
+    }
+    const segments = dirname.split(path.sep);
+    return segments.map((_, index) => segments.slice(0, index + 1).join(path.sep));
+}
+async function hasSymlinkPathComponent(root, relativePath) {
+    for (const componentPath of pathComponentPaths(relativePath)) {
+        if (await isSymlinkPath(root, componentPath)) {
+            return true;
+        }
+    }
+    return false;
+}
+function pathComponentPaths(relativePath) {
+    const parts = relativePath.split(path.sep).filter(Boolean);
+    return parts.map((_, index) => parts.slice(0, index + 1).join(path.sep));
+}
+async function isSymlinkPath(root, relativePath) {
+    try {
+        return (await lstat(path.join(root, relativePath))).isSymbolicLink();
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return false;
+        }
+        throw error;
+    }
+}
+function hasDefaultIgnoredPathPart(relativePath) {
+    return relativePath.split(path.sep).some((part) => DEFAULT_IGNORED_DIRECTORIES.has(part));
+}
+async function isGitignoredPath(root, relativePath) {
+    const gitignores = [];
+    const dirname = path.dirname(relativePath);
+    const segments = dirname === "." ? [] : dirname.split(path.sep);
+    for (let index = 0; index <= segments.length; index += 1) {
+        const prefix = segments.slice(0, index).join(path.sep);
+        const localGitignore = await loadGitignore(root, prefix);
+        if (localGitignore) {
+            gitignores.push(localGitignore);
+        }
+    }
+    return isGitignored(relativePath, gitignores);
+}
+function worktreeRelativePath(worktree, filePath) {
+    const root = path.resolve(worktree);
+    const resolved = path.resolve(root, filePath);
+    const relative = path.relative(root, resolved);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        return;
+    }
+    return relative;
 }
 async function* scanFiles(root, includeGlobs, excludeGlobs) {
     const predicates = createScanPredicates(includeGlobs, excludeGlobs);

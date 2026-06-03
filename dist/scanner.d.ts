@@ -39,4 +39,5 @@ export declare function createIndexer(input: {
     embedBatch?(texts: string[], signal?: AbortSignal): Promise<number[][]>;
 }): {
     refresh(signal?: AbortSignal): Promise<CastIndex>;
+    refreshFile(filePath: string, signal?: AbortSignal): Promise<CastIndex>;
 };

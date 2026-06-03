@@ -78,6 +78,55 @@ function createMemoryStore(initial?: CastIndex): CreateIndexerInput["store"] {
   }
 }
 
+function createReadyIndex(input: {
+  worktree: string
+  includeGlobs?: string[]
+  excludeGlobs?: string[]
+  diagnostics?: string[]
+  diagnosticDetails?: CastIndex["metadata"]["diagnosticDetails"]
+}) {
+  const index = createEmptyIndex({
+    projectId: "p",
+    worktree: input.worktree,
+    cacheKey: "memory",
+    maxChunkNonWhitespaceChars: 2000,
+    chunking: DEFAULT_CHUNKING_OPTIONS,
+    diagnostics: input.diagnostics,
+  })
+  index.metadata.status = "ready"
+  index.metadata.maxFileBytes = DEFAULT_MAX_FILE_BYTES
+  index.metadata.includeGlobs = input.includeGlobs ?? ["**/*.ts"]
+  index.metadata.excludeGlobs = input.excludeGlobs ?? []
+  index.metadata.diagnosticDetails = input.diagnosticDetails
+  return index
+}
+
+function addStaleFile(index: CastIndex, filePath: string) {
+  const chunkId = `${filePath}:chunk`
+  index.files[filePath] = {
+    path: filePath,
+    language: "typescript",
+    fingerprint: "stale",
+    chunkIds: [chunkId],
+    diagnostics: [],
+  }
+  index.chunks[chunkId] = {
+    id: chunkId,
+    filePath,
+    language: "typescript",
+    kind: "fallback",
+    range: { byteStart: 0, byteEnd: 5, lineStart: 1, lineEnd: 1 },
+    text: "stale",
+    nonWhitespaceChars: 5,
+    nodeTypes: [],
+    symbolIds: [],
+    childChunkIds: [],
+    embedding: [1, 0],
+    lexical: { length: 1, termFrequencies: { stale: 1 } },
+  }
+  index.lexical = { documentCount: 1, averageDocumentLength: 1, documentFrequencies: { stale: 1 } }
+}
+
 function disableBatchFileResultWrites(store: ResumableStore) {
   const storeWithoutBatch = store as Partial<BatchResumableStore>
   storeWithoutBatch.writeFileResults = undefined
@@ -114,6 +163,292 @@ describe("createIndexer", () => {
       expect(Object.keys(index.files).sort()).toEqual(["a.ts", "b.ts"])
       expect(batches).toHaveLength(1)
       expect(batches[0]).toHaveLength(2)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshFile reparses and embeds only the requested file", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
+      const store = createMemoryStore()
+      const parsedPaths: string[] = []
+      const embeddedTexts: string[] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+        },
+        store,
+        parse: async (filePath) => {
+          parsedPaths.push(path.relative(dir, filePath))
+          return { language: "typescript", root: undefined }
+        },
+        embed: async (text) => {
+          embeddedTexts.push(text)
+          return [embeddedTexts.length, 0]
+        },
+      })
+
+      await indexer.refresh()
+      parsedPaths.length = 0
+      embeddedTexts.length = 0
+      await writeFile(path.join(dir, "a.ts"), "export const a = 3\n")
+
+      const index = await indexer.refreshFile("a.ts")
+
+      expect(parsedPaths).toEqual(["a.ts"])
+      expect(embeddedTexts).toHaveLength(1)
+      expect(Object.keys(index.files).sort()).toEqual(["a.ts", "b.ts"])
+      expect(Object.values(index.chunks).some((chunk) => chunk.filePath === "a.ts" && chunk.text.includes("3"))).toBe(
+        true,
+      )
+      expect(Object.values(index.chunks).some((chunk) => chunk.filePath === "b.ts" && chunk.text.includes("2"))).toBe(
+        true,
+      )
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshFile removes deleted files from an existing index", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      await writeFile(path.join(dir, "b.ts"), "export const b = 2\n")
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+        },
+        store: createMemoryStore(),
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      await indexer.refresh()
+      await rm(path.join(dir, "a.ts"))
+
+      const index = await indexer.refreshFile("a.ts")
+
+      expect(Object.keys(index.files)).toEqual(["b.ts"])
+      expect(Object.values(index.chunks).every((chunk) => chunk.filePath !== "a.ts")).toBe(true)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshFile removes symlink targets without indexing linked content", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const outside = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-outside-"))
+    try {
+      await writeFile(path.join(dir, "link.ts"), "export const local = 1\n")
+      await writeFile(path.join(outside, "secret.ts"), "export const secret = 'outside'\n")
+      const parsedPaths: string[] = []
+      const embeddedTexts: string[] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+        },
+        store: createMemoryStore(),
+        parse: async (filePath) => {
+          parsedPaths.push(path.relative(dir, filePath))
+          return { language: "typescript", root: undefined }
+        },
+        embed: async (text) => {
+          embeddedTexts.push(text)
+          return [1, 0]
+        },
+      })
+
+      await indexer.refresh()
+      await rm(path.join(dir, "link.ts"))
+      await symlink(path.join(outside, "secret.ts"), path.join(dir, "link.ts"))
+      parsedPaths.length = 0
+      embeddedTexts.length = 0
+
+      const index = await indexer.refreshFile("link.ts")
+
+      expect(parsedPaths).toEqual([])
+      expect(embeddedTexts).toEqual([])
+      expect(index.files["link.ts"]).toBeUndefined()
+      expect(Object.values(index.chunks).every((chunk) => chunk.filePath !== "link.ts")).toBe(true)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshFile removes paths under symlinked directories without indexing linked content", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    const outside = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-outside-"))
+    try {
+      await writeFile(path.join(outside, "a.ts"), "export const secret = 'outside'\n")
+      await symlink(outside, path.join(dir, "linkdir"))
+      const initial = createReadyIndex({ worktree: dir })
+      const targetPath = path.join("linkdir", "a.ts")
+      addStaleFile(initial, targetPath)
+      const parsedPaths: string[] = []
+      const embeddedTexts: string[] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+        },
+        store: createMemoryStore(initial),
+        parse: async (filePath) => {
+          parsedPaths.push(path.relative(dir, filePath))
+          return { language: "typescript", root: undefined }
+        },
+        embed: async (text) => {
+          embeddedTexts.push(text)
+          return [1, 0]
+        },
+      })
+
+      const index = await indexer.refreshFile(targetPath)
+
+      expect(parsedPaths).toEqual([])
+      expect(embeddedTexts).toEqual([])
+      expect(index.files[targetPath]).toBeUndefined()
+      expect(Object.values(index.chunks).every((chunk) => chunk.filePath !== targetPath)).toBe(true)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshFile removes excluded, gitignored, and default-ignored targets without parsing", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await mkdir(path.join(dir, "generated"), { recursive: true })
+      await mkdir(path.join(dir, "node_modules", "pkg"), { recursive: true })
+      await writeFile(path.join(dir, "generated", "a.ts"), "export const generated = 1\n")
+      await writeFile(path.join(dir, "ignored.ts"), "export const ignored = 1\n")
+      await writeFile(path.join(dir, "node_modules", "pkg", "a.ts"), "export const dependency = 1\n")
+      await writeFile(path.join(dir, ".gitignore"), "ignored.ts\n")
+      const initial = createReadyIndex({ worktree: dir, excludeGlobs: ["generated"] })
+      addStaleFile(initial, "generated/a.ts")
+      addStaleFile(initial, "ignored.ts")
+      addStaleFile(initial, path.join("node_modules", "pkg", "a.ts"))
+      const parsedPaths: string[] = []
+      const embeddedTexts: string[] = []
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: ["generated"],
+        },
+        store: createMemoryStore(initial),
+        parse: async (filePath) => {
+          parsedPaths.push(path.relative(dir, filePath))
+          return { language: "typescript", root: undefined }
+        },
+        embed: async (text) => {
+          embeddedTexts.push(text)
+          return [1, 0]
+        },
+      })
+
+      const excludedPath = "generated/a.ts"
+      const gitignoredPath = "ignored.ts"
+      const defaultIgnoredPath = path.join("node_modules", "pkg", "a.ts")
+      const afterExcluded = await indexer.refreshFile(excludedPath)
+      const afterGitignored = await indexer.refreshFile(gitignoredPath)
+      const afterDefaultIgnored = await indexer.refreshFile(defaultIgnoredPath)
+      const skippedPaths = new Set([excludedPath, gitignoredPath, defaultIgnoredPath])
+
+      expect(parsedPaths).toEqual([])
+      expect(embeddedTexts).toEqual([])
+      expect(afterExcluded.files[excludedPath]).toBeUndefined()
+      expect(afterGitignored.files[gitignoredPath]).toBeUndefined()
+      expect(afterDefaultIgnored.files[defaultIgnoredPath]).toBeUndefined()
+      expect(Object.values(afterDefaultIgnored.chunks).every((chunk) => !skippedPaths.has(chunk.filePath))).toBe(true)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshFile persists removal of stale path diagnostics even without file records", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      const initial = createReadyIndex({
+        worktree: dir,
+        diagnostics: ["large.ts: skipped file over maxFileBytes (10 > 1)"],
+        diagnosticDetails: [
+          {
+            code: "index.skipped_file",
+            message: "large.ts: skipped file over maxFileBytes (10 > 1)",
+            filePath: "large.ts",
+          },
+        ],
+      })
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+        },
+        store: createMemoryStore(initial),
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      const index = await indexer.refreshFile("large.ts")
+
+      expect(index.metadata.diagnostics).toEqual([])
+      expect(index.metadata.diagnosticDetails).toEqual([])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("refreshFile propagates processing errors without partially persisting stale record removal", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      const stored = createReadyIndex({ worktree: dir })
+      addStaleFile(stored, "a.ts")
+      let writes = 0
+      const controller = new AbortController()
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+        },
+        store: {
+          read: async () => stored,
+          write: async () => {
+            writes += 1
+          },
+        },
+        parse: async () => {
+          controller.abort(new Error("stop before persist"))
+          return { language: "typescript", root: undefined }
+        },
+        embed: async () => [1, 0],
+      })
+
+      await expect(indexer.refreshFile("a.ts", controller.signal)).rejects.toThrow("stop before persist")
+
+      expect(writes).toBe(0)
+      expect(stored.files["a.ts"]).toBeDefined()
+      expect(Object.values(stored.chunks).some((chunk) => chunk.filePath === "a.ts")).toBe(true)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
