@@ -15,7 +15,9 @@ At index time, it scans the repository, parses supported languages with native T
 
 At query time, it runs hybrid retrieval: vector search for semantic similarity, SQLite FTS/BM25 for lexical matches, and Reciprocal Rank Fusion (RRF) to merge the candidate lists. If the initial vector match is weak, HyDE uses Pi's active model to generate alternative search text, embeds that text, and merges those candidates into retrieval. Optional reranking can reorder the final candidate set.
 
-Search results include source text, file/line ranges, symbol breadcrumbs, retrieval details, and structural topology. `semantic_get_chunk` can then hydrate any topology node by ID, such as `topology.current.id`, `topology.parent.id`, a sibling ID, or a child ID.
+Search results include source text, file/line ranges, symbol breadcrumbs, and structural topology. `semantic_get_chunk` can then hydrate any topology node by ID, such as `topology.current.id`, `topology.parent.id`, a sibling ID, or a child ID.
+
+Retrieval scores and debug details are hidden from `semantic_search_code` output by default. Set `PI_SEMSEARCH_DEBUG_RETRIEVAL=1` to expose `score`, `finalScore`, `retrieval`, and `status.bestScore` while debugging.
 
 ## Installation
 
