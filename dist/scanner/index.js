@@ -144,8 +144,8 @@ function createSingleFileRefreshState(index, input, relativePath) {
     state.nextFiles = { ...index.files };
     state.nextChunks = { ...index.chunks };
     state.nextSymbols = { ...index.symbols };
-    state.metadataDiagnostics = (index.metadata.diagnostics ?? []).filter((diagnostic) => !diagnosticBelongsToFile(diagnostic, relativePath));
-    state.metadataDiagnosticDetails = (index.metadata.diagnosticDetails ?? []).filter((diagnostic) => diagnostic.filePath !== relativePath);
+    state.metadataDiagnostics = (index.metadata.diagnostics ?? []).filter((diagnostic) => !(diagnosticBelongsToFile(diagnostic, relativePath) || isSourceHydrationDiagnostic(diagnostic)));
+    state.metadataDiagnosticDetails = (index.metadata.diagnosticDetails ?? []).filter((diagnostic) => !(diagnostic.filePath === relativePath || isSourceHydrationDiagnosticCode(diagnostic.code)));
     removeFileRecordsFromState(state, relativePath);
     return state;
 }
@@ -164,6 +164,14 @@ function removeFileRecordsFromState(state, relativePath) {
 }
 function diagnosticBelongsToFile(diagnostic, relativePath) {
     return diagnostic === relativePath || diagnostic.startsWith(`${relativePath}:`);
+}
+function isSourceHydrationDiagnostic(diagnostic) {
+    return (diagnostic.startsWith("source fingerprint mismatch for ") ||
+        diagnostic.startsWith("source read failed for ") ||
+        diagnostic.startsWith("source range invalid for "));
+}
+function isSourceHydrationDiagnosticCode(code) {
+    return code === "source.mismatch" || code === "source.read_failed";
 }
 function singleFileStateSnapshot(index, relativePath) {
     return stableStringify({

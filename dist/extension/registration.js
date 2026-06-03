@@ -13,7 +13,7 @@ function createRegisteredPiSemsearchExtensionForTest(dependencies = {}) {
         const runtimeFor = createRuntimeResolver(runtimes, dependencies);
         registerLifecycle(pi, runtimes, runtimeFor);
         registerRefreshCommand(pi, runtimeFor);
-        registerWriteToolIndexHook(pi, runtimeFor);
+        registerFileMutationIndexHooks(pi, runtimeFor);
         registerSearchTool(pi, runtimeFor);
         registerChunkLookupTool(pi, runtimeFor);
     };
@@ -55,13 +55,28 @@ function registerRefreshCommand(pi, runtimeFor) {
         },
     });
 }
-function registerWriteToolIndexHook(pi, runtimeFor) {
-    pi.on("tool_result", async (event, ctx) => {
-        if (!isSuccessfulFileMutationToolResult(event)) {
+function registerFileMutationIndexHooks(pi, runtimeFor) {
+    pi.on("tool_call", async (event, ctx) => {
+        if (!isFileMutationToolEvent(event)) {
             return;
         }
         const runtime = await runtimeFor(ctx);
-        trackIndexingStatus(ctx, runtime, runtime.refreshAfterWrite(event.input.path));
+        runtime.trackPendingWrite(event.toolCallId, event.input.path);
+    });
+    pi.on("tool_result", async (event, ctx) => {
+        if (!isFileMutationToolEvent(event)) {
+            return;
+        }
+        const runtime = await runtimeFor(ctx);
+        const refresh = runtime.completePendingWrite(event.toolCallId, event.input.path, event.isError !== true);
+        trackIndexingStatus(ctx, runtime, refresh);
+    });
+    pi.on("tool_execution_end", async (event, ctx) => {
+        if (!isFileMutationToolName(event.toolName)) {
+            return;
+        }
+        const runtime = await runtimeFor(ctx);
+        runtime.resolveUnseenPendingWrite(event.toolCallId);
     });
 }
 function trackIndexingStatus(ctx, runtime, refresh) {
@@ -154,12 +169,15 @@ function piToolResult(result) {
         details: result.metadata && typeof result.metadata === "object" ? result.metadata : { metadata: result.metadata },
     };
 }
-function isSuccessfulFileMutationToolResult(event) {
-    return ((event.toolName === "edit" || event.toolName === "write") &&
-        event.isError !== true &&
+function isFileMutationToolEvent(event) {
+    return (isFileMutationToolName(event.toolName) &&
+        typeof event.toolCallId === "string" &&
         typeof event.input === "object" &&
         event.input !== null &&
         "path" in event.input &&
         typeof event.input.path === "string");
+}
+function isFileMutationToolName(toolName) {
+    return toolName === "edit" || toolName === "write";
 }
 export { createRegisteredPiSemsearchExtensionForTest };

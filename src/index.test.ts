@@ -117,6 +117,15 @@ describe("pi-semsearch extension", () => {
     await eventually(() => expect(fileRefreshes).toEqual(["src/new.ts", "src/changed.ts"]))
     await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 
+    const statusesBeforeFailedEdit = [...statuses]
+    await harness.events.tool_call?.(
+      successfulEditCall("src/failed.ts", "failed-edit"),
+      ctx(worktree, [], { statuses }),
+    )
+    await harness.events.tool_result?.(
+      { ...successfulEditResult("src/failed.ts", "failed-edit"), isError: true },
+      ctx(worktree, [], { statuses }),
+    )
     await harness.events.tool_result?.({ ...successfulWriteResult("src/failed.ts"), isError: true }, ctx(worktree))
     await harness.events.tool_result?.(
       { toolName: "read", input: { path: "src/read.ts" }, isError: false },
@@ -130,7 +139,135 @@ describe("pi-semsearch extension", () => {
     await waitForEventLoop()
 
     expect(fileRefreshes).toEqual(["src/new.ts", "src/changed.ts"])
+    expect(statuses).toEqual(statusesBeforeFailedEdit)
     expect(fullRefreshes).toBe(0)
+  })
+
+  test("semantic_search_code waits for pending edit refreshes from parallel tool batches", async () => {
+    const worktree = await tempWorktree({ embedding: configuredEmbedding() })
+    const index = readyIndex(worktree)
+    const fileRefreshes: string[] = []
+    let retrievals = 0
+    let resolveRefreshStarted!: () => void
+    let resolveRefresh!: () => void
+    const refreshStarted = new Promise<void>((resolve) => {
+      resolveRefreshStarted = resolve
+    })
+    const refreshDone = new Promise<void>((resolve) => {
+      resolveRefresh = resolve
+    })
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => readyStore(index),
+        createIndexer: () => ({
+          refresh: async () => {
+            throw new Error("full refresh should not run")
+          },
+          refreshFile: async (filePath) => {
+            fileRefreshes.push(filePath)
+            resolveRefreshStarted()
+            await refreshDone
+          },
+        }),
+        retrieve: async ({ input }) => {
+          retrievals++
+          return searchOutput(index.metadata, input.query)
+        },
+      }),
+    )
+
+    await harness.events.tool_call?.(successfulEditCall("src/changed.ts", "edit-1"), ctx(worktree))
+    const search = executeTool(harness, "semantic_search_code", { query: "find session" }, worktree)
+    await waitForEventLoop()
+    expect(retrievals).toBe(0)
+
+    await harness.events.tool_result?.(successfulEditResult("src/changed.ts", "edit-1"), ctx(worktree))
+    await refreshStarted
+    await waitForEventLoop()
+    expect(retrievals).toBe(0)
+
+    resolveRefresh()
+    await search
+
+    expect(fileRefreshes).toEqual(["src/changed.ts"])
+    expect(retrievals).toBe(1)
+  })
+
+  test("semantic_get_chunk waits for pending edit refreshes from parallel tool batches", async () => {
+    const worktree = await tempWorktree({ embedding: configuredEmbedding() })
+    const index = readyIndex(worktree)
+    const fileRefreshes: string[] = []
+    let reads = 0
+    let resolveRefreshStarted!: () => void
+    let resolveRefresh!: () => void
+    const refreshStarted = new Promise<void>((resolve) => {
+      resolveRefreshStarted = resolve
+    })
+    const refreshDone = new Promise<void>((resolve) => {
+      resolveRefresh = resolve
+    })
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => ({
+          ...readyStore(index),
+          read: async () => {
+            reads++
+            return index
+          },
+        }),
+        createIndexer: () => ({
+          refresh: async () => {
+            throw new Error("full refresh should not run")
+          },
+          refreshFile: async (filePath) => {
+            fileRefreshes.push(filePath)
+            resolveRefreshStarted()
+            await refreshDone
+          },
+        }),
+      }),
+    )
+
+    await harness.events.tool_call?.(successfulEditCall("src/changed.ts", "edit-1"), ctx(worktree))
+    const lookup = executeTool(harness, "semantic_get_chunk", { id: "missing" }, worktree)
+    await waitForEventLoop()
+    expect(reads).toBe(0)
+
+    await harness.events.tool_result?.(successfulEditResult("src/changed.ts", "edit-1"), ctx(worktree))
+    await refreshStarted
+    await waitForEventLoop()
+    expect(reads).toBe(0)
+
+    resolveRefresh()
+    await lookup
+
+    expect(fileRefreshes).toEqual(["src/changed.ts"])
+    expect(reads).toBe(1)
+  })
+
+  test("session shutdown resolves pending edit refresh waits", async () => {
+    const worktree = await tempWorktree({ embedding: configuredEmbedding() })
+    const index = readyIndex(worktree)
+    let retrievals = 0
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => readyStore(index),
+        retrieve: async ({ input }) => {
+          retrievals++
+          return searchOutput(index.metadata, input.query)
+        },
+      }),
+    )
+
+    await harness.events.tool_call?.(successfulEditCall("src/changed.ts", "edit-1"), ctx(worktree))
+    const search = executeTool(harness, "semantic_search_code", { query: "find session" }, worktree)
+    await waitForEventLoop()
+    expect(retrievals).toBe(0)
+
+    await harness.events.session_shutdown?.({})
+    await search
+
+    expect(retrievals).toBe(1)
   })
 
   test("semantic_search_code reports missing embedding configuration without breaking Pi startup", async () => {
@@ -354,13 +491,25 @@ interface TestCommandRegistration {
 interface TestEventHandlers {
   session_start?: (event: unknown, ctx: ReturnType<typeof ctx>) => Promise<void>
   session_shutdown?: (event: unknown) => Promise<void>
+  tool_call?: (event: TestToolCallEvent, ctx: ReturnType<typeof ctx>) => Promise<void>
   tool_result?: (event: TestToolResultEvent, ctx: ReturnType<typeof ctx>) => Promise<void>
+  tool_execution_end?: (event: TestToolExecutionEndEvent, ctx: ReturnType<typeof ctx>) => Promise<void>
 }
 
-interface TestToolResultEvent {
+interface TestToolCallEvent {
+  toolCallId: string
   toolName: string
   input: Record<string, unknown>
+}
+
+interface TestToolResultEvent extends TestToolCallEvent {
   isError?: boolean
+}
+
+interface TestToolExecutionEndEvent {
+  toolCallId: string
+  toolName: string
+  isError: boolean
 }
 
 function installExtension(extension: (pi: never) => void) {
@@ -400,12 +549,16 @@ interface CtxOptions {
   statuses?: string[]
 }
 
-function successfulWriteResult(filePath: string): TestToolResultEvent {
-  return { toolName: "write", input: { path: filePath }, isError: false }
+function successfulWriteResult(filePath: string, toolCallId = "write-call"): TestToolResultEvent {
+  return { toolCallId, toolName: "write", input: { path: filePath }, isError: false }
 }
 
-function successfulEditResult(filePath: string): TestToolResultEvent {
-  return { toolName: "edit", input: { path: filePath }, isError: false }
+function successfulEditCall(filePath: string, toolCallId = "edit-call"): TestToolCallEvent {
+  return { toolCallId, toolName: "edit", input: { path: filePath } }
+}
+
+function successfulEditResult(filePath: string, toolCallId = "edit-call"): TestToolResultEvent {
+  return { toolCallId, toolName: "edit", input: { path: filePath }, isError: false }
 }
 
 function ctx(worktree: string, notifications: string[] = [], options: CtxOptions = {}) {

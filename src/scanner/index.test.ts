@@ -381,6 +381,38 @@ describe("createIndexer", () => {
     }
   })
 
+  test("refreshFile drops transient source hydration diagnostics from other files", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
+    try {
+      await writeFile(path.join(dir, "a.ts"), "export const a = 1\n")
+      const transientDiagnostic = "source fingerprint mismatch for README.md; chunk text unavailable"
+      const initial = createReadyIndex({
+        worktree: dir,
+        diagnostics: [transientDiagnostic],
+        diagnosticDetails: [{ code: "source.mismatch", message: transientDiagnostic, filePath: "README.md" }],
+      })
+      addStaleFile(initial, "a.ts")
+      const indexer = createIndexer({
+        worktree: dir,
+        options: {
+          maxChunkNonWhitespaceChars: 2000,
+          includeGlobs: ["**/*.ts"],
+          excludeGlobs: [],
+        },
+        store: createMemoryStore(initial),
+        parse: async () => ({ language: "typescript", root: undefined }),
+        embed: async () => [1, 0],
+      })
+
+      const index = await indexer.refreshFile("a.ts")
+
+      expect(index.metadata.diagnostics).toEqual([])
+      expect(index.metadata.diagnosticDetails).toEqual([])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("refreshFile persists removal of stale path diagnostics even without file records", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "cast-indexer-"))
     try {

@@ -190,10 +190,10 @@ function createSingleFileRefreshState(index: CastIndex, input: CreateIndexerInpu
   state.nextChunks = { ...index.chunks }
   state.nextSymbols = { ...index.symbols }
   state.metadataDiagnostics = (index.metadata.diagnostics ?? []).filter(
-    (diagnostic) => !diagnosticBelongsToFile(diagnostic, relativePath),
+    (diagnostic) => !(diagnosticBelongsToFile(diagnostic, relativePath) || isSourceHydrationDiagnostic(diagnostic)),
   )
   state.metadataDiagnosticDetails = (index.metadata.diagnosticDetails ?? []).filter(
-    (diagnostic) => diagnostic.filePath !== relativePath,
+    (diagnostic) => !(diagnostic.filePath === relativePath || isSourceHydrationDiagnosticCode(diagnostic.code)),
   )
   removeFileRecordsFromState(state, relativePath)
   return state
@@ -215,6 +215,18 @@ function removeFileRecordsFromState(state: RefreshState, relativePath: string) {
 
 function diagnosticBelongsToFile(diagnostic: string, relativePath: string) {
   return diagnostic === relativePath || diagnostic.startsWith(`${relativePath}:`)
+}
+
+function isSourceHydrationDiagnostic(diagnostic: string) {
+  return (
+    diagnostic.startsWith("source fingerprint mismatch for ") ||
+    diagnostic.startsWith("source read failed for ") ||
+    diagnostic.startsWith("source range invalid for ")
+  )
+}
+
+function isSourceHydrationDiagnosticCode(code: string) {
+  return code === "source.mismatch" || code === "source.read_failed"
 }
 
 function singleFileStateSnapshot(index: CastIndex, relativePath: string) {

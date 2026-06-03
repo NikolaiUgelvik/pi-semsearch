@@ -12,6 +12,7 @@ import { formatThrownError, IndexUnavailableError, isStoreUnavailableError } fro
 import { appendSearchDiagnostic, ensureSearchIndexReady, INDEX_REFRESH_IN_PROGRESS_DIAGNOSTIC, queueInitialRefresh, rerankDocuments, } from "./index-ready.js";
 import { serializeChunkLookupToolOutput, serializeSearchToolOutput, unavailableToolResult } from "./output.js";
 import { resolveWorktreePath, worktreeRelativePath } from "./paths.js";
+import { PendingWriteTracker } from "./pending-write.js";
 import { addRunStoreMethods, createProjectId, hasHydrateChunksStore, hasLexicalCandidateStore, hasReadMetadataStore, hasVectorCandidateStore, hydratedChunkSetToIndex, } from "./store.js";
 const HYDE_PROVIDER_ERROR = "pi-semsearch HyDE requires either an active Pi model or explicit hyde.baseURL and hyde.model; set hyde.enabled=false to disable HyDE";
 class SemsearchRuntime {
@@ -25,6 +26,7 @@ class SemsearchRuntime {
     refresh;
     forcedRefresh;
     refreshTail = Promise.resolve();
+    pendingWrites = new PendingWriteTracker();
     constructor(input) {
         this.worktree = input.worktree;
         this.options = input.options;
@@ -64,6 +66,7 @@ class SemsearchRuntime {
     }
     dispose() {
         this.lifecycle.abort();
+        this.pendingWrites.resolveAll();
         this.refresh = undefined;
         this.forcedRefresh = undefined;
         this.refreshTail = Promise.resolve();
@@ -126,6 +129,7 @@ class SemsearchRuntime {
         if (!embedding) {
             throw new Error("embedding dependency unavailable");
         }
+        await this.waitForPendingWriteRefreshes();
         const readiness = await ensureSearchIndexReady(args.refresh === true, (input) => this.queueRefresh(input), () => this.refresh, () => this.storeError);
         try {
             const output = await (this.dependencies.retrieve ?? retrieveFromStore)({
@@ -163,6 +167,7 @@ class SemsearchRuntime {
         if (!this.store) {
             return unavailableToolResult("Semantic chunk lookup index unavailable", this.storeError);
         }
+        await this.waitForPendingWriteRefreshes();
         await this.refresh;
         if (this.storeError) {
             return unavailableToolResult("Semantic chunk lookup index unavailable", this.storeError);
@@ -210,6 +215,32 @@ class SemsearchRuntime {
             },
         };
     }
+    trackPendingWrite(toolCallId, filePath) {
+        if (this.semanticSearchUnavailable() || this.pendingWrites.has(toolCallId)) {
+            return;
+        }
+        const relativePath = worktreeRelativePath(this.worktree, filePath);
+        if (!relativePath) {
+            return;
+        }
+        this.pendingWrites.track(toolCallId);
+    }
+    completePendingWrite(toolCallId, filePath, succeeded) {
+        const hasPendingWrite = this.pendingWrites.markResultSeen(toolCallId);
+        if (!succeeded) {
+            this.pendingWrites.resolve(toolCallId);
+            return;
+        }
+        const refresh = this.refreshAfterWrite(filePath);
+        if (!refresh) {
+            this.pendingWrites.resolve(toolCallId);
+            return;
+        }
+        return hasPendingWrite ? refresh.finally(() => this.pendingWrites.resolve(toolCallId)) : refresh;
+    }
+    resolveUnseenPendingWrite(toolCallId) {
+        this.pendingWrites.resolveUnseen(toolCallId);
+    }
     refreshAfterWrite(filePath) {
         const relativePath = worktreeRelativePath(this.worktree, filePath);
         if (this.semanticSearchUnavailable() || !relativePath) {
@@ -219,6 +250,9 @@ class SemsearchRuntime {
     }
     currentRefresh() {
         return this.refresh;
+    }
+    async waitForPendingWriteRefreshes() {
+        await this.pendingWrites.waitForAll();
     }
     clearRefresh(refresh) {
         if (this.refresh === refresh) {

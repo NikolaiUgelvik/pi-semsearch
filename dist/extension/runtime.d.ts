@@ -26,6 +26,7 @@ declare class SemsearchRuntime {
     private refresh;
     private forcedRefresh;
     private refreshTail;
+    private readonly pendingWrites;
     constructor(input: {
         worktree: string;
         options: ReturnType<typeof parseOptions>;
@@ -86,8 +87,12 @@ declare class SemsearchRuntime {
             filteredCount: number;
         };
     };
+    trackPendingWrite(toolCallId: string, filePath: string): void;
+    completePendingWrite(toolCallId: string, filePath: string, succeeded: boolean): Promise<unknown> | undefined;
+    resolveUnseenPendingWrite(toolCallId: string): void;
     refreshAfterWrite(filePath: string): Promise<unknown> | undefined;
     currentRefresh(): Promise<unknown> | undefined;
+    private waitForPendingWriteRefreshes;
     private clearRefresh;
     private recordStoreUnavailable;
     private readIndex;

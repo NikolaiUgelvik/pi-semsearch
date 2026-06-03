@@ -22,6 +22,7 @@ import {
 import type { ToolOutputLimits } from "./output.js"
 import { serializeChunkLookupToolOutput, serializeSearchToolOutput, unavailableToolResult } from "./output.js"
 import { resolveWorktreePath, worktreeRelativePath } from "./paths.js"
+import { PendingWriteTracker } from "./pending-write.js"
 import type { IndexingStore, WrappedIndexingStore } from "./store.js"
 import {
   addRunStoreMethods,
@@ -55,6 +56,7 @@ class SemsearchRuntime {
   private refresh: Promise<unknown> | undefined
   private forcedRefresh: Promise<unknown> | undefined
   private refreshTail = Promise.resolve()
+  private readonly pendingWrites = new PendingWriteTracker()
 
   constructor(input: {
     worktree: string
@@ -102,6 +104,7 @@ class SemsearchRuntime {
 
   dispose() {
     this.lifecycle.abort()
+    this.pendingWrites.resolveAll()
     this.refresh = undefined
     this.forcedRefresh = undefined
     this.refreshTail = Promise.resolve()
@@ -176,6 +179,7 @@ class SemsearchRuntime {
     if (!embedding) {
       throw new Error("embedding dependency unavailable")
     }
+    await this.waitForPendingWriteRefreshes()
     const readiness = await ensureSearchIndexReady(
       args.refresh === true,
       (input) => this.queueRefresh(input),
@@ -219,6 +223,7 @@ class SemsearchRuntime {
     if (!this.store) {
       return unavailableToolResult("Semantic chunk lookup index unavailable", this.storeError)
     }
+    await this.waitForPendingWriteRefreshes()
     await this.refresh
     if (this.storeError) {
       return unavailableToolResult("Semantic chunk lookup index unavailable", this.storeError)
@@ -268,6 +273,35 @@ class SemsearchRuntime {
     }
   }
 
+  trackPendingWrite(toolCallId: string, filePath: string) {
+    if (this.semanticSearchUnavailable() || this.pendingWrites.has(toolCallId)) {
+      return
+    }
+    const relativePath = worktreeRelativePath(this.worktree, filePath)
+    if (!relativePath) {
+      return
+    }
+    this.pendingWrites.track(toolCallId)
+  }
+
+  completePendingWrite(toolCallId: string, filePath: string, succeeded: boolean) {
+    const hasPendingWrite = this.pendingWrites.markResultSeen(toolCallId)
+    if (!succeeded) {
+      this.pendingWrites.resolve(toolCallId)
+      return
+    }
+    const refresh = this.refreshAfterWrite(filePath)
+    if (!refresh) {
+      this.pendingWrites.resolve(toolCallId)
+      return
+    }
+    return hasPendingWrite ? refresh.finally(() => this.pendingWrites.resolve(toolCallId)) : refresh
+  }
+
+  resolveUnseenPendingWrite(toolCallId: string) {
+    this.pendingWrites.resolveUnseen(toolCallId)
+  }
+
   refreshAfterWrite(filePath: string) {
     const relativePath = worktreeRelativePath(this.worktree, filePath)
     if (this.semanticSearchUnavailable() || !relativePath) {
@@ -278,6 +312,10 @@ class SemsearchRuntime {
 
   currentRefresh() {
     return this.refresh
+  }
+
+  private async waitForPendingWriteRefreshes() {
+    await this.pendingWrites.waitForAll()
   }
 
   private clearRefresh(refresh: Promise<unknown>) {
