@@ -1,0 +1,17 @@
+import type { SqliteDatabase as Database } from "./store-db.js";
+import type { StoreFileResult as FileResult } from "./store-types.js";
+import type { CastIndex, ChunkRecord, FileRecord, LexicalIndex, SymbolRecord } from "./types.js";
+declare function clearSqliteIndex(db: Database): void;
+declare function insertRun(db: Database, runId: string, index: CastIndex): void;
+declare function insertFile(db: Database, runId: string, file: FileRecord, updateGlobalFile?: boolean): void;
+declare function upsertGlobalFile(db: Database, file: FileRecord): void;
+declare function insertChunks(db: Database, runId: string, chunks: ChunkRecord[]): void;
+declare function insertChunksWithVectorRowids(db: Database, runId: string, chunks: ChunkRecord[], initialVectorRowid: number): void;
+declare function deleteRunFile(db: Database, runId: string, filePath: string): void;
+declare function pruneSupersededRuns(db: Database, activeRunId: string): void;
+declare function insertSymbol(db: Database, runId: string, symbol: SymbolRecord): void;
+declare function insertLexical(db: Database, runId: string, lexical: LexicalIndex): void;
+declare function inferEmbeddingDimensions(index: CastIndex): number | undefined;
+declare function inferFileResultEmbeddingDimensions(fileResult: FileResult): number | undefined;
+declare function inferFileResultsEmbeddingDimensions(fileResults: FileResult[]): number | undefined;
+export { clearSqliteIndex, deleteRunFile, inferEmbeddingDimensions, inferFileResultEmbeddingDimensions, inferFileResultsEmbeddingDimensions, insertChunks, insertChunksWithVectorRowids, insertFile, insertLexical, insertRun, insertSymbol, pruneSupersededRuns, upsertGlobalFile, };

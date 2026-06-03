@@ -1,43 +1,16 @@
-import { type SyntaxNode } from "./cast.js";
-import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, SymbolRecord } from "./types.js";
-export type FileResult = {
-    file: FileRecord;
-    chunks: Record<string, ChunkRecord>;
-    symbols: Record<string, SymbolRecord>;
-};
-export type Store = {
-    read(): Promise<CastIndex>;
-    write(index: CastIndex): Promise<void>;
-    beginIndexRun?(input: {
-        configHash: string;
-        metadata: CastIndex["metadata"];
-    }): Promise<{
-        runId: string;
-    }>;
+import type { CreateIndexerInput, ScannerFileResult, ScannerStore } from "./scanner-types.js";
+import type { CastIndex } from "./types.js";
+export interface FileResult extends ScannerFileResult {
+}
+export interface Store extends Omit<ScannerStore, "getCompletedFile" | "writeFileResult" | "writeFileResults"> {
     getCompletedFile?(runId: string, filePath: string, fingerprint: string): Promise<FileResult | undefined>;
     writeFileResult?(runId: string, fileResult: FileResult): Promise<void>;
     writeFileResults?(runId: string, fileResults: FileResult[]): Promise<void>;
-    activateRun?(runId: string, index: CastIndex): Promise<void>;
-};
-export declare function createIndexer(input: {
-    worktree: string;
-    options: {
-        maxChunkNonWhitespaceChars: number;
-        maxFileBytes: number;
-        includeGlobs: string[];
-        excludeGlobs: string[];
-        chunking: ChunkingOptions;
-        embeddingBatchSize?: number;
-        embeddingBatchConcurrency?: number;
-    };
+}
+export interface PublicCreateIndexerInput extends Omit<CreateIndexerInput, "store"> {
     store: Store;
-    parse(filePath: string, source: string): Promise<{
-        language: string;
-        root?: SyntaxNode;
-    }>;
-    embed(text: string, signal?: AbortSignal): Promise<number[]>;
-    embedBatch?(texts: string[], signal?: AbortSignal): Promise<number[][]>;
-}): {
+}
+export declare function createIndexer(input: PublicCreateIndexerInput): {
     refresh(signal?: AbortSignal): Promise<CastIndex>;
     refreshFile(filePath: string, signal?: AbortSignal): Promise<CastIndex>;
 };

@@ -8,6 +8,7 @@
 - Usual local verification: `npm run lint`, `npm run typecheck`, `npm test`, `npm run build`.
 - Focused test: `npm test -- src/options.test.ts` or add `-t "test name"`.
 - `npm run format` is the only mutating formatter command; `lint`/`check` are non-mutating Biome checks.
+- `npm run check` also runs Fallow (`npm run fallow`, currently `fallow --ci --fail-on-issues`) after `biome ci .`; fix dependency/dead-code issues rather than bypassing them.
 
 ## Architecture
 
@@ -24,4 +25,5 @@
 - Imports in source use `.js` extensions because `module`/`moduleResolution` are `nodenext`.
 - Tests run with Vitest under Node.
 - Biome is strict: 2-space indentation, double quotes, no semicolons, trailing commas, line width 120; prefer small targeted rule overrides only when necessary.
+- Non-test source files have a 500-line Biome error target. Prefer extracting modules or other refactors to meet it; do not add `biome-ignore` comments to silence file-length errors.
 - Keep Pi config examples as extension entries; after changing extension config or rebuilding a local `dist/index.js`, Pi must be restarted if the extension is already loaded.

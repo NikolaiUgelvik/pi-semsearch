@@ -120,6 +120,7 @@ describe("pi-semsearch extension", () => {
       successfulWriteResult(path.join(path.dirname(worktree), "outside.ts")),
       ctx(worktree),
     )
+    await harness.events.tool_result?.(successfulWriteResult("src/../../outside.ts"), ctx(worktree))
     await waitForEventLoop()
 
     expect(fileRefreshes).toEqual(["src/new.ts"])

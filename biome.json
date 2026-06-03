@@ -42,7 +42,14 @@
       "performance": "error",
       "security": "error",
       "style": "error",
-      "nursery": "off"
+      "nursery": {
+        "noExcessiveLinesPerFile": {
+          "level": "error",
+          "options": {
+            "maxLines": 500
+          }
+        }
+      }
     }
   },
   "overrides": [
@@ -58,7 +65,7 @@
       }
     },
     {
-      "includes": ["src/index.ts", "extensions/pi-semsearch.ts", "vitest.config.ts"],
+      "includes": ["src/index.ts", "src/extension.ts", "extensions/pi-semsearch.ts", "vitest.config.ts"],
       "linter": {
         "rules": {
           "performance": {
@@ -71,7 +78,7 @@
       }
     },
     {
-      "includes": ["src/cast.ts", "src/language.ts", "src/scanner.ts", "src/types.ts"],
+      "includes": ["src/cast.ts", "src/language.ts", "src/scanner.ts", "src/scanner-*.ts", "src/types.ts"],
       "linter": {
         "rules": {
           "style": {
@@ -93,12 +100,23 @@
           "style": {
             "noMagicNumbers": "off",
             "useNamingConvention": "off"
+          },
+          "nursery": {
+            "noExcessiveLinesPerFile": "off"
           }
         }
       }
     },
     {
-      "includes": ["src/options.ts", "src/extension.ts", "src/retriever.ts", "src/scanner.ts", "src/topology.ts"],
+      "includes": [
+        "src/options.ts",
+        "src/extension.ts",
+        "src/extension-*.ts",
+        "src/retriever.ts",
+        "src/scanner.ts",
+        "src/scanner-*.ts",
+        "src/topology.ts"
+      ],
       "linter": {
         "rules": {
           "complexity": {
@@ -109,7 +127,7 @@
       }
     },
     {
-      "includes": ["src/scanner.ts"],
+      "includes": ["src/scanner.ts", "src/scanner-*.ts"],
       "linter": {
         "rules": {
           "performance": {
@@ -119,7 +137,7 @@
       }
     },
     {
-      "includes": ["src/cast.ts", "src/fallback.ts", "src/scanner.ts"],
+      "includes": ["src/cast.ts", "src/fallback.ts", "src/scanner.ts", "src/scanner-*.ts"],
       "linter": {
         "rules": {
           "complexity": {
@@ -139,7 +157,7 @@
       }
     },
     {
-      "includes": ["src/extension.ts"],
+      "includes": ["src/extension.ts", "src/extension-*.ts"],
       "linter": {
         "rules": {
           "style": {
@@ -152,7 +170,7 @@
       }
     },
     {
-      "includes": ["src/openai.ts", "src/options.ts"],
+      "includes": ["src/openai.ts", "src/options.ts", "src/extension-*.ts"],
       "linter": {
         "rules": {
           "style": {
@@ -174,9 +192,11 @@
         "src/openai.ts",
         "src/options.ts",
         "src/extension.ts",
+        "src/extension-*.ts",
         "src/range.ts",
         "src/retriever.ts",
         "src/scanner.ts",
+        "src/scanner-*.ts",
         "src/store.ts",
         "src/topology.ts"
       ],
