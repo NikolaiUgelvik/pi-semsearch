@@ -148,103 +148,64 @@ export function createIndexStore(input: { cacheDir: string; cacheKey: string; em
   return createSqliteIndexStore(input.cacheDir, input.cacheKey, input.embeddingDimensions)
 }
 
-// biome-ignore lint/complexity/noExcessiveLinesPerFunction: The store factory intentionally exposes the SQLite store API in one object.
 function createSqliteIndexStore(cacheDir: string, cacheKey: string, embeddingDimensions?: number) {
   const file = path.join(cacheDir, cacheKey, "index.sqlite")
+  const withDb = async <T>(dimensions: number | undefined, operation: (db: Database) => T | Promise<T>): Promise<T> => {
+    const db = await openSqliteIndex(file, dimensions)
+    try {
+      return await operation(db)
+    } finally {
+      db.close()
+    }
+  }
+
   return {
-    async read() {
-      const db = await openSqliteIndex(file, embeddingDimensions)
-      try {
-        return readSqliteIndex(db, cacheKey, embeddingDimensions)
-      } finally {
-        db.close()
-      }
+    read() {
+      return withDb(embeddingDimensions, (db) => readSqliteIndex(db, cacheKey, embeddingDimensions))
     },
-    async write(index: CastIndex) {
-      const db = await openSqliteIndex(file, embeddingDimensions ?? inferEmbeddingDimensions(index))
-      try {
-        writeSqliteIndex(db, index)
-      } finally {
-        db.close()
-      }
+    write(index: CastIndex) {
+      return withDb(embeddingDimensions ?? inferEmbeddingDimensions(index), (db) => writeSqliteIndex(db, index))
     },
-    async readMetadata() {
-      const db = await openSqliteIndex(file, embeddingDimensions)
-      try {
-        return readSqliteMetadata(db, cacheKey, embeddingDimensions)
-      } finally {
-        db.close()
-      }
+    readMetadata() {
+      return withDb(embeddingDimensions, (db) => readSqliteMetadata(db, cacheKey, embeddingDimensions))
     },
-    async hydrateChunks(chunkIds: string[], options?: HydrateChunksOptions) {
-      const db = await openSqliteIndex(file, embeddingDimensions)
-      try {
-        return hydrateSqliteChunks({ db, cacheKey, embeddingDimensions, chunkIds, options })
-      } finally {
-        db.close()
-      }
+    hydrateChunks(chunkIds: string[], options?: HydrateChunksOptions) {
+      return withDb(embeddingDimensions, (db) =>
+        hydrateSqliteChunks({ db, cacheKey, embeddingDimensions, chunkIds, options }),
+      )
     },
-    async searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]) {
+    searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]) {
       if (queryEmbedding.length === 0 || topK <= 0) {
-        return []
+        return Promise.resolve([])
       }
-      const db = await openSqliteIndex(file, embeddingDimensions ?? queryEmbedding.length)
-      try {
-        return searchSqliteVectorCandidates(db, queryEmbedding, topK, paths)
-      } finally {
-        db.close()
-      }
+      return withDb(embeddingDimensions ?? queryEmbedding.length, (db) =>
+        searchSqliteVectorCandidates(db, queryEmbedding, topK, paths),
+      )
     },
-    async searchLexicalCandidates(query: string, topK: number, paths?: string[]) {
+    searchLexicalCandidates(query: string, topK: number, paths?: string[]) {
       if (query.trim().length === 0 || topK <= 0) {
-        return []
+        return Promise.resolve([])
       }
-      const db = await openSqliteIndex(file, embeddingDimensions)
-      try {
-        return searchSqliteLexicalCandidates(db, query, topK, paths)
-      } finally {
-        db.close()
-      }
+      return withDb(embeddingDimensions, (db) => searchSqliteLexicalCandidates(db, query, topK, paths))
     },
-    async beginIndexRun(input: { configHash: string; metadata: CastIndex["metadata"] }) {
-      const db = await openSqliteIndex(file, embeddingDimensions)
-      try {
-        return beginSqliteIndexRun(db, input.configHash, input.metadata)
-      } finally {
-        db.close()
-      }
+    beginIndexRun(input: { configHash: string; metadata: CastIndex["metadata"] }) {
+      return withDb(embeddingDimensions, (db) => beginSqliteIndexRun(db, input.configHash, input.metadata))
     },
-    async getCompletedFile(runId: string, filePath: string, fingerprint: string) {
-      const db = await openSqliteIndex(file, embeddingDimensions)
-      try {
-        return getCompletedSqliteFile(db, runId, filePath, fingerprint)
-      } finally {
-        db.close()
-      }
+    getCompletedFile(runId: string, filePath: string, fingerprint: string) {
+      return withDb(embeddingDimensions, (db) => getCompletedSqliteFile(db, runId, filePath, fingerprint))
     },
-    async writeFileResult(runId: string, fileResult: FileResult) {
-      const db = await openSqliteIndex(file, embeddingDimensions ?? inferFileResultEmbeddingDimensions(fileResult))
-      try {
-        writeSqliteFileResult(db, runId, fileResult)
-      } finally {
-        db.close()
-      }
+    writeFileResult(runId: string, fileResult: FileResult) {
+      return withDb(embeddingDimensions ?? inferFileResultEmbeddingDimensions(fileResult), (db) =>
+        writeSqliteFileResult(db, runId, fileResult),
+      )
     },
-    async writeFileResults(runId: string, fileResults: FileResult[]) {
-      const db = await openSqliteIndex(file, embeddingDimensions ?? inferFileResultsEmbeddingDimensions(fileResults))
-      try {
-        writeSqliteFileResults(db, runId, fileResults)
-      } finally {
-        db.close()
-      }
+    writeFileResults(runId: string, fileResults: FileResult[]) {
+      return withDb(embeddingDimensions ?? inferFileResultsEmbeddingDimensions(fileResults), (db) =>
+        writeSqliteFileResults(db, runId, fileResults),
+      )
     },
-    async activateRun(runId: string, index: CastIndex) {
-      const db = await openSqliteIndex(file, embeddingDimensions ?? inferEmbeddingDimensions(index))
-      try {
-        activateSqliteRun(db, runId, index)
-      } finally {
-        db.close()
-      }
+    activateRun(runId: string, index: CastIndex) {
+      return withDb(embeddingDimensions ?? inferEmbeddingDimensions(index), (db) => activateSqliteRun(db, runId, index))
     },
   }
 }
@@ -410,14 +371,32 @@ function hydrateStoredChunks(input: {
   const chunks: Record<string, ChunkRecord> = {}
 
   for (const storedChunk of input.orderedStoredChunks) {
-    const chunk: ChunkRecord = { ...storedChunk, text: readChunkText(input.sourceContext, sourceCache, storedChunk) }
-    const embedding = vectors.get(chunk.id)
-    if (embedding) {
-      chunk.embedding = embedding
-    }
+    const chunk = hydrateStoredChunkRecord({
+      storedRecord: storedChunk,
+      vectors,
+      sourceContext: input.sourceContext,
+      sourceCache,
+    })
     chunks[chunk.id] = chunk
   }
   return chunks
+}
+
+function hydrateStoredChunkRecord(input: {
+  storedRecord: StoredChunkRecord
+  vectors: Map<string, number[]>
+  sourceContext?: SourceHydrationContext
+  sourceCache: Map<string, SourceReadResult>
+}): ChunkRecord {
+  const record: ChunkRecord = {
+    ...input.storedRecord,
+    text: readChunkText(input.sourceContext, input.sourceCache, input.storedRecord),
+  }
+  const embedding = input.vectors.get(record.id)
+  if (embedding) {
+    record.embedding = embedding
+  }
+  return record
 }
 
 function hydratedChunkSet(input: {
@@ -583,25 +562,29 @@ interface FileRow {
 function fileRecordsFromRows(files: FileRow[]) {
   const records: Record<string, FileRecord> = {}
   for (const file of files) {
-    const record: FileRecord = {
-      path: file.path,
-      language: file.language,
-      fingerprint: file.fingerprint,
-      chunkIds: parsePersistedJson(file.chunkIdsJson),
-      diagnostics: parsePersistedJson(file.diagnosticsJson),
-    }
-    if (file.sizeBytes !== null) {
-      record.sizeBytes = file.sizeBytes
-    }
-    if (file.mtimeMs !== null) {
-      record.mtimeMs = file.mtimeMs
-    }
-    if (file.ctimeMs !== null) {
-      record.ctimeMs = file.ctimeMs
-    }
-    records[file.path] = record
+    records[file.path] = fileRecordFromRow(file)
   }
   return records
+}
+
+function fileRecordFromRow(file: FileRow): FileRecord {
+  const record: FileRecord = {
+    path: file.path,
+    language: file.language,
+    fingerprint: file.fingerprint,
+    chunkIds: parsePersistedJson(file.chunkIdsJson),
+    diagnostics: parsePersistedJson(file.diagnosticsJson),
+  }
+  if (file.sizeBytes !== null) {
+    record.sizeBytes = file.sizeBytes
+  }
+  if (file.mtimeMs !== null) {
+    record.mtimeMs = file.mtimeMs
+  }
+  if (file.ctimeMs !== null) {
+    record.ctimeMs = file.ctimeMs
+  }
+  return record
 }
 
 function readStoredChunksByIds(db: Database, runId: string, chunkIds: string[]) {
@@ -672,14 +655,7 @@ function readChunks(
     if (sourceContext?.filePaths && !sourceContext.filePaths.has(storedRecord.filePath)) {
       continue
     }
-    const record: ChunkRecord = {
-      ...storedRecord,
-      text: readChunkText(sourceContext, sourceCache, storedRecord),
-    }
-    const embedding = vectors.get(chunk.id)
-    if (embedding) {
-      record.embedding = embedding
-    }
+    const record = hydrateStoredChunkRecord({ storedRecord, vectors, sourceContext, sourceCache })
     records[chunk.id] = record
   }
   return records
@@ -710,14 +686,12 @@ function readFileChunks(input: {
   }>
   for (const chunk of chunks) {
     const storedRecord = parsePersistedJson<StoredChunkRecord>(chunk.recordJson)
-    const record: ChunkRecord = {
-      ...storedRecord,
-      text: readChunkText(input.sourceContext, sourceCache, storedRecord),
-    }
-    const embedding = input.vectors.get(chunk.id)
-    if (embedding) {
-      record.embedding = embedding
-    }
+    const record = hydrateStoredChunkRecord({
+      storedRecord,
+      vectors: input.vectors,
+      sourceContext: input.sourceContext,
+      sourceCache,
+    })
     records[chunk.id] = record
   }
   return records
@@ -942,30 +916,12 @@ function getCompletedSqliteFile(
        from file_runs
        where run_id = ? and path = ? and fingerprint = ?`,
     )
-    .get(runId, filePath, fingerprint) as {
-    path: string
-    language: string
-    fingerprint: string
-    sizeBytes: number | null
-    mtimeMs: number | null
-    ctimeMs: number | null
-    diagnosticsJson: string
-    chunkIdsJson: string
-  } | null
+    .get(runId, filePath, fingerprint) as FileRow | null
   if (!file) {
     return
   }
 
-  const record: FileRecord = {
-    path: file.path,
-    language: file.language,
-    fingerprint: file.fingerprint,
-    sizeBytes: file.sizeBytes ?? undefined,
-    mtimeMs: file.mtimeMs ?? undefined,
-    ctimeMs: file.ctimeMs ?? undefined,
-    chunkIds: JSON.parse(file.chunkIdsJson),
-    diagnostics: JSON.parse(file.diagnosticsJson),
-  }
+  const record = fileRecordFromRow(file)
   const metadata = readRunMetadata(db, runId)
   if (!metadata) {
     return
@@ -1411,11 +1367,14 @@ function readActiveVectorCount(db: Database, runId: string) {
   return row.count
 }
 
-interface SqliteVectorCandidateRow {
+interface SqliteVectorRow {
   rowid: number
+  embedding: string
+}
+
+interface SqliteVectorCandidateRow extends SqliteVectorRow {
   id: string
   filePath: string
-  embedding: string
   queryEmbedding: number[]
 }
 
@@ -1437,16 +1396,8 @@ function querySqliteVectorCandidates(input: {
        where rowid in (select rowid from chunk_rowids where run_id = ?) and embedding match ? and k = ?
        order by distance`,
     )
-    .all(input.runId, JSON.stringify(input.queryEmbedding), input.topK) as Array<{ rowid: number; embedding: string }>
-  const rowMetadata = readSqliteVectorRowMetadata(
-    input.db,
-    input.runId,
-    vectorRows.map((row) => row.rowid),
-  )
-  return vectorRows.flatMap((row) => {
-    const metadata = rowMetadata.get(row.rowid)
-    return metadata ? [{ ...row, ...metadata, queryEmbedding: input.queryEmbedding }] : []
-  })
+    .all(input.runId, JSON.stringify(input.queryEmbedding), input.topK) as SqliteVectorRow[]
+  return sqliteVectorRowsToCandidateRows(input.db, input.runId, vectorRows, input.queryEmbedding)
 }
 
 function queryPathFilteredSqliteVectorCandidates(input: {
@@ -1469,18 +1420,24 @@ function queryPathFilteredSqliteVectorCandidates(input: {
        ) and embedding match ? and k = ?
        order by distance`,
     )
-    .all(input.runId, ...input.pathFilter.args, JSON.stringify(input.queryEmbedding), input.topK) as Array<{
-    rowid: number
-    embedding: string
-  }>
+    .all(input.runId, ...input.pathFilter.args, JSON.stringify(input.queryEmbedding), input.topK) as SqliteVectorRow[]
+  return sqliteVectorRowsToCandidateRows(input.db, input.runId, vectorRows, input.queryEmbedding)
+}
+
+function sqliteVectorRowsToCandidateRows(
+  db: Database,
+  runId: string,
+  vectorRows: SqliteVectorRow[],
+  queryEmbedding: number[],
+): SqliteVectorCandidateRow[] {
   const rowMetadata = readSqliteVectorRowMetadata(
-    input.db,
-    input.runId,
+    db,
+    runId,
     vectorRows.map((row) => row.rowid),
   )
   return vectorRows.flatMap((row) => {
     const metadata = rowMetadata.get(row.rowid)
-    return metadata ? [{ ...row, ...metadata, queryEmbedding: input.queryEmbedding }] : []
+    return metadata ? [{ ...row, ...metadata, queryEmbedding }] : []
   })
 }
 

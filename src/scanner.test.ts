@@ -2,8 +2,8 @@ import { createHash } from "node:crypto"
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import BetterSqlite3 from "better-sqlite3"
 import { describe, expect, test } from "vitest"
+import { Database } from "../test-utils/sqlite.js"
 import { parseOptions } from "./options.js"
 import { createIndexer as createScannerIndexer } from "./scanner.js"
 import { createEmptyIndex, createIndexStore } from "./store.js"
@@ -12,31 +12,6 @@ import type { CastIndex, ChunkingOptions, ChunkRecord, FileRecord, SymbolRecord 
 const DEFAULT_CHUNKING_OPTIONS: ChunkingOptions = { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 }
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024
 
-type SqliteParameter = string | number | bigint | null | Buffer
-
-class Database {
-  private readonly db: BetterSqlite3.Database
-
-  constructor(file: string) {
-    this.db = new BetterSqlite3(file)
-  }
-
-  query(sql: string) {
-    const statement = this.db.prepare(sql)
-    return {
-      get: (...params: SqliteParameter[]) => statement.get(...params),
-      all: (...params: SqliteParameter[]) => statement.all(...params),
-    }
-  }
-
-  run(sql: string, params: SqliteParameter[] = []) {
-    return this.db.prepare(sql).run(...params)
-  }
-
-  close() {
-    this.db.close()
-  }
-}
 type CreateIndexerInput = Parameters<typeof createScannerIndexer>[0]
 type TestCreateIndexerInput = Omit<CreateIndexerInput, "options"> & {
   options: Omit<CreateIndexerInput["options"], "chunking" | "maxFileBytes"> & {
@@ -121,8 +96,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 2,
         },
         store: createMemoryStore(),
@@ -178,8 +151,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: createMemoryStore(),
         parse: async () => parsed,
@@ -206,8 +177,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: createMemoryStore(),
         parse: async () => {
@@ -245,8 +214,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 5,
           includeGlobs: ["**/*.txt"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 1,
         },
         store: createMemoryStore(),
@@ -284,8 +251,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 8,
           includeGlobs: ["**/*.txt"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 1,
           embeddingBatchConcurrency: 2,
         },
@@ -323,8 +288,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 2,
         },
         store: createMemoryStore(),
@@ -392,8 +355,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async (filePath) => {
@@ -440,8 +401,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: createMemoryStore(),
         parse: async (_filePath, source) => {
@@ -482,8 +441,6 @@ describe("createIndexer", () => {
         maxChunkNonWhitespaceChars: 2000,
         includeGlobs: ["**/*.ts"],
         excludeGlobs: [],
-        topK: 5,
-        maxContextChars: 12_000,
       }
       const makeIndexer = () =>
         createIndexer({
@@ -541,8 +498,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -595,8 +550,6 @@ describe("createIndexer", () => {
             maxChunkNonWhitespaceChars: 2000,
             includeGlobs: ["**/*.ts"],
             excludeGlobs: [],
-            topK: 5,
-            maxContextChars: 12_000,
           },
           store,
           parse: async () => ({ language: "typescript", root: undefined }),
@@ -657,8 +610,6 @@ describe("createIndexer", () => {
             maxChunkNonWhitespaceChars: 2000,
             includeGlobs: ["**/*.ts"],
             excludeGlobs: [],
-            topK: 5,
-            maxContextChars: 12_000,
           },
           store,
           parse: async () => ({ language: "typescript", root: undefined }),
@@ -705,8 +656,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -748,8 +697,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -777,8 +724,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -814,8 +759,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -866,8 +809,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -921,8 +862,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -988,8 +927,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1058,8 +995,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts", "src/**/*.ts"],
           excludeGlobs: ["generated/**", "dist/**"],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1097,8 +1032,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1160,8 +1093,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -1193,8 +1124,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -1237,8 +1166,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async (filePath) => {
@@ -1286,8 +1213,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -1360,8 +1285,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1441,8 +1364,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1492,8 +1413,6 @@ describe("createIndexer", () => {
             maxChunkNonWhitespaceChars: 2000,
             includeGlobs: ["**/*.ts"],
             excludeGlobs: [],
-            topK: 5,
-            maxContextChars: 12_000,
           },
           store,
           parse: async () => ({ language: "typescript", root: undefined }),
@@ -1508,8 +1427,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => {
@@ -1558,8 +1475,6 @@ describe("createIndexer", () => {
         maxChunkNonWhitespaceChars: 2000,
         includeGlobs: ["**/*.ts"],
         excludeGlobs: [],
-        topK: 5,
-        maxContextChars: 12_000,
       }
       const makeIndexer = () =>
         createIndexer({
@@ -1613,8 +1528,6 @@ describe("createIndexer", () => {
         maxChunkNonWhitespaceChars: 2000,
         includeGlobs: ["**/*.ts"],
         excludeGlobs: [],
-        topK: 5,
-        maxContextChars: 12_000,
       }
       const makeIndexer = () =>
         createIndexer({
@@ -1708,8 +1621,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -1745,8 +1656,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1787,8 +1696,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1832,8 +1739,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1866,8 +1771,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1902,8 +1805,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: ["excluded/**"],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -1940,8 +1841,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: ["ignored/**"],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: createMemoryStore(),
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -1969,8 +1868,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["src/**"],
           excludeGlobs: ["**/*.map", "vendor/**"],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: createMemoryStore(),
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -1996,8 +1893,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["foo/**/*.ts"],
           excludeGlobs: ["foo/*"],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: createMemoryStore(),
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -2026,8 +1921,6 @@ describe("createIndexer", () => {
             maxChunkNonWhitespaceChars: 2000,
             includeGlobs: ["**/*.ts"],
             excludeGlobs: [],
-            topK: 5,
-            maxContextChars: 12_000,
           },
           store: createMemoryStore(),
           parse: async (filePath) => {
@@ -2061,8 +1954,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: options.maxChunkNonWhitespaceChars,
           includeGlobs: options.includeGlobs,
           excludeGlobs: options.excludeGlobs,
-          topK: options.topK,
-          maxContextChars: options.maxContextChars,
         },
         store: {
           read: async () => index,
@@ -2097,8 +1988,6 @@ describe("createIndexer", () => {
           maxFileBytes: 1024,
           includeGlobs: ["**/*"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2137,8 +2026,6 @@ describe("createIndexer", () => {
           maxFileBytes: 100,
           includeGlobs: ["**/*"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2175,8 +2062,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 17,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store,
         parse: async () => ({ language: "typescript", root: undefined }),
@@ -2207,8 +2092,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2265,8 +2148,6 @@ describe("createIndexer", () => {
             maxFileBytes,
             includeGlobs: ["**/*.ts"],
             excludeGlobs: [],
-            topK: 5,
-            maxContextChars: 12_000,
           },
           store,
           parse: async () => ({ language: "typescript", root: undefined }),
@@ -2296,8 +2177,6 @@ describe("createIndexer", () => {
         maxChunkNonWhitespaceChars: 2000,
         includeGlobs: ["**/*.ts"],
         excludeGlobs: [],
-        topK: 5,
-        maxContextChars: 12_000,
       }
       const makeIndexer = () =>
         createIndexer({
@@ -2365,8 +2244,6 @@ describe("createIndexer", () => {
             maxChunkNonWhitespaceChars: 2000,
             includeGlobs: ["**/*.ts"],
             excludeGlobs: [],
-            topK: 5,
-            maxContextChars: 12_000,
             chunking,
           },
           store: {
@@ -2420,8 +2297,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2464,8 +2339,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2508,8 +2381,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2557,8 +2428,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2608,8 +2477,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2657,8 +2524,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2707,8 +2572,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2751,8 +2614,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2806,8 +2667,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -2860,8 +2719,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           chunking: { overlap: 0, expansion: true, minSemanticNonWhitespaceChars: 8 },
         },
         store: {
@@ -2916,8 +2773,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           chunking: { overlap: 0, expansion: true, minSemanticNonWhitespaceChars: 8 },
         },
         store: {
@@ -2958,8 +2813,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -3007,8 +2860,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -3063,8 +2914,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 1,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,
@@ -3108,8 +2957,6 @@ describe("createIndexer", () => {
           maxFileBytes: 1024,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 3,
           chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
         },
@@ -3160,8 +3007,6 @@ describe("createIndexer", () => {
           maxFileBytes: 1024,
           includeGlobs: ["**/*.txt"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 1,
           embeddingBatchConcurrency: 2,
           chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
@@ -3201,8 +3046,6 @@ describe("createIndexer", () => {
           maxFileBytes: 1024,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 2,
           chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
         },
@@ -3248,8 +3091,6 @@ describe("createIndexer", () => {
           maxFileBytes: 1024,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
           embeddingBatchSize: 2,
           chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 1 },
         },
@@ -3291,8 +3132,6 @@ describe("createIndexer", () => {
           maxChunkNonWhitespaceChars: 2000,
           includeGlobs: ["**/*.ts"],
           excludeGlobs: [],
-          topK: 5,
-          maxContextChars: 12_000,
         },
         store: {
           read: async () => index,

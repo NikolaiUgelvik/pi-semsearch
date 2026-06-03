@@ -177,8 +177,6 @@ class SemsearchRuntime {
             maxFileBytes: this.options.maxFileBytes,
             includeGlobs: this.options.includeGlobs,
             excludeGlobs: this.options.excludeGlobs,
-            topK: this.options.topK,
-            maxContextChars: this.options.maxContextChars,
             chunking: this.options.chunking,
             embeddingBatchSize: embedding.batchSize,
             embeddingBatchConcurrency: embedding.concurrency,
@@ -417,12 +415,6 @@ class SemsearchRuntime {
     }
     const indexStore = this.store
     const wrapped: RetrievalIndexStore = {
-      readMetadata: () => {
-        if (!hasReadMetadataStore(indexStore)) {
-          throw new IndexUnavailableError(this.storeError ?? "index unavailable")
-        }
-        return this.wrapStoreOperation(() => indexStore.readMetadata())
-      },
       searchVectorCandidates: (queryEmbedding, topK, paths) => {
         if (!hasVectorCandidateStore(indexStore)) {
           throw new IndexUnavailableError(this.storeError ?? "index unavailable")
@@ -785,7 +777,7 @@ function hasLexicalCandidateStore(value: unknown): value is LexicalCandidateStor
   )
 }
 
-function hasReadMetadataStore(value: unknown): value is Pick<RetrievalIndexStore, "readMetadata"> {
+function hasReadMetadataStore(value: unknown): value is { readMetadata(): Promise<IndexMetadata> } {
   return (
     typeof value === "object" && value !== null && "readMetadata" in value && typeof value.readMetadata === "function"
   )

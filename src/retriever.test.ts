@@ -42,7 +42,6 @@ async function retrieveFromIndex({ index, indexStore, ...input }: RetrieveFromIn
 
 function indexStoreFromIndex(index: CastIndex): RetrievalIndexStore {
   return {
-    readMetadata: async () => index.metadata,
     searchVectorCandidates: async (queryEmbedding, topK, paths) => {
       const vectors = Object.values(index.chunks)
         .filter((chunk) => chunk.embedding && testPathMatches(chunk.filePath, paths))
@@ -183,17 +182,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "function alpha() {}",
       indexStore: {
-        readMetadata: async () => ({
-          schemaVersion: 1,
-          projectId: "p",
-          worktree: "/repo",
-          cacheKey: "key",
-          maxChunkNonWhitespaceChars: 2000,
-          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
-          updatedAt: 1,
-          status: "ready",
-          diagnostics: [],
-        }),
         searchVectorCandidates: async () => [{ id: "c1", score: 0.9 }],
         hydrateChunks: async () => ({
           metadata: {
@@ -256,7 +244,6 @@ describe("retrieve", () => {
         throw new Error("source should not be read")
       },
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async () => [{ id: "c1", score: 0.9 }],
         hydrateChunks: async () => ({
           metadata,
@@ -297,17 +284,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde alpha",
       readSource: async (filePath) => (filePath === "hyde.ts" ? "function hydeAlpha() {}" : "function alpha() {}"),
       indexStore: {
-        readMetadata: async () => ({
-          schemaVersion: 1,
-          projectId: "p",
-          worktree: "/repo",
-          cacheKey: "key",
-          maxChunkNonWhitespaceChars: 2000,
-          chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
-          updatedAt: 1,
-          status: "ready",
-          diagnostics: [],
-        }),
         searchVectorCandidates: async (vector) =>
           vector[0] === 1 ? [{ id: "initial", score: 0.1 }] : [{ id: "hyde", score: 0.95 }],
         hydrateChunks: async (chunkIds) => {
@@ -397,7 +373,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde alpha",
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async (vector) =>
           vector[0] === 1
             ? [{ id: "initial", score: 0.1 }]
@@ -461,7 +436,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "function alpha() {}",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async () => [{ id: "c1", score: 0.9 }],
         hydrateChunks: async () => ({
           metadata,
@@ -504,17 +478,6 @@ describe("retrieve", () => {
         generateHyde: async () => "hyde alpha",
         readSource: async () => "function alpha() {}",
         indexStore: {
-          readMetadata: async () => ({
-            schemaVersion: 1,
-            projectId: "p",
-            worktree: "/repo",
-            cacheKey: "key",
-            maxChunkNonWhitespaceChars: 2000,
-            chunking: { overlap: 0, expansion: false, minSemanticNonWhitespaceChars: 8 },
-            updatedAt: 1,
-            status: "ready",
-            diagnostics: [],
-          }),
           searchVectorCandidates: async (vector) => {
             if (vector[0] === 1) {
               return [{ id: "initial", score: 0.1 }]
@@ -550,7 +513,6 @@ describe("retrieve", () => {
       readSource: async (filePath) =>
         filePath === "lexical.ts" ? "function exactNeedle() {}" : "function vector() {}",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async () => [{ id: "vector", score: 0.9 }],
         searchLexicalCandidates: async () => [{ id: "lexical", score: 12, bm25Score: 7 }],
         hydrateChunks: async (ids) => {
@@ -643,7 +605,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async (_vector, topK) => {
           vectorTopKs.push(topK)
           return Array.from({ length: topK }, (_, index) => ({ id: `vector-${index}`, score: 1 - index / topK }))
@@ -721,7 +682,6 @@ describe("retrieve", () => {
       },
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async (_vector, topK) => {
           vectorTopKs.push(topK)
           return Array.from({ length: topK }, (_, index) => ({ id: `c${index}`, score: 1 - index / topK }))
@@ -788,7 +748,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async () =>
           Object.assign([{ id: "c1", score: 1 }], {
             incomplete: true,
@@ -856,7 +815,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async () => [
           { id: "c1", score: 1 },
           { id: "c2", score: 0.9 },
@@ -922,7 +880,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async () =>
           Array.from({ length: 5 }, (_, index) => ({ id: `c${index}`, score: 1 - index / 10 })),
         hydrateChunks: async (ids) => ({
@@ -983,7 +940,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async (_vector, topK) =>
           Array.from({ length: topK }, (_, index) => ({ id: `c${index}`, score: 1 - index / 10 })),
         hydrateChunks: async (ids) => ({
@@ -1047,7 +1003,6 @@ describe("retrieve", () => {
       rerank: async (_query, documents) => documents.map((_document, index) => ({ index, score: 1 - index / 10 })),
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async (_vector, topK) =>
           Array.from({ length: topK }, (_, index) => ({ id: `c${index}`, score: 1 - index / 10 })),
         hydrateChunks: async (ids) => ({
@@ -1109,7 +1064,6 @@ describe("retrieve", () => {
       generateHyde: async () => "hyde text",
       readSource: async () => "",
       indexStore: {
-        readMetadata: async () => metadata,
         searchVectorCandidates: async (_vector, topK) => {
           vectorTopKs.push(topK)
           const candidates = [{ id: "a-unrelated", score: 1 }]

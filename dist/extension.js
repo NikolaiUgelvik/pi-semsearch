@@ -124,8 +124,6 @@ class SemsearchRuntime {
                     maxFileBytes: this.options.maxFileBytes,
                     includeGlobs: this.options.includeGlobs,
                     excludeGlobs: this.options.excludeGlobs,
-                    topK: this.options.topK,
-                    maxContextChars: this.options.maxContextChars,
                     chunking: this.options.chunking,
                     embeddingBatchSize: embedding.batchSize,
                     embeddingBatchConcurrency: embedding.concurrency,
@@ -338,12 +336,6 @@ class SemsearchRuntime {
         }
         const indexStore = this.store;
         const wrapped = {
-            readMetadata: () => {
-                if (!hasReadMetadataStore(indexStore)) {
-                    throw new IndexUnavailableError(this.storeError ?? "index unavailable");
-                }
-                return this.wrapStoreOperation(() => indexStore.readMetadata());
-            },
             searchVectorCandidates: (queryEmbedding, topK, paths) => {
                 if (!hasVectorCandidateStore(indexStore)) {
                     throw new IndexUnavailableError(this.storeError ?? "index unavailable");

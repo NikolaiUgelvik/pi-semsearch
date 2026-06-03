@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "vitest"
 import packagedSemsearchExtension from "../extensions/pi-semsearch.ts"
 import { createPiSemsearchExtensionForTest } from "./extension.js"
 import semsearchExtension from "./index.js"
+import { parseOptions } from "./options.js"
 import { createEmptyIndex } from "./store.js"
 import type { CastIndex, IndexMetadata, SearchOutput } from "./types.js"
 
@@ -338,7 +339,7 @@ function readyIndex(worktree: string): CastIndex {
   index.metadata.status = "ready"
   index.metadata.maxFileBytes = 2 * 1024 * 1024
   index.metadata.includeGlobs = ["**/*"]
-  index.metadata.excludeGlobs = defaultExcludeGlobs()
+  index.metadata.excludeGlobs = parseOptions({}).excludeGlobs
   return index
 }
 
@@ -399,43 +400,6 @@ function testUsage() {
     totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   }
-}
-
-function defaultExcludeGlobs() {
-  return [
-    "**/*.{png,jpg,jpeg,gif,webp,ico,pdf,zip,gz,tgz,tar,7z,mp4,mov,mp3,woff,woff2,ttf,eot}",
-    "**/bun.lock",
-    "**/package-lock.json",
-    "**/pnpm-lock.yaml",
-    "**/yarn.lock",
-    "**/*.min.js",
-    "**/*.map",
-    "**/__pycache__/**",
-    "**/*.{pyc,pyo,pyd}",
-    "**/.venv/**",
-    "**/venv/**",
-    "**/.mypy_cache/**",
-    "**/.pytest_cache/**",
-    "**/.ruff_cache/**",
-    "**/.tox/**",
-    "**/.nox/**",
-    "**/*.egg-info/**",
-    "**/coverage/**",
-    "**/.next/**",
-    "**/.nuxt/**",
-    "**/.svelte-kit/**",
-    "**/.turbo/**",
-    "**/.vite/**",
-    "**/.parcel-cache/**",
-    "**/*.test",
-    "**/coverage.out",
-    "**/target/**",
-    "**/.gradle/**",
-    "**/*.{class,jar,war,ear}",
-    "**/.bundle/**",
-    "**/vendor/bundle/**",
-    "**/vendor/**",
-  ]
 }
 
 async function eventually(assertion: () => void, attempts = 10): Promise<void> {

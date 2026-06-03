@@ -23,7 +23,6 @@ const DEFAULT_MAX_RERANK_CANDIDATES = 64
 const PATH_FILTER_CAP_DIAGNOSTIC = "path-filtered vector search hit the candidate cap; results may be incomplete"
 
 export interface RetrievalIndexStore {
-  readMetadata(): Promise<CastIndex["metadata"]>
   searchVectorCandidates(queryEmbedding: number[], topK: number, paths?: string[]): Promise<VectorCandidateSearchResult>
   searchLexicalCandidates?(query: string, topK: number, paths?: string[]): Promise<LexicalChunkCandidate[]>
   hydrateChunks(chunkIds: string[]): Promise<HydratedChunkSet>
@@ -72,7 +71,6 @@ interface StoreCandidateSearch {
 }
 
 export async function retrieveFromStore(input: RetrieveFromStoreInput): Promise<SearchOutput> {
-  await input.indexStore.readMetadata()
   const settings = retrievalSettings(input)
   const maxVectorCandidates = input.options.maxVectorCandidates ?? DEFAULT_MAX_VECTOR_CANDIDATES
   const maxRerankCandidates = input.options.maxRerankCandidates ?? DEFAULT_MAX_RERANK_CANDIDATES

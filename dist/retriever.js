@@ -7,7 +7,6 @@ const DEFAULT_MAX_VECTOR_CANDIDATES = 512;
 const DEFAULT_MAX_RERANK_CANDIDATES = 64;
 const PATH_FILTER_CAP_DIAGNOSTIC = "path-filtered vector search hit the candidate cap; results may be incomplete";
 export async function retrieveFromStore(input) {
-    await input.indexStore.readMetadata();
     const settings = retrievalSettings(input);
     const maxVectorCandidates = input.options.maxVectorCandidates ?? DEFAULT_MAX_VECTOR_CANDIDATES;
     const maxRerankCandidates = input.options.maxRerankCandidates ?? DEFAULT_MAX_RERANK_CANDIDATES;

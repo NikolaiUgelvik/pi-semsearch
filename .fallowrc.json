@@ -1,20 +1,8 @@
 {
   "$schema": "./node_modules/fallow/schema.json",
   "sealed": true,
-  "entry": ["extensions/pi-semsearch.ts", "src/index.ts", "src/**/*.test.ts"],
-  "ignorePatterns": ["dist/**", "node_modules/**", ".cache/**", "coverage/**", "docs/superpowers/**"],
-  "ignoreDependencies": [
-    "tree-sitter-bash",
-    "tree-sitter-go",
-    "tree-sitter-html",
-    "tree-sitter-java",
-    "tree-sitter-javascript",
-    "tree-sitter-php",
-    "tree-sitter-python",
-    "tree-sitter-ruby",
-    "tree-sitter-rust",
-    "tree-sitter-typescript"
-  ],
+  "entry": ["extensions/pi-semsearch.ts", "src/**/*.test.ts"],
+  "ignorePatterns": ["dist/**", "node_modules/**", ".cache/**", "coverage/**"],
   "includeEntryExports": true,
   "duplicates": {
     "mode": "strict",

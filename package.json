@@ -28,7 +28,7 @@
     "check": "biome ci . && npm run fallow",
     "fallow": "fallow --ci --fail-on-issues",
     "test": "vitest run",
-    "typecheck": "tsgo --noEmit",
+    "typecheck": "tsc --noEmit",
     "build": "tsc",
     "prepack": "npm run check && npm run typecheck && npm run build"
   },
@@ -49,6 +49,7 @@
   "files": [
     "extensions",
     "src",
+    "!src/**/*.test.ts",
     "dist",
     "README.md",
     "LICENSE"
@@ -83,7 +84,6 @@
     "@tsconfig/node24": "^24.0.4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.12.4",
-    "@typescript/native-preview": "^7.0.0-dev.20260602.1",
     "fallow": "^2.86.0",
     "typebox": "^1.0.68",
     "typescript": "^6.0.3",

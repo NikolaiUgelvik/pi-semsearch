@@ -2,9 +2,9 @@ import { createHash } from "node:crypto"
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import BetterSqlite3 from "better-sqlite3"
 import { load as loadSqliteVec } from "sqlite-vec"
 import { describe, expect, test } from "vitest"
+import { Database } from "../test-utils/sqlite.js"
 import { cosineSimilarity, createEmptyIndex, createIndexStore, searchVectors } from "./store.js"
 import type { CastIndex, ChunkRecord, FileRecord, LexicalChunkCandidate, SymbolRecord } from "./types.js"
 
@@ -52,36 +52,6 @@ type BatchResumableStore = ResumableStore & {
 }
 
 const MISSING_CHUNK_RECORD_COLUMN_PATTERN = /record_json|no such column/
-
-type SqliteParameter = string | number | bigint | null | Buffer
-
-class Database {
-  private readonly db: BetterSqlite3.Database
-
-  constructor(file: string) {
-    this.db = new BetterSqlite3(file)
-  }
-
-  query(sql: string) {
-    const statement = this.db.prepare(sql)
-    return {
-      get: (...params: SqliteParameter[]) => statement.get(...params),
-      all: (...params: SqliteParameter[]) => statement.all(...params),
-    }
-  }
-
-  run(sql: string, params: SqliteParameter[] = []) {
-    return this.db.prepare(sql).run(...params)
-  }
-
-  close() {
-    this.db.close()
-  }
-
-  raw() {
-    return this.db
-  }
-}
 
 function chunk(id: string, filePath: string, embedding: number[]): ChunkRecord {
   return {

@@ -91,8 +91,6 @@ export function createIndexer(input: {
     maxFileBytes: number
     includeGlobs: string[]
     excludeGlobs: string[]
-    topK: number
-    maxContextChars: number
     chunking: ChunkingOptions
     embeddingBatchSize?: number
     embeddingBatchConcurrency?: number
