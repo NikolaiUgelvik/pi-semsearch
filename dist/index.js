@@ -1,1 +1,1 @@
-export { piSemsearchExtension as default } from "./extension.js";
+export { piSemsearchExtension as default } from "./extension/index.js";

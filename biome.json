@@ -65,7 +65,7 @@
       }
     },
     {
-      "includes": ["src/index.ts", "src/extension.ts", "extensions/pi-semsearch.ts", "vitest.config.ts"],
+      "includes": ["src/index.ts", "src/extension/index.ts", "extensions/pi-semsearch.ts", "vitest.config.ts"],
       "linter": {
         "rules": {
           "performance": {
@@ -78,7 +78,13 @@
       }
     },
     {
-      "includes": ["src/cast.ts", "src/language.ts", "src/scanner.ts", "src/scanner-*.ts", "src/types.ts"],
+      "includes": [
+        "src/parsing/cast.ts",
+        "src/parsing/language.ts",
+        "src/scanner/index.ts",
+        "src/scanner/**/*.ts",
+        "src/shared/types.ts"
+      ],
       "linter": {
         "rules": {
           "style": {
@@ -109,13 +115,13 @@
     },
     {
       "includes": [
-        "src/options.ts",
-        "src/extension.ts",
-        "src/extension-*.ts",
-        "src/retriever.ts",
-        "src/scanner.ts",
-        "src/scanner-*.ts",
-        "src/topology.ts"
+        "src/options/index.ts",
+        "src/extension/index.ts",
+        "src/extension/**/*.ts",
+        "src/retriever/index.ts",
+        "src/scanner/index.ts",
+        "src/scanner/**/*.ts",
+        "src/topology/index.ts"
       ],
       "linter": {
         "rules": {
@@ -127,7 +133,7 @@
       }
     },
     {
-      "includes": ["src/scanner.ts", "src/scanner-*.ts"],
+      "includes": ["src/scanner/index.ts", "src/scanner/**/*.ts"],
       "linter": {
         "rules": {
           "performance": {
@@ -137,7 +143,7 @@
       }
     },
     {
-      "includes": ["src/cast.ts", "src/fallback.ts", "src/scanner.ts", "src/scanner-*.ts"],
+      "includes": ["src/parsing/cast.ts", "src/parsing/fallback.ts", "src/scanner/index.ts", "src/scanner/**/*.ts"],
       "linter": {
         "rules": {
           "complexity": {
@@ -147,7 +153,7 @@
       }
     },
     {
-      "includes": ["src/options.ts"],
+      "includes": ["src/options/index.ts"],
       "linter": {
         "rules": {
           "style": {
@@ -157,7 +163,7 @@
       }
     },
     {
-      "includes": ["src/extension.ts", "src/extension-*.ts"],
+      "includes": ["src/extension/index.ts", "src/extension/**/*.ts"],
       "linter": {
         "rules": {
           "style": {
@@ -170,7 +176,12 @@
       }
     },
     {
-      "includes": ["src/openai.ts", "src/options.ts", "src/extension-*.ts"],
+      "includes": [
+        "src/embeddings/openai.ts",
+        "src/options/index.ts",
+        "src/extension/index.ts",
+        "src/extension/**/*.ts"
+      ],
       "linter": {
         "rules": {
           "style": {
@@ -186,19 +197,19 @@
     },
     {
       "includes": [
-        "src/cast.ts",
-        "src/fallback.ts",
-        "src/language.ts",
-        "src/openai.ts",
-        "src/options.ts",
-        "src/extension.ts",
-        "src/extension-*.ts",
-        "src/range.ts",
-        "src/retriever.ts",
-        "src/scanner.ts",
-        "src/scanner-*.ts",
-        "src/store.ts",
-        "src/topology.ts"
+        "src/parsing/cast.ts",
+        "src/parsing/fallback.ts",
+        "src/parsing/language.ts",
+        "src/embeddings/openai.ts",
+        "src/options/index.ts",
+        "src/extension/index.ts",
+        "src/extension/**/*.ts",
+        "src/parsing/range.ts",
+        "src/retriever/index.ts",
+        "src/scanner/index.ts",
+        "src/scanner/**/*.ts",
+        "src/store/index.ts",
+        "src/topology/index.ts"
       ],
       "linter": {
         "rules": {

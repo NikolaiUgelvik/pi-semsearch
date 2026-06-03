@@ -3,11 +3,11 @@ import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import packagedSemsearchExtension from "../extensions/pi-semsearch.ts"
-import { createPiSemsearchExtensionForTest } from "./extension.js"
+import { createPiSemsearchExtensionForTest } from "./extension/index.js"
 import semsearchExtension from "./index.js"
-import { parseOptions } from "./options.js"
-import { createEmptyIndex } from "./store.js"
-import type { CastIndex, IndexMetadata, SearchOutput } from "./types.js"
+import { parseOptions } from "./options/index.js"
+import type { CastIndex, IndexMetadata, SearchOutput } from "./shared/types.js"
+import { createEmptyIndex } from "./store/index.js"
 
 const tempDirs: string[] = []
 

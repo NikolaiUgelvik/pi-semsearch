@@ -1,0 +1,38 @@
+import type { ChunkRecord, SymbolRecord } from "../shared/types.js";
+declare function linkSymbolsToChunks(chunks: ChunkRecord[], symbols: Record<string, SymbolRecord>): {
+    symbolIds: string[];
+    id: string;
+    filePath: string;
+    language: string;
+    kind: import("../shared/types.js").ChunkKind;
+    range: import("../shared/types.js").SourceRange;
+    text: string;
+    nonWhitespaceChars: number;
+    nodeTypes: string[];
+    parentChunkId?: string;
+    childChunkIds: string[];
+    previousSiblingChunkId?: string;
+    nextSiblingChunkId?: string;
+    embedding?: number[];
+    embeddingError?: string;
+    lexical?: import("../shared/types.js").ChunkLexicalStats;
+}[];
+declare function linkChunkTopology(chunks: ChunkRecord[], symbols: Record<string, SymbolRecord>): {
+    previousSiblingChunkId: string;
+    nextSiblingChunkId: string;
+    id: string;
+    filePath: string;
+    language: string;
+    kind: import("../shared/types.js").ChunkKind;
+    range: import("../shared/types.js").SourceRange;
+    text: string;
+    nonWhitespaceChars: number;
+    nodeTypes: string[];
+    symbolIds: string[];
+    parentChunkId?: string;
+    childChunkIds: string[];
+    embedding?: number[];
+    embeddingError?: string;
+    lexical?: import("../shared/types.js").ChunkLexicalStats;
+}[];
+export { linkChunkTopology, linkSymbolsToChunks };
