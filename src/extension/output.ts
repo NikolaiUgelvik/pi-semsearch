@@ -1,4 +1,5 @@
 import path from "node:path"
+import { env } from "node:process"
 import { Minimatch } from "minimatch"
 import type { ChunkLookupOutput, DiagnosticRecord, IndexMetadata, SearchOutput } from "../shared/types.js"
 
@@ -16,7 +17,11 @@ type VisibleStatus<T extends IndexMetadata> = Omit<
   excludeGlobs?: string[]
 }
 
-type VisibleSearchOutput = Omit<SearchOutput, "status" | "diagnostics" | "diagnosticDetails"> & {
+type VisibleSearchResult = Omit<SearchOutput["results"][number], "finalScore" | "retrieval" | "score"> &
+  Partial<Pick<SearchOutput["results"][number], "finalScore" | "retrieval" | "score">>
+
+type VisibleSearchOutput = Omit<SearchOutput, "diagnosticDetails" | "diagnostics" | "results" | "status"> & {
+  results: VisibleSearchResult[]
   status: VisibleStatus<SearchOutput["status"]>
 }
 
@@ -47,6 +52,9 @@ const LOOKUP_COMPACT_CHILD_LIMITS = [
   SINGLE_COMPACT_CHILD,
   NO_COMPACT_CHILDREN,
 ]
+const RETRIEVAL_DEBUG_ENV = "PI_SEMSEARCH_DEBUG_RETRIEVAL"
+const DISABLED_ENV_VALUES = new Set(["", "0", "false", "no", "off"])
+
 function unavailableToolResult(title: string, message: string | undefined) {
   return {
     title,
@@ -61,13 +69,36 @@ function searchOutputForTool(output: SearchOutput): VisibleSearchOutput {
     diagnostics: [...output.status.diagnostics, ...output.diagnostics],
     details: diagnosticDetails,
   })
+  const includeRetrievalDebug = retrievalDebugEnabled()
+  const status = visibleStatusForTool(output.status, diagnostics, [
+    ...output.results.map((result) => result.filePath),
+    ...diagnosticFilePaths(diagnosticDetails),
+  ])
   return {
-    results: output.results,
-    status: visibleStatusForTool(output.status, diagnostics, [
-      ...output.results.map((result) => result.filePath),
-      ...diagnosticFilePaths(diagnosticDetails),
-    ]),
+    results: output.results.map((result) => visibleSearchResult(result, includeRetrievalDebug)),
+    status: includeRetrievalDebug ? status : statusWithoutRetrievalDebug(status),
   }
+}
+
+function visibleSearchResult(
+  result: SearchOutput["results"][number],
+  includeRetrievalDebug: boolean,
+): VisibleSearchResult {
+  if (includeRetrievalDebug) {
+    return result
+  }
+  const { finalScore: _finalScore, retrieval: _retrieval, score: _score, ...visibleResult } = result
+  return visibleResult
+}
+
+function statusWithoutRetrievalDebug<T extends { bestScore?: number }>(status: T) {
+  const { bestScore: _bestScore, ...visibleStatus } = status
+  return visibleStatus as Omit<T, "bestScore">
+}
+
+function retrievalDebugEnabled() {
+  const value = env[RETRIEVAL_DEBUG_ENV]
+  return value !== undefined && !DISABLED_ENV_VALUES.has(value.toLowerCase())
 }
 
 function chunkLookupOutputForTool(output: ChunkLookupOutput): VisibleChunkLookupOutput {

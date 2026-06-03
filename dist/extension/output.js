@@ -1,4 +1,5 @@
 import path from "node:path";
+import { env } from "node:process";
 import { Minimatch } from "minimatch";
 const COMPACTION_DIAGNOSTIC = "output compacted; use semantic_get_chunk for more context";
 const LOOKUP_COMPACTION_DIAGNOSTIC = "output compacted; narrow semantic_get_chunk args, page children, or reduce included relations";
@@ -23,6 +24,8 @@ const LOOKUP_COMPACT_CHILD_LIMITS = [
     SINGLE_COMPACT_CHILD,
     NO_COMPACT_CHILDREN,
 ];
+const RETRIEVAL_DEBUG_ENV = "PI_SEMSEARCH_DEBUG_RETRIEVAL";
+const DISABLED_ENV_VALUES = new Set(["", "0", "false", "no", "off"]);
 function unavailableToolResult(title, message) {
     return {
         title,
@@ -36,13 +39,30 @@ function searchOutputForTool(output) {
         diagnostics: [...output.status.diagnostics, ...output.diagnostics],
         details: diagnosticDetails,
     });
+    const includeRetrievalDebug = retrievalDebugEnabled();
+    const status = visibleStatusForTool(output.status, diagnostics, [
+        ...output.results.map((result) => result.filePath),
+        ...diagnosticFilePaths(diagnosticDetails),
+    ]);
     return {
-        results: output.results,
-        status: visibleStatusForTool(output.status, diagnostics, [
-            ...output.results.map((result) => result.filePath),
-            ...diagnosticFilePaths(diagnosticDetails),
-        ]),
+        results: output.results.map((result) => visibleSearchResult(result, includeRetrievalDebug)),
+        status: includeRetrievalDebug ? status : statusWithoutRetrievalDebug(status),
     };
+}
+function visibleSearchResult(result, includeRetrievalDebug) {
+    if (includeRetrievalDebug) {
+        return result;
+    }
+    const { finalScore: _finalScore, retrieval: _retrieval, score: _score, ...visibleResult } = result;
+    return visibleResult;
+}
+function statusWithoutRetrievalDebug(status) {
+    const { bestScore: _bestScore, ...visibleStatus } = status;
+    return visibleStatus;
+}
+function retrievalDebugEnabled() {
+    const value = env[RETRIEVAL_DEBUG_ENV];
+    return value !== undefined && !DISABLED_ENV_VALUES.has(value.toLowerCase());
 }
 function chunkLookupOutputForTool(output) {
     const diagnosticDetails = [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])];

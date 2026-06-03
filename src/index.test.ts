@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { env } from "node:process"
 import { afterEach, describe, expect, test } from "vitest"
 import packagedSemsearchExtension from "../extensions/pi-semsearch.ts"
 import { createPiSemsearchExtensionForTest } from "./extension/index.js"
@@ -9,6 +10,7 @@ import { parseOptions } from "./options/index.js"
 import type { CastIndex, IndexMetadata, SearchOutput } from "./shared/types.js"
 import { createEmptyIndex } from "./store/index.js"
 
+const RETRIEVAL_DEBUG_ENV = "PI_SEMSEARCH_DEBUG_RETRIEVAL"
 const tempDirs: string[] = []
 
 afterEach(async () => {
@@ -152,9 +154,11 @@ describe("pi-semsearch extension", () => {
       }),
     )
 
+    delete env[RETRIEVAL_DEBUG_ENV]
     const result = await executeTool(harness, "semantic_search_code", { query: "find session" }, worktree)
     const output = toolJson(result)
     const status = output.status as Record<string, unknown>
+    const firstResult = (output.results as Record<string, unknown>[])[0]
 
     expect(result.content[0].text).toContain("Semantic code search: find session")
     expect(result.content[0].text).toContain("src/session.ts")
@@ -163,9 +167,42 @@ describe("pi-semsearch extension", () => {
     expect(status.cacheKey).toBeUndefined()
     expect(status.includeGlobs).toBeUndefined()
     expect(status.excludeGlobs).toBeUndefined()
+    expect(status.bestScore).toBeUndefined()
+    expect(firstResult.score).toBeUndefined()
+    expect(firstResult.finalScore).toBeUndefined()
+    expect(firstResult.retrieval).toBeUndefined()
     expect(output.diagnostics).toBeUndefined()
     expect(status.diagnostics).toEqual([])
     expect(result.details).toMatchObject({ resultCount: 1, hydeUsed: false, rerankUsed: false })
+  })
+
+  test("semantic_search_code includes retrieval scores when extension debug env is enabled", async () => {
+    const worktree = await tempWorktree({ embedding: configuredEmbedding() })
+    const index = readyIndex(worktree)
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => readyStore(index),
+        retrieve: async ({ input }) => {
+          const output = searchOutput(index.metadata, input.query)
+          return { ...output, status: { ...output.status, bestScore: 0.9 } }
+        },
+      }),
+    )
+
+    env[RETRIEVAL_DEBUG_ENV] = "1"
+    try {
+      const result = await executeTool(harness, "semantic_search_code", { query: "find session" }, worktree)
+      const output = toolJson(result)
+      const status = output.status as Record<string, unknown>
+      const firstResult = (output.results as Record<string, unknown>[])[0]
+
+      expect(status.bestScore).toBe(0.9)
+      expect(firstResult.score).toBe(0.9)
+      expect(firstResult.finalScore).toBe(0.95)
+      expect(firstResult.retrieval).toEqual({ mode: "vector", vectorRank: 1 })
+    } finally {
+      delete env[RETRIEVAL_DEBUG_ENV]
+    }
   })
 
   test("semantic_search_code shows only matched filter globs and one diagnostics copy", async () => {
