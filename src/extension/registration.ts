@@ -68,7 +68,7 @@ function registerRefreshCommand(pi: ExtensionAPI, runtimeFor: RuntimeResolver) {
 
 function registerWriteToolIndexHook(pi: ExtensionAPI, runtimeFor: RuntimeResolver) {
   pi.on("tool_result", async (event, ctx) => {
-    if (!isSuccessfulWriteToolResult(event)) {
+    if (!isSuccessfulFileMutationToolResult(event)) {
       return
     }
     const runtime = await runtimeFor(ctx)
@@ -178,13 +178,17 @@ function piToolResult(result: { title: string; output: string; metadata?: unknow
     details: result.metadata && typeof result.metadata === "object" ? result.metadata : { metadata: result.metadata },
   }
 }
-function isSuccessfulWriteToolResult(event: { toolName?: unknown; input?: unknown; isError?: unknown }): event is {
-  toolName: "write"
+function isSuccessfulFileMutationToolResult(event: {
+  toolName?: unknown
+  input?: unknown
+  isError?: unknown
+}): event is {
+  toolName: "edit" | "write"
   input: { path: string }
   isError?: false
 } {
   return (
-    event.toolName === "write" &&
+    (event.toolName === "edit" || event.toolName === "write") &&
     event.isError !== true &&
     typeof event.input === "object" &&
     event.input !== null &&

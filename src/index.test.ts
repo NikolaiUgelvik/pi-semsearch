@@ -87,7 +87,7 @@ describe("pi-semsearch extension", () => {
     expect(statuses).toEqual([])
   })
 
-  test("write tool results queue a single-file background index refresh for worktree paths", async () => {
+  test("file mutation tool results queue a single-file background index refresh for worktree paths", async () => {
     const worktree = await tempWorktree({ embedding: configuredEmbedding() })
     let fullRefreshes = 0
     const fileRefreshes: string[] = []
@@ -111,6 +111,10 @@ describe("pi-semsearch extension", () => {
     await eventually(() => expect(fileRefreshes).toEqual(["src/new.ts"]))
     await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 
+    await harness.events.tool_result?.(successfulEditResult("src/changed.ts"), ctx(worktree, [], { statuses }))
+    await eventually(() => expect(fileRefreshes).toEqual(["src/new.ts", "src/changed.ts"]))
+    await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
+
     await harness.events.tool_result?.({ ...successfulWriteResult("src/failed.ts"), isError: true }, ctx(worktree))
     await harness.events.tool_result?.(
       { toolName: "read", input: { path: "src/read.ts" }, isError: false },
@@ -123,7 +127,7 @@ describe("pi-semsearch extension", () => {
     await harness.events.tool_result?.(successfulWriteResult("src/../../outside.ts"), ctx(worktree))
     await waitForEventLoop()
 
-    expect(fileRefreshes).toEqual(["src/new.ts"])
+    expect(fileRefreshes).toEqual(["src/new.ts", "src/changed.ts"])
     expect(fullRefreshes).toBe(0)
   })
 
@@ -361,6 +365,10 @@ interface CtxOptions {
 
 function successfulWriteResult(filePath: string): TestToolResultEvent {
   return { toolName: "write", input: { path: filePath }, isError: false }
+}
+
+function successfulEditResult(filePath: string): TestToolResultEvent {
+  return { toolName: "edit", input: { path: filePath }, isError: false }
 }
 
 function ctx(worktree: string, notifications: string[] = [], options: CtxOptions = {}) {
