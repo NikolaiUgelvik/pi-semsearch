@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { env } from "node:process";
 import { complete } from "@earendil-works/pi-ai";
+import { Minimatch } from "minimatch";
 import { Type } from "typebox";
 import { getChunkById } from "./chunk-lookup.js";
 import { HYDE_SYSTEM_PROMPT } from "./hyde.js";
@@ -676,30 +677,64 @@ function unavailableToolResult(title, message) {
     };
 }
 function searchOutputForTool(output) {
-    const { diagnosticDetails: _outputDetails, ...visibleOutput } = output;
-    const { diagnosticDetails: _statusDetails, ...visibleStatus } = output.status;
+    const diagnosticDetails = [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])];
     const diagnostics = summarizeDiagnostics({
         diagnostics: [...output.status.diagnostics, ...output.diagnostics],
-        details: [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])],
+        details: diagnosticDetails,
     });
     return {
-        ...visibleOutput,
-        status: { ...visibleStatus, diagnostics },
-        diagnostics,
+        results: output.results,
+        status: visibleStatusForTool(output.status, diagnostics, [
+            ...output.results.map((result) => result.filePath),
+            ...diagnosticFilePaths(diagnosticDetails),
+        ]),
     };
 }
 function chunkLookupOutputForTool(output) {
-    const { diagnosticDetails: _outputDetails, ...visibleOutput } = output;
-    const { diagnosticDetails: _statusDetails, ...visibleStatus } = output.status;
+    const diagnosticDetails = [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])];
     const diagnostics = summarizeDiagnostics({
         diagnostics: [...output.status.diagnostics, ...output.diagnostics],
-        details: [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])],
+        details: diagnosticDetails,
     });
     return {
-        ...visibleOutput,
-        status: { ...visibleStatus, diagnostics },
+        ...(output.chunk ? { chunk: output.chunk } : {}),
+        status: visibleStatusForTool(output.status, diagnostics, [
+            ...(output.chunk ? [output.chunk.filePath] : []),
+            ...diagnosticFilePaths(diagnosticDetails),
+        ]),
+    };
+}
+function visibleStatusForTool(status, diagnostics, relevantPaths) {
+    const { projectId: _projectId, cacheKey: _cacheKey, includeGlobs, excludeGlobs, diagnosticDetails: _diagnosticDetails, diagnostics: _diagnostics, ...visibleStatus } = status;
+    return {
+        ...visibleStatus,
+        ...matchedVisibleGlobs({ includeGlobs, excludeGlobs, relevantPaths }),
         diagnostics,
     };
+}
+function matchedVisibleGlobs(input) {
+    const relevantPaths = [...new Set(input.relevantPaths.filter((filePath) => filePath.length > 0))];
+    if (relevantPaths.length === 0) {
+        return {};
+    }
+    const includeGlobs = matchedGlobs(input.includeGlobs ?? [], relevantPaths).filter((glob) => glob !== "**/*");
+    const excludeGlobs = matchedGlobs(input.excludeGlobs ?? [], relevantPaths);
+    return {
+        ...(includeGlobs.length > 0 ? { includeGlobs } : {}),
+        ...(excludeGlobs.length > 0 ? { excludeGlobs } : {}),
+    };
+}
+function matchedGlobs(globs, relevantPaths) {
+    return globs.filter((glob) => {
+        const matcher = new Minimatch(glob, { dot: true });
+        return relevantPaths.some((filePath) => matcher.match(toGlobPath(filePath)));
+    });
+}
+function toGlobPath(filePath) {
+    return filePath.split(path.sep).join("/");
+}
+function diagnosticFilePaths(details) {
+    return details.flatMap((detail) => (detail.filePath ? [detail.filePath] : []));
 }
 function summarizeDiagnostics(input) {
     const details = uniqueDiagnosticDetails(input.details);
@@ -881,7 +916,7 @@ function compactSearchOutput(output, limits) {
                 const { parentText: _parentText, parentRange: _parentRange, text, ...rest } = result;
                 return { ...rest, text: trimText(text, maxTextLength) };
             }),
-            diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+            status: statusWithSearchCompaction(output.status),
         };
         if (serializedFits(serializeJson(compacted), limits)) {
             return compacted;
@@ -893,12 +928,12 @@ function compactSearchOutput(output, limits) {
             const { parentText: _parentText, parentRange: _parentRange, text, ...rest } = result;
             return { ...rest, text: trimText(text, 0) };
         }),
-        diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+        status: statusWithSearchCompaction(output.status),
     };
 }
 function minimalSearchOutput(output) {
     return {
-        status: output.status,
+        status: output.results.length === 0 ? statusWithSearchCompaction(output.status) : output.status,
         results: output.results.map((result, index) => ({
             rank: index + SINGLE_COMPACT_CHILD,
             id: result.topology.current.id,
@@ -908,14 +943,13 @@ function minimalSearchOutput(output) {
             finalScore: result.finalScore,
             retrieval: result.retrieval,
         })),
-        ...(output.results.length === 0 ? { diagnostics: diagnosticsWithSearchCompaction(output.diagnostics) } : {}),
     };
 }
 function diagnosticsFocusedSearchOutput(output) {
     return {
         status: output.status.status,
         resultCount: output.results.length,
-        diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+        diagnostics: diagnosticsWithSearchCompaction(output.status.diagnostics),
     };
 }
 function compactChunkLookupOutput(output, limits) {
@@ -931,7 +965,7 @@ function compactChunkLookupOutput(output, limits) {
 }
 function compactChunkLookupOutputWith(output, maxTextLength, maxChildren) {
     if (!output.chunk) {
-        return { ...output, diagnostics: diagnosticsWithLookupCompaction(output.diagnostics) };
+        return { ...output, status: statusWithLookupCompaction(output.status) };
     }
     const { parentText: _parentText, parentRange: _parentRange, text, related, ...chunk } = output.chunk;
     const children = related.children.slice(0, maxChildren).map(compactRelatedChunk);
@@ -948,7 +982,7 @@ function compactChunkLookupOutputWith(output, maxTextLength, maxChildren) {
                 childrenPage: compactChildrenPage(related.childrenPage, children.length),
             },
         },
-        diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
+        status: statusWithLookupCompaction(output.status),
     };
 }
 function compactRelatedChunk(chunk) {
@@ -960,10 +994,10 @@ function compactRelatedChunk(chunk) {
 }
 function minimalChunkLookupOutput(output) {
     if (!output.chunk) {
-        return { status: output.status, diagnostics: diagnosticsWithLookupCompaction(output.diagnostics) };
+        return { status: statusWithLookupCompaction(output.status) };
     }
     return {
-        status: output.status,
+        status: statusWithLookupCompaction(output.status),
         chunk: {
             filePath: output.chunk.filePath,
             language: output.chunk.language,
@@ -979,14 +1013,13 @@ function minimalChunkLookupOutput(output) {
                 childrenPage: output.chunk.related.childrenPage,
             },
         },
-        diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
     };
 }
 function diagnosticsFocusedChunkLookupOutput(output) {
     return {
         status: output.status.status,
         found: Boolean(output.chunk),
-        diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
+        diagnostics: diagnosticsWithLookupCompaction(output.status.diagnostics),
     };
 }
 function compactChildrenPage(page, emittedChildren) {
@@ -998,6 +1031,12 @@ function compactChildrenPage(page, emittedChildren) {
         limit: emittedChildren,
         hasMore: page.offset + emittedChildren < page.total,
     };
+}
+function statusWithSearchCompaction(status) {
+    return { ...status, diagnostics: diagnosticsWithSearchCompaction(status.diagnostics) };
+}
+function statusWithLookupCompaction(status) {
+    return { ...status, diagnostics: diagnosticsWithLookupCompaction(status.diagnostics) };
 }
 function diagnosticsWithSearchCompaction(diagnostics) {
     return diagnostics.includes(COMPACTION_DIAGNOSTIC) ? diagnostics : [...diagnostics, COMPACTION_DIAGNOSTIC];

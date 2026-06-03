@@ -148,11 +148,48 @@ describe("pi-semsearch extension", () => {
     )
 
     const result = await executeTool(harness, "semantic_search_code", { query: "find session" }, worktree)
+    const output = toolJson(result)
+    const status = output.status as Record<string, unknown>
 
     expect(result.content[0].text).toContain("Semantic code search: find session")
     expect(result.content[0].text).toContain("src/session.ts")
     expect(result.content[0].text).toContain("function session")
+    expect(status.projectId).toBeUndefined()
+    expect(status.cacheKey).toBeUndefined()
+    expect(status.includeGlobs).toBeUndefined()
+    expect(status.excludeGlobs).toBeUndefined()
+    expect(output.diagnostics).toBeUndefined()
+    expect(status.diagnostics).toEqual([])
     expect(result.details).toMatchObject({ resultCount: 1, hydeUsed: false, rerankUsed: false })
+  })
+
+  test("semantic_search_code shows only matched filter globs and one diagnostics copy", async () => {
+    const includeGlobs = ["src/**/*.ts", "tmp/**", "docs/**"]
+    const excludeGlobs = ["tmp/**", "dist/**"]
+    const worktree = await tempWorktree({ embedding: configuredEmbedding(), includeGlobs, excludeGlobs })
+    const index = readyIndex(worktree)
+    index.metadata.includeGlobs = includeGlobs
+    index.metadata.excludeGlobs = excludeGlobs
+    const skippedDiagnostic = "tmp/cache.tmp: skipped binary file"
+    index.metadata.diagnostics = [skippedDiagnostic]
+    index.metadata.diagnosticDetails = [
+      { code: "index.skipped_file", message: skippedDiagnostic, filePath: "tmp/cache.tmp" },
+    ]
+    const harness = installExtension(
+      createPiSemsearchExtensionForTest({
+        createStore: () => readyStore(index),
+        retrieve: async ({ input }) => searchOutput(index.metadata, input.query),
+      }),
+    )
+
+    const result = await executeTool(harness, "semantic_search_code", { query: "find session" }, worktree)
+    const output = toolJson(result)
+    const status = output.status as Record<string, unknown>
+
+    expect(status.includeGlobs).toEqual(["src/**/*.ts", "tmp/**"])
+    expect(status.excludeGlobs).toEqual(["tmp/**"])
+    expect(status.diagnostics).toEqual(["1 index diagnostic suppressed"])
+    expect(output.diagnostics).toBeUndefined()
   })
 
   test("semantic_get_chunk reads chunk context through the Pi tool API", async () => {
@@ -182,9 +219,14 @@ describe("pi-semsearch extension", () => {
     const harness = installExtension(createPiSemsearchExtensionForTest({ createStore: () => readyStore(index) }))
 
     const result = await executeTool(harness, "semantic_get_chunk", { id: "c1", includeParents: false }, worktree)
+    const output = toolJson(result)
+    const status = output.status as Record<string, unknown>
 
     expect(result.content[0].text).toContain("Semantic chunk lookup: c1")
     expect(result.content[0].text).toContain("export function session")
+    expect(status.projectId).toBeUndefined()
+    expect(status.cacheKey).toBeUndefined()
+    expect(output.diagnostics).toBeUndefined()
     expect(result.details).toEqual({ found: true })
   })
 
@@ -305,6 +347,10 @@ async function executeTool(
   worktree: string,
 ) {
   return harness.tools[name].execute("tool-call", params, new AbortController().signal, undefined, ctx(worktree))
+}
+
+function toolJson(result: Awaited<ReturnType<typeof executeTool>>) {
+  return JSON.parse(result.content[0].text.split("\n\n").slice(1).join("\n\n")) as Record<string, unknown>
 }
 
 interface CtxOptions {

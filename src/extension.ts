@@ -5,6 +5,7 @@ import path from "node:path"
 import { env } from "node:process"
 import { complete, type UserMessage } from "@earendil-works/pi-ai"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
+import { Minimatch } from "minimatch"
 import { Type } from "typebox"
 import { getChunkById } from "./chunk-lookup.js"
 import { HYDE_SYSTEM_PROMPT } from "./hyde.js"
@@ -50,6 +51,23 @@ interface SemsearchRuntimeDependencies {
 interface ToolOutputLimits {
   maxLines?: number
   maxBytes?: number
+}
+
+type VisibleStatus<T extends IndexMetadata> = Omit<
+  T,
+  "projectId" | "cacheKey" | "includeGlobs" | "excludeGlobs" | "diagnosticDetails" | "diagnostics"
+> & {
+  diagnostics: string[]
+  includeGlobs?: string[]
+  excludeGlobs?: string[]
+}
+
+type VisibleSearchOutput = Omit<SearchOutput, "status" | "diagnostics" | "diagnosticDetails"> & {
+  status: VisibleStatus<SearchOutput["status"]>
+}
+
+type VisibleChunkLookupOutput = Omit<ChunkLookupOutput, "status" | "diagnostics" | "diagnosticDetails"> & {
+  status: VisibleStatus<ChunkLookupOutput["status"]>
 }
 
 const SEMSEARCH_STATUS_KEY = "semsearch"
@@ -830,32 +848,86 @@ function unavailableToolResult(title: string, message: string | undefined) {
   }
 }
 
-function searchOutputForTool(output: SearchOutput): SearchOutput {
-  const { diagnosticDetails: _outputDetails, ...visibleOutput } = output
-  const { diagnosticDetails: _statusDetails, ...visibleStatus } = output.status
+function searchOutputForTool(output: SearchOutput): VisibleSearchOutput {
+  const diagnosticDetails = [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])]
   const diagnostics = summarizeDiagnostics({
     diagnostics: [...output.status.diagnostics, ...output.diagnostics],
-    details: [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])],
+    details: diagnosticDetails,
   })
   return {
-    ...visibleOutput,
-    status: { ...visibleStatus, diagnostics },
+    results: output.results,
+    status: visibleStatusForTool(output.status, diagnostics, [
+      ...output.results.map((result) => result.filePath),
+      ...diagnosticFilePaths(diagnosticDetails),
+    ]),
+  }
+}
+
+function chunkLookupOutputForTool(output: ChunkLookupOutput): VisibleChunkLookupOutput {
+  const diagnosticDetails = [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])]
+  const diagnostics = summarizeDiagnostics({
+    diagnostics: [...output.status.diagnostics, ...output.diagnostics],
+    details: diagnosticDetails,
+  })
+  return {
+    ...(output.chunk ? { chunk: output.chunk } : {}),
+    status: visibleStatusForTool(output.status, diagnostics, [
+      ...(output.chunk ? [output.chunk.filePath] : []),
+      ...diagnosticFilePaths(diagnosticDetails),
+    ]),
+  }
+}
+
+function visibleStatusForTool<T extends IndexMetadata>(
+  status: T,
+  diagnostics: string[],
+  relevantPaths: string[],
+): VisibleStatus<T> {
+  const {
+    projectId: _projectId,
+    cacheKey: _cacheKey,
+    includeGlobs,
+    excludeGlobs,
+    diagnosticDetails: _diagnosticDetails,
+    diagnostics: _diagnostics,
+    ...visibleStatus
+  } = status
+  return {
+    ...(visibleStatus as Omit<
+      T,
+      "projectId" | "cacheKey" | "includeGlobs" | "excludeGlobs" | "diagnosticDetails" | "diagnostics"
+    >),
+    ...matchedVisibleGlobs({ includeGlobs, excludeGlobs, relevantPaths }),
     diagnostics,
   }
 }
 
-function chunkLookupOutputForTool(output: ChunkLookupOutput): ChunkLookupOutput {
-  const { diagnosticDetails: _outputDetails, ...visibleOutput } = output
-  const { diagnosticDetails: _statusDetails, ...visibleStatus } = output.status
-  const diagnostics = summarizeDiagnostics({
-    diagnostics: [...output.status.diagnostics, ...output.diagnostics],
-    details: [...(output.status.diagnosticDetails ?? []), ...(output.diagnosticDetails ?? [])],
-  })
-  return {
-    ...visibleOutput,
-    status: { ...visibleStatus, diagnostics },
-    diagnostics,
+function matchedVisibleGlobs(input: { includeGlobs?: string[]; excludeGlobs?: string[]; relevantPaths: string[] }) {
+  const relevantPaths = [...new Set(input.relevantPaths.filter((filePath) => filePath.length > 0))]
+  if (relevantPaths.length === 0) {
+    return {}
   }
+  const includeGlobs = matchedGlobs(input.includeGlobs ?? [], relevantPaths).filter((glob) => glob !== "**/*")
+  const excludeGlobs = matchedGlobs(input.excludeGlobs ?? [], relevantPaths)
+  return {
+    ...(includeGlobs.length > 0 ? { includeGlobs } : {}),
+    ...(excludeGlobs.length > 0 ? { excludeGlobs } : {}),
+  }
+}
+
+function matchedGlobs(globs: string[], relevantPaths: string[]) {
+  return globs.filter((glob) => {
+    const matcher = new Minimatch(glob, { dot: true })
+    return relevantPaths.some((filePath) => matcher.match(toGlobPath(filePath)))
+  })
+}
+
+function toGlobPath(filePath: string) {
+  return filePath.split(path.sep).join("/")
+}
+
+function diagnosticFilePaths(details: DiagnosticRecord[]) {
+  return details.flatMap((detail) => (detail.filePath ? [detail.filePath] : []))
 }
 
 function summarizeDiagnostics(input: { diagnostics: string[]; details: DiagnosticRecord[] }) {
@@ -1091,15 +1163,15 @@ function truncateUtf8(value: string, maxBytes: number) {
   return output
 }
 
-function compactSearchOutput(output: SearchOutput, limits: ToolOutputLimits): SearchOutput {
+function compactSearchOutput(output: VisibleSearchOutput, limits: ToolOutputLimits): VisibleSearchOutput {
   for (const maxTextLength of SEARCH_COMPACT_TEXT_LENGTHS) {
-    const compacted: SearchOutput = {
+    const compacted: VisibleSearchOutput = {
       ...output,
       results: output.results.map((result) => {
         const { parentText: _parentText, parentRange: _parentRange, text, ...rest } = result
         return { ...rest, text: trimText(text, maxTextLength) }
       }),
-      diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+      status: statusWithSearchCompaction(output.status),
     }
     if (serializedFits(serializeJson(compacted), limits)) {
       return compacted
@@ -1111,13 +1183,13 @@ function compactSearchOutput(output: SearchOutput, limits: ToolOutputLimits): Se
       const { parentText: _parentText, parentRange: _parentRange, text, ...rest } = result
       return { ...rest, text: trimText(text, 0) }
     }),
-    diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+    status: statusWithSearchCompaction(output.status),
   }
 }
 
-function minimalSearchOutput(output: SearchOutput) {
+function minimalSearchOutput(output: VisibleSearchOutput) {
   return {
-    status: output.status,
+    status: output.results.length === 0 ? statusWithSearchCompaction(output.status) : output.status,
     results: output.results.map((result, index) => ({
       rank: index + SINGLE_COMPACT_CHILD,
       id: result.topology.current.id,
@@ -1127,19 +1199,21 @@ function minimalSearchOutput(output: SearchOutput) {
       finalScore: result.finalScore,
       retrieval: result.retrieval,
     })),
-    ...(output.results.length === 0 ? { diagnostics: diagnosticsWithSearchCompaction(output.diagnostics) } : {}),
   }
 }
 
-function diagnosticsFocusedSearchOutput(output: SearchOutput) {
+function diagnosticsFocusedSearchOutput(output: VisibleSearchOutput) {
   return {
     status: output.status.status,
     resultCount: output.results.length,
-    diagnostics: diagnosticsWithSearchCompaction(output.diagnostics),
+    diagnostics: diagnosticsWithSearchCompaction(output.status.diagnostics),
   }
 }
 
-function compactChunkLookupOutput(output: ChunkLookupOutput, limits: ToolOutputLimits): ChunkLookupOutput {
+function compactChunkLookupOutput(
+  output: VisibleChunkLookupOutput,
+  limits: ToolOutputLimits,
+): VisibleChunkLookupOutput {
   for (const maxTextLength of LOOKUP_COMPACT_TEXT_LENGTHS) {
     for (const maxChildren of LOOKUP_COMPACT_CHILD_LIMITS) {
       const compacted = compactChunkLookupOutputWith(output, maxTextLength, maxChildren)
@@ -1152,12 +1226,12 @@ function compactChunkLookupOutput(output: ChunkLookupOutput, limits: ToolOutputL
 }
 
 function compactChunkLookupOutputWith(
-  output: ChunkLookupOutput,
+  output: VisibleChunkLookupOutput,
   maxTextLength: number,
   maxChildren: number,
-): ChunkLookupOutput {
+): VisibleChunkLookupOutput {
   if (!output.chunk) {
-    return { ...output, diagnostics: diagnosticsWithLookupCompaction(output.diagnostics) }
+    return { ...output, status: statusWithLookupCompaction(output.status) }
   }
 
   const { parentText: _parentText, parentRange: _parentRange, text, related, ...chunk } = output.chunk
@@ -1175,7 +1249,7 @@ function compactChunkLookupOutputWith(
         childrenPage: compactChildrenPage(related.childrenPage, children.length),
       },
     },
-    diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
+    status: statusWithLookupCompaction(output.status),
   }
 }
 
@@ -1187,12 +1261,12 @@ function compactRelatedChunk<T extends { text?: string } | undefined>(chunk: T):
   return rest as T
 }
 
-function minimalChunkLookupOutput(output: ChunkLookupOutput) {
+function minimalChunkLookupOutput(output: VisibleChunkLookupOutput) {
   if (!output.chunk) {
-    return { status: output.status, diagnostics: diagnosticsWithLookupCompaction(output.diagnostics) }
+    return { status: statusWithLookupCompaction(output.status) }
   }
   return {
-    status: output.status,
+    status: statusWithLookupCompaction(output.status),
     chunk: {
       filePath: output.chunk.filePath,
       language: output.chunk.language,
@@ -1208,15 +1282,14 @@ function minimalChunkLookupOutput(output: ChunkLookupOutput) {
         childrenPage: output.chunk.related.childrenPage,
       },
     },
-    diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
   }
 }
 
-function diagnosticsFocusedChunkLookupOutput(output: ChunkLookupOutput) {
+function diagnosticsFocusedChunkLookupOutput(output: VisibleChunkLookupOutput) {
   return {
     status: output.status.status,
     found: Boolean(output.chunk),
-    diagnostics: diagnosticsWithLookupCompaction(output.diagnostics),
+    diagnostics: diagnosticsWithLookupCompaction(output.status.diagnostics),
   }
 }
 
@@ -1232,6 +1305,14 @@ function compactChildrenPage(
     limit: emittedChildren,
     hasMore: page.offset + emittedChildren < page.total,
   }
+}
+
+function statusWithSearchCompaction<T extends { diagnostics: string[] }>(status: T): T {
+  return { ...status, diagnostics: diagnosticsWithSearchCompaction(status.diagnostics) }
+}
+
+function statusWithLookupCompaction<T extends { diagnostics: string[] }>(status: T): T {
+  return { ...status, diagnostics: diagnosticsWithLookupCompaction(status.diagnostics) }
 }
 
 function diagnosticsWithSearchCompaction(diagnostics: string[]) {
