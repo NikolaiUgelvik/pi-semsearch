@@ -2,7 +2,7 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 function worktreeRelativePath(worktree, filePath) {
     const root = path.resolve(worktree);
-    const resolved = path.resolve(root, filePath);
+    const resolved = path.resolve(root, normalizeToolPath(filePath));
     const relative = path.relative(root, resolved);
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
         return;
@@ -11,7 +11,7 @@ function worktreeRelativePath(worktree, filePath) {
 }
 async function resolveWorktreePath(worktree, filePath) {
     const root = path.resolve(worktree);
-    const resolved = path.resolve(root, filePath);
+    const resolved = path.resolve(root, normalizeToolPath(filePath));
     const relative = path.relative(root, resolved);
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
         throw new Error(`source path escapes worktree: ${filePath}`);
@@ -23,5 +23,8 @@ async function resolveWorktreePath(worktree, filePath) {
         throw new Error(`source path escapes worktree: ${filePath}`);
     }
     return resolved;
+}
+function normalizeToolPath(filePath) {
+    return filePath.startsWith("@") ? filePath.slice(1) : filePath;
 }
 export { resolveWorktreePath, worktreeRelativePath };

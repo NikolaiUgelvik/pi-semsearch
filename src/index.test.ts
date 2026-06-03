@@ -113,7 +113,7 @@ describe("pi-semsearch extension", () => {
     await eventually(() => expect(fileRefreshes).toEqual(["src/new.ts"]))
     await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 
-    await harness.events.tool_result?.(successfulEditResult("src/changed.ts"), ctx(worktree, [], { statuses }))
+    await harness.events.tool_result?.(successfulEditResult("@src/changed.ts"), ctx(worktree, [], { statuses }))
     await eventually(() => expect(fileRefreshes).toEqual(["src/new.ts", "src/changed.ts"]))
     await eventually(() => expect(statuses.at(-1)).toBe("semsearch:<clear>"))
 

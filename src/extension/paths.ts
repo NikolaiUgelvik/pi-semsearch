@@ -3,7 +3,7 @@ import path from "node:path"
 
 function worktreeRelativePath(worktree: string, filePath: string) {
   const root = path.resolve(worktree)
-  const resolved = path.resolve(root, filePath)
+  const resolved = path.resolve(root, normalizeToolPath(filePath))
   const relative = path.relative(root, resolved)
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     return
@@ -13,7 +13,7 @@ function worktreeRelativePath(worktree: string, filePath: string) {
 
 async function resolveWorktreePath(worktree: string, filePath: string) {
   const root = path.resolve(worktree)
-  const resolved = path.resolve(root, filePath)
+  const resolved = path.resolve(root, normalizeToolPath(filePath))
   const relative = path.relative(root, resolved)
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error(`source path escapes worktree: ${filePath}`)
@@ -25,6 +25,10 @@ async function resolveWorktreePath(worktree: string, filePath: string) {
     throw new Error(`source path escapes worktree: ${filePath}`)
   }
   return resolved
+}
+
+function normalizeToolPath(filePath: string) {
+  return filePath.startsWith("@") ? filePath.slice(1) : filePath
 }
 
 export { resolveWorktreePath, worktreeRelativePath }
